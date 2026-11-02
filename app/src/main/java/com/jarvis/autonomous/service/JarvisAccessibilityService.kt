@@ -622,6 +622,92 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Finds the first video result on a YouTube search-results screen.
+     * Heuristic (YouTube UI changes, so this is best-effort, never a
+     * blind tap): first clickable element below the search bar whose
+     * row is tall/wide like a video thumbnail row, with a real title,
+     * and not a chip/button like Search/Filter/Shorts/Home. Returns
+     * null when no such row is found, so the caller can fall back to
+     * asking the user instead of tapping the wrong thing.
+     */
+    suspend fun findFirstYouTubeVideo(): ScreenElement? {
+        repeat(3) { attempt ->
+            val snapshot = captureScreenSnapshot()
+            val candidates = snapshot.elements.filter { el ->
+                el.isClickable &&
+                    el.centerY > 260 &&
+                    el.bounds.height() > 110 &&
+                    el.bounds.width() > 200 &&
+                    (el.text.isNotBlank() || el.contentDesc.isNotBlank())
+            }
+            val skipWords = listOf(
+                "search", "filter", "shorts", "home", "subscriptions",
+                "library", "create", "you", "sign in", "voice search"
+            )
+            val picked = candidates.firstOrNull { el ->
+                val label = "${el.text} ${el.contentDesc}".lowercase()
+                skipWords.none { label.contains(it) }
+            }
+            if (picked != null) {
+                JarvisStateRepository.addLog(
+                    "First YouTube video found: '${picked.text.ifBlank { picked.contentDesc }}'"
+                )
+                return picked
+            }
+            if (attempt < 2) kotlinx.coroutines.delay(1800L)
+        }
+        return null
+    }
+
+    /**
+     * Opens a WhatsApp chat for a contact/number and taps Send for the
+     * given message. Contact names resolve through the phone book;
+     * numbers go straight to wa.me. Returns false when the Send button
+     * is not found — the chat stays open with the message prefilled,
+     * so the user can tap Send themselves instead of losing the draft.
+     * Callers must confirm with the user BEFORE invoking this: a sent
+     * WhatsApp message cannot be unsent reliably.
+     */
+    suspend fun sendWhatsAppMessage(contactOrNumber: String, message: String): Boolean {
+        if (message.isBlank()) return false
+        val digits = runCatching {
+            var target = contactOrNumber.trim()
+            if (target.any { it.isLetter() }) {
+                lookupContactNumber(target)?.let { target = it }
+            }
+            target.filter { it.isDigit() }.let {
+                if (it.length > 10 && it.startsWith("91")) it.drop(2) else it
+            }
+        }.getOrDefault("")
+        if (digits.length < 7) {
+            JarvisStateRepository.addLog("WhatsApp send failed: contact '$contactOrNumber' not found in phone book")
+            return false
+        }
+        val intent = Intent(
+            Intent.ACTION_VIEW,
+            Uri.parse("https://wa.me/91$digits?text=${Uri.encode(message)}")
+        ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        runCatching { startActivity(intent) }.onFailure { return false }
+        kotlinx.coroutines.delay(3000L)
+        repeat(3) { attempt ->
+            val snapshot = captureScreenSnapshot()
+            val sendButton = snapshot.elements.firstOrNull { el ->
+                el.isClickable &&
+                    (el.contentDesc.lowercase().contains("send") ||
+                        el.viewId.lowercase().contains("send"))
+            }
+            if (sendButton != null) {
+                val ok = tapNode(sendButton.id)
+                JarvisStateRepository.addLog("WhatsApp message to $digits: send tapped=$ok")
+                return ok
+            }
+            if (attempt < 2) kotlinx.coroutines.delay(1800L)
+        }
+        JarvisStateRepository.addLog("WhatsApp chat opened for $digits, Send button not found — message prefilled only")
+        return false
+    }
+
+    /**
      * Controls background media playback (Spotify, YouTube Music, etc.) without switching apps.
      */
     fun controlMediaPlayback(command: String): Boolean {

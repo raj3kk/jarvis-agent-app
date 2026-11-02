@@ -33,6 +33,8 @@ class JarvisForegroundService : Service() {
         const val ACTION_ANNOUNCE_NOTIFICATION = "com.jarvis.autonomous.ACTION_ANNOUNCE_NOTIFICATION"
         const val EXTRA_NOTIF_SENDER = "extra_notif_sender"
         const val EXTRA_NOTIF_TEXT = "extra_notif_text"
+        const val ACTION_ANNOUNCE_CALL = "com.jarvis.autonomous.ACTION_ANNOUNCE_CALL"
+        const val EXTRA_CALL_DISPLAY = "extra_call_display"
     }
 
     private lateinit var prefs: JarvisPreferences
@@ -106,6 +108,15 @@ class JarvisForegroundService : Service() {
                     val msg = intent.getStringExtra(EXTRA_NOTIF_TEXT) ?: ""
                     if (sender.isNotBlank() && msg.isNotBlank()) {
                         agentEngine.announceIncomingNotification(sender, msg)
+                    }
+                }
+            }
+
+            ACTION_ANNOUNCE_CALL -> {
+                if (!agentEngine.isTaskRunning() && prefs.autoAnnounceNotifications) {
+                    val display = intent.getStringExtra(EXTRA_CALL_DISPLAY) ?: ""
+                    if (display.isNotBlank()) {
+                        agentEngine.announceIncomingCall(display)
                     }
                 }
             }

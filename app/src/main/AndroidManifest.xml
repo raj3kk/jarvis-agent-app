@@ -25,6 +25,7 @@
         tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.FLASHLIGHT" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
@@ -107,6 +108,18 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+
+        <!-- Incoming-call announcer: speaks caller name/number on RINGING.
+             It never answers the call — Android does not allow a normal
+             app to inject voice into call audio. -->
+        <receiver
+            android:name=".service.JarvisCallReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telephony.action.PHONE_STATE" />
+            </intent-filter>
+        </receiver>
 
         <!-- Auto-Start on Boot Receiver -->
         <receiver

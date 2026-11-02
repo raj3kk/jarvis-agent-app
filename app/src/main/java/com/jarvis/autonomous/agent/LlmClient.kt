@@ -218,6 +218,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             - "NONE": No screen action needed (casual chat, asking user a question, or task already complete).
             - "OPEN_APP": Launch an installed app by name. Fill `appName` (e.g. "WhatsApp", "YouTube", "Instagram", "Chrome", "Spotify", "Settings").
             - "YOUTUBE_SEARCH": Directly open YouTube search results for a song/video query! Fill `text` with search query.
+            - "YOUTUBE_PLAY": Search YouTube AND play the first video result automatically. Fill `text` with search query. Use this when the user said play/chalao/bajao.
+            - "WHATSAPP_SEND": Open a WhatsApp chat and send a NEW message (not a notification reply). Fill `contact` (name or number) and `text` (message). Use ONLY after the user explicitly said to send this message to this person — a sent message cannot be unsent.
             - "OPEN_URL": Open any website or deep link directly. Fill `text` with URL.
             - "REPLY_NOTIFICATION": Reply directly in background to a recent WhatsApp/Instagram/SMS notification without opening the app! Fill `contact` (sender name filter) and `text` (reply message).
             - "TAP_NODE": Click a UI element from the live screen list by its integer `[ID]`. Fill `nodeId`.
@@ -242,7 +244,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             {
               "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, 1-2 short sentences for step updates, never a lecture, never 'As an AI'",
               "thought": "Your internal reasoning for this step",
-              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
+              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | YOUTUBE_PLAY | WHATSAPP_SEND | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
               "appName": "",
               "nodeId": -1,
               "x": -1,

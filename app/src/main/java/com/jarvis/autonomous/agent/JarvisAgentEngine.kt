@@ -56,6 +56,110 @@ class JarvisAgentEngine(
     }
 
     /**
+     * Incoming-call announcement (from JarvisCallReceiver). Same
+     * Auto-Announce toggle as notifications, and never while a task
+     * is running, so it never talks over an ongoing job.
+     */
+    fun announceIncomingCall(displayNameOrNumber: String) {
+        if (isTaskRunning()) return
+        scope.launch {
+            val announcement = "Bhai, call aa raha hai, $displayNameOrNumber se."
+            JarvisStateRepository.addChatMessage("Jarvis", announcement)
+            onSpeakAndAwait(announcement)
+        }
+    }
+
+    /**
+     * No-AI routines (user order 2026-11-02): fixed everyday commands
+     * run as deterministic steps, without an LLM call for every step.
+     * YouTube: search → find first video → ASK the user → play only
+     * on "haan". WhatsApp: ASK first (a sent message cannot be
+     * unsent), then send. Anything that does not match a routine
+     * falls through to the normal LLM multi-step loop below.
+     */
+    private fun tryNoAiRoutine(lower: String, trimmed: String): Boolean {
+        val acc = JarvisAccessibilityService.instance
+        // YouTube: "youtube par <query> chalao/play/bajao"
+        val ytMatch = Regex(
+            "youtube\\s+(?:par|pe|me)?\\s*(.+?)\\s*(?:chalao|play|bajao|sunao|dikhao)\\s*$"
+        ).find(lower)
+        if (ytMatch != null) {
+            val query = ytMatch.groupValues[1]
+                .replace(Regex("^(par|pe|me)\\s+"), "").trim()
+            if (query.isNotBlank()) {
+                if (acc == null) {
+                    scope.launch { onSpeakAndAwait("Accessibility service on nahi hai, isliye YouTube nahi khol sakta. Permissions screen se on karo.") }
+                    return true
+                }
+                activeTaskJob?.cancel()
+                activeTaskJob = scope.launch {
+                    try {
+                        onSpeakAndAwait("YouTube par $query dhoondh raha hoon.")
+                        if (!acc.searchYouTube(query)) {
+                            onSpeakAndAwait("YouTube nahi khul paya.")
+                            return@launch
+                        }
+                        kotlinx.coroutines.delay(3000L)
+                        val video = acc.findFirstYouTubeVideo()
+                        if (video == null) {
+                            onSpeakAndAwait("Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
+                            return@launch
+                        }
+                        val title = video.text.ifBlank { video.contentDesc }
+                        onSpeakAndAwait("Pehli video $title mili hai. Chalau?")
+                        val reply = onRequestUserVoiceReply()?.lowercase() ?: ""
+                        if (reply.contains("haan") || reply.contains("yes") ||
+                            reply.contains("chalao") || reply.contains("play") ||
+                            reply.contains("bajao")
+                        ) {
+                            val ok = acc.tapNode(video.id)
+                            onSpeakAndAwait(if (ok) "Chala diya." else "Tap nahi ho paya.")
+                        } else {
+                            onSpeakAndAwait("Theek hai, nahi chalaya.")
+                        }
+                    } catch (e: Exception) {
+                        JarvisStateRepository.addLog("YouTube routine error: ${e.message}")
+                    }
+                }
+                return true
+            }
+        }
+        // WhatsApp: "whatsapp par <name> ko <message> bhejo"
+        val waMatch = Regex(
+            "whatsapp\\s+(?:par|pe|me)?\\s*(.+?)\\s+ko\\s+(.+?)\\s*(?:bhejo|bhej\\s+do|send\\s+karo)\\s*$"
+        ).find(lower)
+        if (waMatch != null) {
+            val contact = waMatch.groupValues[1].trim()
+            val message = waMatch.groupValues[2].trim()
+            if (contact.isNotBlank() && message.isNotBlank()) {
+                if (acc == null) {
+                    scope.launch { onSpeakAndAwait("Accessibility service on nahi hai, isliye WhatsApp nahi bhej sakta.") }
+                    return true
+                }
+                activeTaskJob?.cancel()
+                activeTaskJob = scope.launch {
+                    try {
+                        onSpeakAndAwait("$contact ko ye message bhejna hai: $message. Bhej dun?")
+                        val reply = onRequestUserVoiceReply()?.lowercase() ?: ""
+                        if (reply.contains("haan") || reply.contains("yes") ||
+                            reply.contains("bhej") || reply.contains("send")
+                        ) {
+                            val ok = acc.sendWhatsAppMessage(contact, message)
+                            onSpeakAndAwait(if (ok) "Message bhej diya." else "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
+                        } else {
+                            onSpeakAndAwait("Theek hai, message nahi bheja.")
+                        }
+                    } catch (e: Exception) {
+                        JarvisStateRepository.addLog("WhatsApp routine error: ${e.message}")
+                    }
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
      * Entry point for any voice or text command from the user.
      */
     fun handleUserCommand(rawCommand: String) {
@@ -69,6 +173,10 @@ class JarvisAgentEngine(
             scope.launch { onSpeakAndAwait("Theek hai bhai, ruk gaya.") }
             return
         }
+
+        // No-AI routines first (YouTube play-first, WhatsApp send):
+        // deterministic steps, no LLM call, with ask-before-play/send.
+        if (tryNoAiRoutine(lower, trimmed)) return
 
         // Check if command matches any custom Voice Routine macro
         val matchedRoutine = prefs.getRoutines().firstOrNull { routine ->
@@ -262,6 +370,25 @@ class JarvisAgentEngine(
                 val ok = acc?.searchYouTube(d.text.ifBlank { d.appName }) ?: false
                 delay(900L)
                 "YOUTUBE_SEARCH('${d.text}') -> success=$ok"
+            }
+
+            "YOUTUBE_PLAY" -> {
+                // Search + play the first video (LLM path: direct, no
+                // confirm — the voice routine path asks first instead).
+                val query = d.text.ifBlank { d.appName }
+                val opened = acc?.searchYouTube(query) ?: false
+                delay(3000L)
+                val video = acc?.findFirstYouTubeVideo()
+                val ok = if (video != null) acc.tapNode(video.id) else false
+                "YOUTUBE_PLAY('$query') -> opened=$opened, video='${video?.text?.ifBlank { video?.contentDesc }}', played=$ok"
+            }
+
+            "WHATSAPP_SEND" -> {
+                // Caller (LLM prompt) must only use this after the user
+                // explicitly said send; the voice routine path confirms
+                // first. A sent message cannot be unsent reliably.
+                val ok = acc?.sendWhatsAppMessage(d.contact, d.text) ?: false
+                "WHATSAPP_SEND(to='${d.contact}') -> success=$ok"
             }
 
             "OPEN_URL" -> {

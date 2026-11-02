@@ -1079,7 +1079,7 @@ fun AiBrainSettingsScreen(
                     onCheckedChange = { visionMode = it }
                 )
                 SettingToggleRow(
-                    title = "Auto-Announce WhatsApp / SMS",
+                    title = "Auto-Announce WhatsApp / SMS / Calls",
                     subtitle = "Speak incoming messages aloud when idle & allow direct voice reply",
                     checked = autoAnnounceNotifs,
                     onCheckedChange = { autoAnnounceNotifs = it }

@@ -38,8 +38,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.1.1-PRO"
+        versionCode = 6
+        versionName = "1.2.0-PRO"
 
         vectorDrawables {
             useSupportLibrary = true
