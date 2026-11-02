@@ -66,6 +66,8 @@ jobs:
           EOF
 
       - name: Build Debug & Release APK
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 
       - name: Verify APKs (exist + badging + signature)

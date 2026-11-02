@@ -2,6 +2,7 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.os.Build
+import com.jarvis.autonomous.BuildConfig
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
@@ -22,10 +23,15 @@ import java.util.concurrent.TimeUnit
  * Free on-device LLM for Jarvis, no API key, no card, no server.
  *
  * Model (live-verified 2026-11-02, litert-community on Hugging Face):
- * Qwen3-0.6B, mixed INT4 `.litertlm`, ~475 MB, Apache 2.0, UNGATED.
- * Gemma was deliberately NOT chosen as default: its repo returns 401
- * without a Hugging Face account + accepted Gemma licence, so an
- * in-app download would fail for most users. Qwen downloads freely.
+ * Gemma 3 270M IT, Q8 `.litertlm`, 304 MB, from litert-community/gemma-3-270m-it.
+ * GATED: the user's Hugging Face account (raj3kk) accepted the free
+ * Gemma licence on 2026-11-02 and the file was downloaded +
+ * size/header-verified (304,005,120 bytes, LITERTLM magic). In-app
+ * download needs the user's own HF access token (Bearer header) —
+ * without it HF returns 401. The token stays on the phone
+ * (SharedPreferences) or the build-time HF_TOKEN secret, never in
+ * the repo source. Qwen has been fully removed from Jarvis — no
+ * Qwen code, file or download path remains.
  *
  * Honest limits (do not oversell to the user):
  * - 0.6B is a chat model, NOT a reliable JSON agent. It answers casual
@@ -40,11 +46,11 @@ import java.util.concurrent.TimeUnit
  */
 object LocalLlmManager {
 
-    const val MODEL_FILE_NAME = "qwen3_0_6b_mixed_int4.litertlm"
+    const val MODEL_FILE_NAME = "gemma3-270m-it-q8.litertlm"
     const val MODEL_URL =
-        "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/qwen3_0_6b_mixed_int4.litertlm?download=true"
-    const val MODEL_SIZE_MB = 475L
-    const val MODEL_DISPLAY = "Qwen3-0.6B (on-device, free, Apache 2.0)"
+        "https://huggingface.co/litert-community/gemma-3-270m-it/resolve/main/gemma3-270m-it-q8.litertlm?download=true"
+    const val MODEL_SIZE_MB = 304L
+    const val MODEL_DISPLAY = "Gemma 3 270M (on-device, free, gated — HF token needed)"
 
     private val engineLock = Mutex()
     private var engine: Engine? = null
@@ -66,6 +72,7 @@ object LocalLlmManager {
 
     suspend fun download(
         context: Context,
+        hfToken: String? = null,
         onProgress: (downloadedMB: Long, totalMB: Long) -> Unit
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
@@ -81,9 +88,18 @@ object LocalLlmManager {
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
                 .build()
-            val request = Request.Builder().url(MODEL_URL).build()
+            val effectiveToken = hfToken?.takeIf { it.isNotBlank() }
+                ?: BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
+            val requestBuilder = Request.Builder().url(MODEL_URL)
+            if (!effectiveToken.isNullOrBlank()) {
+                requestBuilder.header("Authorization", "Bearer ${effectiveToken.trim()}")
+            }
+            val request = requestBuilder.build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
+                    if (response.code == 401) {
+                        throw IllegalStateException("Gemma gated hai (HTTP 401) — AI Brain me apna Hugging Face access token daalo (jis account ne Gemma licence accept ki hai), phir dobara download karo.")
+                    }
                     throw IllegalStateException("Model download failed: HTTP ${response.code}")
                 }
                 val body = response.body ?: throw IllegalStateException("Empty download body")
@@ -117,7 +133,7 @@ object LocalLlmManager {
     /**
      * One casual chat reply from the local model. History is trimmed to
      * the last 6 turns so the small context window never overflows.
-     * Thinking output is stripped: Qwen3's thinking channel must never
+     * Thinking output is stripped: any reasoning channel must never
      * reach the user as a reply.
      */
     suspend fun chat(
@@ -129,7 +145,7 @@ object LocalLlmManager {
         val file = modelFile(context)
         if (!isDownloaded(context)) {
             throw IllegalStateException(
-                "Local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (~475 MB, ek baar)."
+                "Local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (~304 MB, ek baar)."
             )
         }
         engineLock.withLock {

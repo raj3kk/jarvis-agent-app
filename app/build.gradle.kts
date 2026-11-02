@@ -38,8 +38,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.1.0-PRO"
+        versionCode = 5
+        versionName = "1.1.1-PRO"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -81,7 +81,17 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
+
+    // HF token for the gated Gemma download, injected at build time
+    // from the HF_TOKEN Actions secret. Empty on local builds without
+    // the secret — then the user-entered token in AI Brain is used.
+    // This value is in the built APK binary, never in repo source.
+    buildConfigField(
+        "String", "HF_TOKEN",
+        "\"" + (System.getenv("HF_TOKEN") ?: "") + "\""
+    )
 
     packaging {
         resources {

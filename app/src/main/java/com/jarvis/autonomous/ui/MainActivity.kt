@@ -869,6 +869,7 @@ fun AiBrainSettingsScreen(
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
     var modelName by remember { mutableStateOf(prefs.modelName) }
+    var hfToken by remember { mutableStateOf(prefs.hfToken) }
     var languageMode by remember { mutableStateOf(prefs.languageMode) }
     var personaPrompt by remember { mutableStateOf(prefs.personaPrompt) }
 
@@ -935,14 +936,14 @@ fun AiBrainSettingsScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Free Local Model — Qwen3-0.6B (Offline, No Key, No Card)",
+                        text = "Free Local Model — Gemma 3 270M (Offline Chat, HF Token Needed)",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
                     Text(
-                        text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Apache 2.0, ~475 MB, ek baar download). " +
+                        text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Gemma 3 270M Q8, ~304 MB, ek baar download). " +
                             "Casual baat-cheet isse tez aur bina internet ke hogi. " +
-                            "Phone ke kaam (WhatsApp/YouTube/action JSON) ke liye chhota model reliable nahi hai, isliye wo abhi bhi Gemini/Groq Lite par chalenge.",
+                            "Ye gated model hai — download ke liye Hugging Face token chahiye (neeche daalo, token sirf phone par save hoga). Phone ke steps/kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-step JSON reliably nahi de sakta.",
                         fontSize = 12.sp
                     )
                     Text(
@@ -951,7 +952,7 @@ fun AiBrainSettingsScreen(
                         } else if (localDownloaded) {
                             "Status: Downloaded ✅ (${LocalLlmManager.downloadedBytes(localContext) / 1_000_000L} MB) — provider me Local chuno aur baat karo."
                         } else {
-                            "Status: Not downloaded — Wi-Fi par download karo, ek baar me ~475 MB lagega."
+                            "Status: Not downloaded — Wi-Fi par download karo, ek baar me ~304 MB lagega."
                         },
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
@@ -959,6 +960,13 @@ fun AiBrainSettingsScreen(
                     if (localProgress.isNotBlank()) {
                         Text(localProgress, fontSize = 12.sp)
                     }
+                    OutlinedTextField(
+                        value = hfToken,
+                        onValueChange = { hfToken = it },
+                        label = { Text("Hugging Face Token (Gemma download ke liye)", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
                     Button(
                         enabled = LocalLlmManager.isDeviceSupported() && !localDownloading,
                         onClick = {
@@ -967,9 +975,9 @@ fun AiBrainSettingsScreen(
                                 modelName = AiProvider.LOCAL.defaultModel
                             } else {
                                 localDownloading = true
-                                localProgress = "Downloading… 0 / ~475 MB"
+                                localProgress = "Downloading… 0 / ~304 MB"
                                 localScope.launch {
-                                    val result = LocalLlmManager.download(localContext) { mb, total ->
+                                    val result = LocalLlmManager.download(localContext, hfToken) { mb, total ->
                                         localScope.launch { localProgress = "Downloading… $mb / $total MB" }
                                     }
                                     localDownloading = false
@@ -986,7 +994,7 @@ fun AiBrainSettingsScreen(
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(if (localDownloaded) "Use Local Model" else "Download Free Local Model (~475 MB)")
+                        Text(if (localDownloaded) "Use Local Model" else "Download Free Local Model (~304 MB)")
                     }
                 }
             }
@@ -1125,6 +1133,7 @@ fun AiBrainSettingsScreen(
         Button(
             onClick = {
                 prefs.provider = selectedProvider
+                prefs.hfToken = hfToken
                 prefs.apiKey = apiKey
                 prefs.modelName = modelName
                 prefs.languageMode = languageMode

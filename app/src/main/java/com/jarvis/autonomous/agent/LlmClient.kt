@@ -81,7 +81,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     userText = userGoal,
                     recentChat = history
                 )
-                AgentDecision(reply = reply, thought = "Local Qwen3 chat", action = "NONE", isCompleted = true)
+                AgentDecision(reply = reply, thought = "Local Gemma chat", action = "NONE", isCompleted = true)
             } catch (e: Exception) {
                 AgentDecision(
                     reply = "Local model se jawab nahi aaya (${(e.message ?: "").take(120)}). AI Brain me dobara Gemini chuno ya model reload karo.",

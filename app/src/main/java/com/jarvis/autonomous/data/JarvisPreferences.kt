@@ -46,14 +46,15 @@ enum class AiProvider(
         "https://openrouter.ai/api/v1/chat/completions",
         listOf("google/gemini-3.8-flash", "google/gemini-3-flash-preview")
     ),
-    // FREE on-device model: Qwen3-0.6B mixed INT4 via LiteRT-LM.
-    // No API key, no card, no server — model downloads once (~475 MB)
-    // from Hugging Face (Apache 2.0, ungated) into the app's own files.
-    // CHAT ONLY: a 0.6B model cannot reliably emit the strict JSON
+    // FREE on-device model: Gemma 3 270M Q8 via LiteRT-LM.
+    // No card, no server — model downloads once (~304 MB) from
+    // Hugging Face into the app's own files. GATED: needs the user's
+    // own HF token (account must have accepted the Gemma licence).
+    // CHAT ONLY: a 270M model cannot reliably emit the strict JSON
     // agent actions, so phone actions stay on a cloud Lite provider.
     LOCAL(
-        "Local Qwen3-0.6B (Free, Offline Chat)",
-        "qwen3-0.6b-int4",
+        "Local Gemma3-270M (Free, Offline Chat)",
+        "gemma3-270m-it-q8",
         "",
         emptyList()
     )
@@ -75,6 +76,12 @@ class JarvisPreferences(context: Context) {
             return runCatching { AiProvider.valueOf(name) }.getOrDefault(AiProvider.GEMINI)
         }
         set(value) = prefs.edit().putString("ai_provider", value.name).apply()
+
+    // Hugging Face token for the gated Gemma download only. Stored
+    // on the phone, never in the APK or repo.
+    var hfToken: String
+        get() = prefs.getString("hf_token", "") ?: ""
+        set(value) = prefs.edit().putString("hf_token", value.trim()).apply()
 
     var apiKey: String
         get() = prefs.getString("api_key", "") ?: ""
