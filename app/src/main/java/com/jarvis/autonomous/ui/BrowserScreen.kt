@@ -57,8 +57,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -528,7 +528,7 @@ object JarvisBackgroundBrowser {
 
     // -- The single shared client (foreground + background dispatch) -----
 
-    private inner class SharedWebViewClient : WebViewClient() {
+    private class SharedWebViewClient : WebViewClient() {
         override fun shouldOverrideUrlLoading(
             view: WebView?,
             request: WebResourceRequest?
@@ -571,7 +571,7 @@ object JarvisBackgroundBrowser {
         }
     }
 
-    private inner class SharedWebChromeClient : WebChromeClient() {
+    private class SharedWebChromeClient : WebChromeClient() {
         override fun onProgressChanged(view: WebView?, newProgress: Int) {
             foregroundCallbacks?.onProgress(newProgress)
         }

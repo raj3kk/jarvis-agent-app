@@ -19,7 +19,7 @@ import androidx.core.content.ContextCompat
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.SpeechSegment
 import com.k2fsa.sherpa.onnx.Vad
-import com.k2fsa.sherpa.onnx.VadKt
+import com.k2fsa.sherpa.onnx.getVadModelConfig
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -599,7 +599,7 @@ fun interface StopSpeakingCallback {
  * TenVadModelConfig, sampleRate, numThreads, provider, debug);
  * SileroVadModelConfig(model, threshold, minSilenceDuration,
  * minSpeechDuration, windowSize, maxSpeechDuration);
- * VadKt.getVadModelConfig(sampleRate).
+ * getVadModelConfig(sampleRate) (top-level function in Vad.kt).
  *
  * HONEST LIMITS — read before enabling:
  * 1. MODEL NOT BUNDLED: Silero VAD needs a silero_vad.onnx model
@@ -656,7 +656,7 @@ class SherpaVadMonitor(
     init {
         available = runCatching {
             if (!modelFile.exists()) return@runCatching false
-            val config = VadKt.getVadModelConfig(SAMPLE_RATE_HZ).copy(
+            val config = getVadModelConfig(SAMPLE_RATE_HZ).copy(
                 sileroVadModelConfig = SileroVadModelConfig(
                     modelFile.absolutePath,
                     VAD_THRESHOLD,

@@ -124,6 +124,7 @@ object ProjectStore {
                     .filter { it.isFile }
                     .map { it.relativeTo(dir).path.replace('\\', '/') }
                     .sorted()
+                    .toList()
                 Project(name = dir.name, files = files)
             }
     }
@@ -271,6 +272,7 @@ object ProjectStore {
             }
             .mapNotNull { sanitizeFileName(it) }
             .distinct()
+            .toList()
     }
 
     /** Validates a built project against the source of truth:
