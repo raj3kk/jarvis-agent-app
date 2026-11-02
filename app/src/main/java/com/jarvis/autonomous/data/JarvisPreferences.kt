@@ -5,11 +5,42 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
-enum class AiProvider(val displayName: String, val defaultModel: String, val baseUrl: String) {
-    GEMINI("Google Gemini (Recommended)", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta"),
-    OPENAI("OpenAI (GPT-4o)", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions"),
-    GROQ("Groq (Ultra-Fast Llama 3.3)", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1/chat/completions"),
-    OPENROUTER("OpenRouter / Custom", "google/gemini-2.5-flash", "https://openrouter.ai/api/v1/chat/completions")
+enum class AiProvider(
+    val displayName: String,
+    val defaultModel: String,
+    val baseUrl: String,
+    val fallbackModels: List<String> = emptyList()
+) {
+    // Live-verified 2026-11-02: gemini-2.5-flash returns 404 "no longer
+    // available to new users" (Google limits 2.5 to past users since Sep 2026;
+    // its own 404 message names gemini-3.8-flash as replacement).
+    // gemini-3.8-flash is also Google's recommended model for UI/agent work.
+    GEMINI(
+        "Google Gemini (Recommended)", "gemini-3.8-flash",
+        "https://generativelanguage.googleapis.com/v1beta",
+        listOf("gemini-3.5-flash-lite", "gemini-3-flash-preview")
+    ),
+    // gpt-4o-mini still answers in Nov 2026; OpenAI shuts the GPT-4 family
+    // down on 2027-01-14 (replacement gpt-6-luna, a reasoning model).
+    OPENAI(
+        "OpenAI (GPT-4o-mini)", "gpt-4o-mini",
+        "https://api.openai.com/v1/chat/completions",
+        listOf("gpt-4.1-mini")
+    ),
+    // Live-verified 2026-11-02: llama-3.3-70b-versatile was decommissioned
+    // by Groq on 2026-08-16 and now returns 404 model_not_found.
+    // Groq's recommended replacement is openai/gpt-oss-120b (HTTP 200).
+    GROQ(
+        "Groq (Ultra-Fast)", "openai/gpt-oss-120b",
+        "https://api.groq.com/openai/v1/chat/completions",
+        listOf("openai/gpt-oss-20b")
+    ),
+    // Same 2.5 problem through OpenRouter's Google route.
+    OPENROUTER(
+        "OpenRouter / Custom", "google/gemini-3.8-flash",
+        "https://openrouter.ai/api/v1/chat/completions",
+        listOf("google/gemini-3.5-flash-lite", "google/gemini-3-flash-preview")
+    )
 }
 
 data class VoiceRoutine(
@@ -33,9 +64,61 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getString("api_key", "") ?: ""
         set(value) = prefs.edit().putString("api_key", value.trim()).apply()
 
+    companion object {
+        // Dead model IDs that return 404 today, mapped to their live
+        // replacement. This is the bug that broke existing installs: the
+        // old APK saved gemini-2.5-flash / llama-3.3-70b-versatile into
+        // SharedPreferences, so merely changing the default above would
+        // NEVER fix a phone that already saved the dead ID.
+        private val DEAD_MODEL_MAP = mapOf(
+            "gemini-2.5-flash" to "gemini-3.8-flash",
+            "gemini-2.5-flash-lite" to "gemini-3.5-flash-lite",
+            "gemini-2.0-flash" to "gemini-3.8-flash",
+            "gemini-2.0-flash-lite" to "gemini-3.5-flash-lite",
+            "gemini-1.5-flash" to "gemini-3.8-flash",
+            "gemini-1.5-pro" to "gemini-3.8-flash",
+            "llama-3.3-70b-versatile" to "openai/gpt-oss-120b",
+            "llama-3.1-8b-instant" to "openai/gpt-oss-20b",
+            "google/gemini-2.5-flash" to "google/gemini-3.8-flash",
+            "google/gemini-2.5-flash-lite" to "google/gemini-3.5-flash-lite",
+            "google/gemini-2.0-flash" to "google/gemini-3.8-flash"
+        )
+    }
+
     var modelName: String
-        get() = prefs.getString("model_name", provider.defaultModel) ?: provider.defaultModel
-        set(value) = prefs.edit().putString("model_name", value.trim()).apply()
+        get() {
+            val saved = prefs.getString("model_name", provider.defaultModel)
+                ?.trim().orEmpty().removePrefix("models/")
+            val migrated = DEAD_MODEL_MAP[saved] ?: saved
+            val resolved = when {
+                migrated.isBlank() -> provider.defaultModel
+                // Cross-provider stale ID (e.g. a Gemini ID saved while on
+                // Groq): that provider will 404 it, so reset to its default.
+                provider == AiProvider.GEMINI &&
+                    (migrated.startsWith("llama-") || migrated.startsWith("openai/") ||
+                        migrated.startsWith("gpt-")) -> provider.defaultModel
+                provider == AiProvider.GROQ &&
+                    (migrated.startsWith("gemini-") || migrated.startsWith("google/")) ->
+                    provider.defaultModel
+                provider == AiProvider.OPENAI &&
+                    (migrated.startsWith("gemini-") || migrated.startsWith("llama-") ||
+                        migrated.startsWith("google/")) -> provider.defaultModel
+                provider == AiProvider.OPENROUTER && !migrated.contains("/") ->
+                    provider.defaultModel
+                else -> migrated
+            }
+            if (resolved != saved) {
+                prefs.edit().putString("model_name", resolved).apply()
+            }
+            return resolved
+        }
+        set(value) {
+            val cleaned = value.trim().removePrefix("models/")
+            prefs.edit().putString(
+                "model_name",
+                if (cleaned.isBlank()) provider.defaultModel else cleaned
+            ).apply()
+        }
 
     var languageMode: String
         get() = prefs.getString("language_mode", "Hinglish") ?: "Hinglish"

@@ -98,26 +98,52 @@ class LlmClient(private val prefs: JarvisPreferences) {
         }
 
         return@withContext try {
-            val rawJson = when (prefs.provider) {
-                AiProvider.GEMINI -> callGeminiApi(
-                    apiKey = apiKey,
-                    model = prefs.modelName,
-                    systemPrompt = systemInstruction,
-                    userPrompt = userPayload,
-                    imageBase64 = screenImageBase64
-                )
-                else -> callOpenAiCompatibleApi(
-                    baseUrl = prefs.provider.baseUrl,
-                    apiKey = apiKey,
-                    model = prefs.modelName,
-                    systemPrompt = systemInstruction,
-                    userPrompt = userPayload
-                )
+            // 404 fallback chain: if the chosen model is dead/overloaded
+            // (404/503), try the provider's verified fallbacks before giving
+            // up, so one retired model ID can never brick the whole agent.
+            val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
+                .map { it.trim().removePrefix("models/") }
+                .filter { it.isNotBlank() }.distinct()
+            var lastError: Exception? = null
+            var rawJson: String? = null
+            for (candidate in candidates) {
+                try {
+                    rawJson = when (prefs.provider) {
+                        AiProvider.GEMINI -> callGeminiApi(
+                            apiKey = apiKey,
+                            model = candidate,
+                            systemPrompt = systemInstruction,
+                            userPrompt = userPayload,
+                            imageBase64 = screenImageBase64
+                        )
+                        else -> callOpenAiCompatibleApi(
+                            provider = prefs.provider,
+                            baseUrl = prefs.provider.baseUrl,
+                            apiKey = apiKey,
+                            model = candidate,
+                            systemPrompt = systemInstruction,
+                            userPrompt = userPayload
+                        )
+                    }
+                    break
+                } catch (e: IllegalStateException) {
+                    val isModelGone = e.message?.contains("HTTP 404") == true ||
+                        e.message?.contains("HTTP 503") == true
+                    lastError = e
+                    if (!isModelGone || candidate == candidates.last()) throw e
+                    // else: fall through to the next candidate model
+                }
             }
-            parseDecisionJson(rawJson)
+            parseDecisionJson(rawJson ?: throw (lastError ?: IllegalStateException("No model responded")))
         } catch (e: Exception) {
+            // Do NOT truncate the error to 60 chars any more: that hid the
+            // "404 model not found" detail that would have named the fix.
+            val detail = (e.message ?: "Unknown error").take(300)
+            val hint = if (detail.contains("404")) {
+                " Model nahi mila — AI Brain me provider ka default model check karo."
+            } else ""
             AgentDecision(
-                reply = "Arre bhai, network ya API mein thoda glitch aaya: ${e.localizedMessage?.take(60)}",
+                reply = "API error: $detail.$hint",
                 thought = "Exception: ${e.message}",
                 action = "NONE",
                 askUser = false,
@@ -230,10 +256,16 @@ class LlmClient(private val prefs: JarvisPreferences) {
         httpClient.newCall(req).execute().use { resp ->
             val respBody = resp.body?.string() ?: ""
             if (!resp.isSuccessful) {
-                throw IllegalStateException("HTTP ${resp.code}: ${respBody.take(160)}")
+                throw IllegalStateException("HTTP ${resp.code}: ${respBody.take(400)}")
             }
             val root = JSONObject(respBody)
-            return root.getJSONArray("candidates")
+            val candidates = root.optJSONArray("candidates")
+            if (candidates == null || candidates.length() == 0) {
+                throw IllegalStateException(
+                    "HTTP 200 but no candidates: ${respBody.take(400)}"
+                )
+            }
+            return candidates
                 .getJSONObject(0)
                 .getJSONObject("content")
                 .getJSONArray("parts")
@@ -243,6 +275,7 @@ class LlmClient(private val prefs: JarvisPreferences) {
     }
 
     private fun callOpenAiCompatibleApi(
+        provider: AiProvider,
         baseUrl: String,
         apiKey: String,
         model: String,
@@ -256,24 +289,43 @@ class LlmClient(private val prefs: JarvisPreferences) {
         val bodyJson = JSONObject().apply {
             put("model", model)
             put("messages", messages)
-            put("temperature", 0.25)
+            // Reasoning models (OpenAI GPT-6 family) reject temperature on
+            // Chat Completions unless reasoning is off; keep them at
+            // reasoning_effort=none so the old JSON contract still works.
+            if (provider == AiProvider.OPENAI && model.startsWith("gpt-6")) {
+                put("reasoning_effort", "none")
+            } else {
+                put("temperature", 0.25)
+            }
             put("response_format", JSONObject().put("type", "json_object"))
         }
 
-        val req = Request.Builder()
+        val reqBuilder = Request.Builder()
             .url(baseUrl)
             .addHeader("Authorization", "Bearer $apiKey")
             .addHeader("Content-Type", "application/json")
+        if (provider == AiProvider.OPENROUTER) {
+            // OpenRouter identifies the calling app from these headers.
+            reqBuilder.addHeader("HTTP-Referer", "https://github.com/raj3kk/jarvis-agent-app")
+            reqBuilder.addHeader("X-Title", "JarvisAgentApp")
+        }
+        val req = reqBuilder
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
         httpClient.newCall(req).execute().use { resp ->
             val respBody = resp.body?.string() ?: ""
             if (!resp.isSuccessful) {
-                throw IllegalStateException("HTTP ${resp.code}: ${respBody.take(160)}")
+                throw IllegalStateException("HTTP ${resp.code}: ${respBody.take(400)}")
             }
             val root = JSONObject(respBody)
-            return root.getJSONArray("choices")
+            val choices = root.optJSONArray("choices")
+            if (choices == null || choices.length() == 0) {
+                throw IllegalStateException(
+                    "HTTP 200 but no choices: ${respBody.take(400)}"
+                )
+            }
+            return choices
                 .getJSONObject(0)
                 .getJSONObject("message")
                 .getString("content")

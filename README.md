@@ -45,3 +45,16 @@ Jab aap sideloaded `.apk` install karte hain, toh Android 13+ security ki wajah 
 - Bina keystore ke build **debug key se sign** hota hai — phone par install ho jayega, par ye production signing nahi hai. Baad me production key se sign ki hui update install karne ke liye purani app uninstall karni padegi.
 - Production key ke liye repo Secrets me ye 4 set karein, phir dobara build chalayein: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`. Keystore file aur `keystore.properties` kabhi commit nahi hote (`.gitignore` me hain).
 - Build me Gradle wrapper (`./gradlew`, Gradle 8.7) use hota hai, isliye runner par Gradle version ka guess nahi lagta.
+
+---
+
+## Models (live-verified 2026-11-02 — purane dead IDs se 404 aata tha)
+
+| Provider | Default model (ab) | Fallback |
+|---|---|---|
+| Google Gemini | `gemini-3.8-flash` | `gemini-3.5-flash-lite`, `gemini-3-flash-preview` |
+| Groq | `openai/gpt-oss-120b` | `openai/gpt-oss-20b` |
+| OpenAI | `gpt-4o-mini` (API me 2027-01-14 tak) | `gpt-4.1-mini` |
+| OpenRouter | `google/gemini-3.8-flash` | `google/gemini-3.5-flash-lite`, `google/gemini-3-flash-preview` |
+
+Purani build me save hua dead model (`gemini-2.5-flash`, `llama-3.3-70b-versatile` wagera) nayi build khud auto-migrate kar degi — dobara type karne ki zaroorat nahi. Koi model 404/503 de to app us provider ke fallback model par khud try karegi, phir bhi fail ho to poora error (code + reason) dikhayegi, 60 character me kaatke nahi.

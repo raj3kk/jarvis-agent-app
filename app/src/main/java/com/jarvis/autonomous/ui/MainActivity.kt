@@ -855,7 +855,7 @@ fun AiBrainSettingsScreen(
         OutlinedTextField(
             value = modelName,
             onValueChange = { modelName = it },
-            label = { Text("Model Name (e.g., gemini-2.5-flash, gpt-4o-mini)") },
+            label = { Text("Model Name (e.g., gemini-3.8-flash, gpt-4o-mini)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
