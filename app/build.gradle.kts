@@ -23,7 +23,10 @@ android {
     signingConfigs {
         if (hasReleaseKeystore) {
             create("release") {
-                storeFile = file(keystoreProperties["storeFile"] as String)
+                // keystore.properties lives at the REPO ROOT (CI writes it there),
+                // so resolve storeFile against rootProject — plain file() would
+                // look inside app/ and validateSigningRelease would fail.
+                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
                 storePassword = keystoreProperties["storePassword"] as String
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
