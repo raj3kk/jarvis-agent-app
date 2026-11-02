@@ -109,7 +109,7 @@ object KokoroTtsClient {
         return espeak.walkTopDown().any { it.isFile }
     }
 
-    fun downloadedBytes(context: Context): Long {
+    fun bundledModelBytes(context: Context): Long {
         val dir = modelDir(context)
         if (!dir.exists()) return 0L
         return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
@@ -201,7 +201,7 @@ object KokoroTtsClient {
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             if (isDownloaded(context)) {
-                val totalMB = downloadedBytes(context) / 1_000_000L
+                val totalMB = bundledModelBytes(context) / 1_000_000L
                 onProgress("ready", totalMB, totalMB)
                 return@runCatching
             }
@@ -277,7 +277,7 @@ object KokoroTtsClient {
             }
             onProgress("ready", totalMB, totalMB)
             JarvisStateRepository.addLog(
-                "Kokoro bundled model ready (${downloadedBytes(context) / 1_000_000L} MB, " +
+                "Kokoro bundled model ready (${bundledModelBytes(context) / 1_000_000L} MB, " +
                     "copied from APK assets — no download needed)."
             )
         }

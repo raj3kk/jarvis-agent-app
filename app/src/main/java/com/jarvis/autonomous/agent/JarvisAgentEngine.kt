@@ -2,6 +2,7 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.provider.Settings
 import android.net.NetworkCapabilities
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
@@ -537,9 +538,13 @@ class JarvisAgentEngine(
      * blocking): only when a licence is activated AND the
      * opt-out is off. Payload is ONLY the generic action
      * sequence (action names, no targets, no inputs, no
-     * utterances, no chat, no whiteboard images, no keys, no
-     * device identifiers). A failed upload is logged, never
-     * retried silently and never shown as success.
+     * utterances, no chat, no whiteboard images) PLUS the
+     * licence auth the server requires (licence_key +
+     * device_id, path (b) of /api/patterns — without them the
+     * server returns 401). A blank key skips the upload
+     * entirely (never send an empty-key request). A failed
+     * upload is logged, never retried silently and never
+     * shown as success.
      */
     private fun maybeUploadLearnedPattern(routine: LearnedRoutine) {
         scope.launch(Dispatchers.IO) {
@@ -548,6 +553,19 @@ class JarvisAgentEngine(
                 val activated = lp.getBoolean(LicencePrefs.KEY_ACTIVATED, false)
                 val optOut = lp.getBoolean(LicencePrefs.KEY_OPT_OUT, false)
                 if (!activated || optOut) return@launch
+                val licenceKey = lp.getString(LicencePrefs.KEY_LICENCE, "") ?: ""
+                if (licenceKey.isBlank()) {
+                    JarvisStateRepository.addLog("Global-learning upload skipped: licence key blank.")
+                    return@launch
+                }
+                val deviceId = Settings.Secure.getString(
+                    context.contentResolver,
+                    Settings.Secure.ANDROID_ID
+                ) ?: ""
+                if (deviceId.isBlank()) {
+                    JarvisStateRepository.addLog("Global-learning upload skipped: device id unavailable.")
+                    return@launch
+                }
                 val stepsJson = JSONArray()
                 for (step in routine.steps) {
                     val obj = JSONObject()
@@ -557,6 +575,8 @@ class JarvisAgentEngine(
                 }
                 val body = JSONObject()
                 body.put("steps", stepsJson)
+                body.put("licence_key", licenceKey)
+                body.put("device_id", deviceId)
                 val conn = URL("$LICENCE_SERVER_URL/api/patterns").openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")

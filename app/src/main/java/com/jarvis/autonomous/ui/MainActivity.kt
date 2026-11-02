@@ -1202,7 +1202,7 @@ fun AiBrainSettingsScreen(
                     )
                     Text(
                         text = if (kokoroReady) {
-                            "Status: Ready ✅ (${KokoroTtsClient.downloadedBytes(kokoroContext) / 1_000_000L} MB) — ab Jarvis isi awaaz me bolega (jab Kokoro toggle ON hai)."
+                            "Status: Ready ✅ (${KokoroTtsClient.bundledModelBytes(kokoroContext) / 1_000_000L} MB) — ab Jarvis isi awaaz me bolega (jab Kokoro toggle ON hai)."
                         } else {
                             "Status: Not ready — bundled copy abhi baaki hai. Neeche wala button dabao (koi download nahi, sirf APK assets se copy)."
                         },

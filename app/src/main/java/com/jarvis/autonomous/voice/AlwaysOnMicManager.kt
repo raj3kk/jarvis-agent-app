@@ -51,10 +51,18 @@ import kotlinx.coroutines.withContext
  * in JarvisForegroundService) — that is an Android limit, not magic,
  * and no code here can listen without a live service process.
  *
- * NO WAKE WORD in this release (user did not ask for one): Jarvis
- * responds in-session, not to every ambient sound. The recognizer
- * loop below is session-gated by [start]/[stop]; the optional VAD
- * monitor likewise only segments while a session is active, because
+ * WAKE WORD (correction 2026-11-03): the wake word IS "Jarvis"
+ * (case-insensitive STT match in VoiceManager's onResults —
+ * "jarvis", "hey jarvis", "ok jarvis", "sun jarvis"). It is the
+ * re-activation path while this always-on loop is OFF: after
+ * "mic band karo" the service restarts wake-word listening, and
+ * a spoken "Jarvis" (alone, or "Jarvis <command>") re-enters the
+ * session. While this loop RUNS, the coordinator suppresses
+ * wake-word listening (service stops it before [start] and only
+ * restarts it when the loop is not enabled), so two recognizers
+ * never fight over the mic. The recognizer loop below is
+ * session-gated by [start]/[stop]; the optional VAD monitor
+ * likewise only segments while a session is active, because
  * the coordinator only starts it after [start].
  *
  * PRIMARY PATH — recognizer-only turn timer. Turn end comes from
@@ -625,8 +633,10 @@ fun interface StopSpeakingCallback {
  *
  * VAD segments go to STT only while a session is active: the
  * coordinator starts this monitor only after AlwaysOnMicManager
- * [start], and [stop]/[release] ends it. There is no wake word and
- * no always-segmenting mode in this release.
+ * [start], and [stop]/[release] ends it. Wake-word listening is
+ * a separate VoiceManager path (word: "Jarvis") that runs only
+ * while this loop is off; there is no always-segmenting mode
+ * outside an active session.
  */
 class SherpaVadMonitor(
     context: Context,

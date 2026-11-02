@@ -111,6 +111,23 @@ jobs:
           ls -lh app/src/main/assets/kokoro/ | head -20
           rm -rf /tmp/kokoro-unpack /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2
 
+      # Silero VAD model — BUNDLED IN CI, NEVER COMMITTED:
+      # same pattern as the Kokoro bundle step. URL verified
+      # 2026-11-03 via HEAD before use: HTTP 200,
+      # application/octet-stream, 643,854 bytes, from the
+      # sherpa-onnx asr-models release (also referenced by
+      # sherpa-onnx's own flutter/wasm VAD examples). The exact
+      # byte check below fails loudly if GitHub ever serves a
+      # different build, instead of silently shipping it.
+      - name: Bundle Silero VAD model asset (CI-only, never committed)
+        run: |
+          set -e
+          mkdir -p app/src/main/assets
+          curl -sL -o app/src/main/assets/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+          VAD_BYTES=$(stat -c%s app/src/main/assets/silero_vad.onnx)
+          echo "Silero VAD bytes: $VAD_BYTES (expected 643854)"
+          test "$VAD_BYTES" -eq 643854
+
       - name: Build Debug & Release APK
         # Owner's HF token (read-only Gemma-download token) goes into
         # BuildConfig.HF_TOKEN so the end user enters no token. The
@@ -134,6 +151,8 @@ jobs:
             echo "Checking bundled Kokoro assets in $APK"
             unzip -l "$APK" | grep -E "assets/kokoro/model\.int8\.onnx" || (echo "MISSING bundled Kokoro model in $APK"; exit 1)
             unzip -l "$APK" | grep -E "assets/kokoro/voices\.bin" || (echo "MISSING bundled Kokoro voices in $APK"; exit 1)
+            # 1.4.0 gate: the release APK MUST carry the bundled Silero VAD model.
+            unzip -l "$APK" | grep -E "assets/silero_vad\.onnx" || (echo "MISSING bundled Silero VAD model in $APK"; exit 1)
           done
 
       - name: Rename release APK to Jarvis2026.apk

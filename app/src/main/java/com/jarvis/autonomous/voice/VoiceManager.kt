@@ -206,7 +206,7 @@ class VoiceManager(
                 // Continuous wake-word mode check
                 if (bestText.isNotEmpty()) {
                     val lower = bestText.lowercase()
-                    val wakeTriggers = listOf("jarvis", "hey jarvis", "ok jarvis", "sun jarvis", "sun bhai")
+                    val wakeTriggers = listOf("jarvis", "hey jarvis", "ok jarvis", "sun jarvis")
                     val matchedWake = wakeTriggers.firstOrNull { lower.contains(it) }
                     if (matchedWake != null) {
                         val stripped = lower.substringAfter(matchedWake).trim()

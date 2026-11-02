@@ -93,17 +93,6 @@ object LicencePrefs {
     const val KEY_ACTIVATED = "licence_activated"
 }
 
-// URL CORRECTION (2026-11-02, verified live): the brief's URL
-// https://jarvis-server-7vt52tm84-webbuilder1.vercel.app is NOT a
-// production alias — it is the frozen deployment URL of the old
-// deploy dpl_C2R9wYwYtojG1EcbW98coAKU2CFQ, and Vercel refuses to
-// re-point it (POST aliases -> 400 alias_in_use: "is a deployment
-// URL"). The project's real automatic production alias, returned by
-// the Vercel create-deployment response, is the URL below. The
-// coordinator must NOT revert this to the old URL: the old deploy
-// lacks /api/patterns and the key+device release path, and its
-// verify route returned 500 where the new deploy returns the correct
-// 404 invalid_licence.
 const val LICENCE_SERVER_URL = "https://jarvis-server-webbuilder1.vercel.app"
 
 private val licenceHttp = OkHttpClient()

@@ -27,7 +27,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 
 class JarvisForegroundService : Service() {
 
@@ -72,6 +74,42 @@ class JarvisForegroundService : Service() {
             }
         } else {
             voiceManager.speakAndWait(text)
+        }
+    }
+
+    /**
+     * Silero VAD (1.4.0, CI-bundled asset, never committed):
+     * after the mic loop starts, copy assets/silero_vad.onnx
+     * to the files dir (skipped when already present at full
+     * size) and start the Sherpa VAD monitor. The recognizer
+     * turn timer stays primary: VAD segments are not used to
+     * cut turns in this release, and the monitor degrades
+     * silently to VAD-off on mic-busy (see AlwaysOnMicManager).
+     * A missing asset only logs — it never breaks the mic loop.
+     */
+    private fun startVadMonitor() {
+        serviceScope.launch {
+            val started = runCatching {
+                val target = File(filesDir, "silero_vad.onnx")
+                val assetSize = runCatching {
+                    assets.openFd("silero_vad.onnx").use { it.length }
+                }.getOrDefault(-1L)
+                if (!target.exists() || (assetSize > 0 && target.length() != assetSize)) {
+                    withContext(Dispatchers.IO) {
+                        assets.open("silero_vad.onnx").use { input ->
+                            target.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                }
+                micManager.enableVadMonitor(target) { _ ->
+                    // Echo-gated segments; no per-segment action:
+                    // the recognizer timer remains the primary path.
+                }
+            }.getOrDefault(false)
+            JarvisStateRepository.addLog(
+                "Silero VAD monitor started=$started " +
+                    "(mic-busy degrades to VAD-off by design)."
+            )
         }
     }
 
@@ -194,7 +232,9 @@ class JarvisForegroundService : Service() {
                 // recognizer), fall back to the single-shot listen.
                 if (::micManager.isInitialized) {
                     voiceManager.stopListeningInternal()
-                    if (!micManager.start()) {
+                    if (micManager.start()) {
+                        startVadMonitor()
+                    } else {
                         voiceManager.triggerManualVoiceCommand()
                     }
                 } else {
