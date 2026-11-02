@@ -23,8 +23,16 @@ jobs:
           java-version: "17"
           distribution: "temurin"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # NOTE: android-actions/setup-android@v3 defaults to installing the
+      # obsolete 'tools' package, which sdkmanager no longer provides, so
+      # that step fails the whole job. ubuntu-latest already ships an
+      # Android SDK, so just ensure the exact platform/build-tools we need.
+      - name: Ensure Android SDK packages (platform 34, build-tools 34.0.0)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/cmdline-tools" || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: Set up Gradle (uses gradlew wrapper, Gradle 8.7)
         uses: gradle/actions/setup-gradle@v3
