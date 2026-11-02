@@ -31,8 +31,9 @@ import kotlinx.coroutines.withContext
  * - Serves EVERY project file through the single source of truth
  *   ([ProjectStore.projectFile]): index.html, style.css, script.js,
  *   nested pages, images and other assets — with correct MIME types
- *   (notably .js as application/javascript, images as image/*, SVG,
- *   fonts) and NO charset suffix on binary types (the old server
+ *   (notably .js as application/javascript, images as image/png
+ *   and friends, SVG, fonts) and NO charset suffix on binary types
+ *   (the old server
  *   appended "; charset=UTF-8" to image/png and friends).
  * - Path mapping is exact for http://127.0.0.1:8080/<project>/ :
  *   a bare "/<project>" (no trailing slash) 301-redirects to
