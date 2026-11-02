@@ -74,6 +74,43 @@ jobs:
           ls -lh app/libs/sherpa-onnx.aar
           test $(stat -c%s app/libs/sherpa-onnx.aar) -eq 37631864
 
+      # Kokoro model assets — BUNDLED IN CI, NEVER COMMITTED:
+      # downloads the sherpa-onnx kokoro-int8-multi-lang-v1_0
+      # tarball (verified 2026-11-02: HTTP 200, 132,353,410 bytes
+      # via GitHub release API + full-download size check) and
+      # extracts it into app/src/main/assets/kokoro/ BEFORE the
+      # Gradle build, so the APK carries the model. The workflow
+      # never commits these files — they exist only in this
+      # runner. Unpacked size ~190 MB (model.int8.onnx ~109 MB).
+      # If this URL 404s in future, the fallback is the HF
+      # unpacked files (csukuangfj/kokoro-int8-multi-lang-v1_0
+      # via the HF tree API, as 1.3.0 downloaded on-device) —
+      # do NOT silently switch to a different model version.
+      - name: Bundle Kokoro model assets (CI-only, never committed)
+        run: |
+          set -e
+          mkdir -p app/src/main/assets/kokoro /tmp/kokoro-unpack
+          curl -sL -o /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2
+          TARBALL_BYTES=$(stat -c%s /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2)
+          echo "Kokoro tarball bytes: $TARBALL_BYTES (expected ~132353410)"
+          test "$TARBALL_BYTES" -ge 100000000
+          tar -xjf /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2 -C /tmp/kokoro-unpack
+          MODEL_FILE=$(find /tmp/kokoro-unpack -name model.int8.onnx | head -1)
+          test -n "$MODEL_FILE"
+          MODEL_DIR=$(dirname "$MODEL_FILE")
+          echo "Kokoro model dir in tarball: $MODEL_DIR"
+          cp -r "$MODEL_DIR"/. app/src/main/assets/kokoro/
+          test -f app/src/main/assets/kokoro/model.int8.onnx
+          MODEL_BYTES=$(stat -c%s app/src/main/assets/kokoro/model.int8.onnx)
+          echo "Bundled model.int8.onnx bytes: $MODEL_BYTES (must be > 50000000)"
+          test "$MODEL_BYTES" -gt 50000000
+          test -f app/src/main/assets/kokoro/voices.bin
+          test -f app/src/main/assets/kokoro/tokens.txt
+          test -d app/src/main/assets/kokoro/espeak-ng-data
+          du -sh app/src/main/assets/kokoro/
+          ls -lh app/src/main/assets/kokoro/ | head -20
+          rm -rf /tmp/kokoro-unpack /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2
+
       - name: Build Debug & Release APK
         # Owner's HF token (read-only Gemma-download token) goes into
         # BuildConfig.HF_TOKEN so the end user enters no token. The
@@ -92,6 +129,18 @@ jobs:
           "$AAPT2" dump badging app/build/outputs/apk/release/*.apk | head -5
           "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/*.apk | head -20
           if [ -f keystore.properties ]; then echo "SIGNING=production-keystore"; else echo "SIGNING=debug-fallback"; fi
+          # 1.4.0 gate: the release APK MUST carry the bundled Kokoro model.
+          for APK in app/build/outputs/apk/release/*.apk; do
+            echo "Checking bundled Kokoro assets in $APK"
+            unzip -l "$APK" | grep -E "assets/kokoro/model\.int8\.onnx" || (echo "MISSING bundled Kokoro model in $APK"; exit 1)
+            unzip -l "$APK" | grep -E "assets/kokoro/voices\.bin" || (echo "MISSING bundled Kokoro voices in $APK"; exit 1)
+          done
+
+      - name: Rename release APK to Jarvis2026.apk
+        run: |
+          set -e
+          cp app/build/outputs/apk/release/*.apk Jarvis2026.apk
+          ls -lh Jarvis2026.apk
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -103,6 +152,6 @@ jobs:
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Autonomous-Release-APK
-          path: app/build/outputs/apk/release/*.apk
+          name: Jarvis2026-APK
+          path: Jarvis2026.apk
           retention-days: 30

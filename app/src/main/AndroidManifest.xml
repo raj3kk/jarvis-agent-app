@@ -86,6 +86,17 @@
                 android:value="Autonomous voice assistant and multi-step accessibility agent" />
         </service>
 
+        <!-- Floating Whiteboard over other apps (S4, 1.4.0) -->
+        <service
+            android:name=".service.JarvisWhiteboardService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating whiteboard over other apps" />
+        </service>
+
         <!-- Notification Reader Service -->
         <service
             android:name=".service.JarvisNotificationService"

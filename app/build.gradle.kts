@@ -38,8 +38,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.3.0-PRO"
+        versionCode = 8
+        versionName = "1.4.0-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
@@ -60,6 +60,19 @@ android {
 
         vectorDrawables {
             useSupportLibrary = true
+        }
+
+        // 1.4.0 Kokoro-only: ship native libs for arm64-v8a only.
+        // Both native stacks ship arm64-v8a (Sherpa-ONNX static AAR
+        // and LiteRT-LM Android), and the user's phone is arm64, so
+        // this does not break either lib on the target device. It
+        // drops the x86_64 slice (emulator-only) and saves a few MB
+        // against the ~190 MB bundled Kokoro assets. CI GATE: if
+        // the 1.4.0 build fails with a missing-native-lib error,
+        // revert this block first (keep both ABIs) before touching
+        // anything else — see INTEGRATION_NOTES_Kokoro.md §4.
+        ndk {
+            abiFilters += "arm64-v8a"
         }
 
     }
@@ -112,6 +125,11 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        // Deliberately NO aapt noCompress for onnx/bin: Sherpa never
+        // reads APK assets directly. KokoroTtsClient copies assets
+        // via AssetManager streams (which decompress on the fly) to
+        // the files dir, and Sherpa loads those copies. noCompress
+        // would only inflate the APK further for zero benefit.
     }
 }
 

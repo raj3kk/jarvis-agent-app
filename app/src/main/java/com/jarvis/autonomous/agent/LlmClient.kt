@@ -3,6 +3,7 @@ package com.jarvis.autonomous.agent
 import android.content.Context
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.data.ProjectStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -34,6 +35,9 @@ data class AgentDecision(
     val projectName: String = "",
     val fileName: String = "",
     val fileContent: String = "",
+    val browserUrl: String = "",
+    val browserSpeakSummary: Boolean = true,
+    val browserShowPage: Boolean = false,
     val askUser: Boolean = false,
     val isCompleted: Boolean = true
 )
@@ -66,6 +70,21 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 return@withContext AgentDecision(
                     reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~475 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
                     thought = "Local model not downloaded",
+                    action = "NONE",
+                    isCompleted = true
+                )
+            }
+            // Builder bypass (audit S7): the local chat path returns
+            // action=NONE for EVERYTHING, so a voice website build
+            // ("ek website banao") used to get a friendly chat reply
+            // and NO project at all — the user saw nothing built.
+            // The small local model has no structured-action path, so
+            // do not fake a build: say so plainly and point at the
+            // working paths (cloud AI, or manual Create in Projects).
+            if (isCodeBuilderRequest(userGoal)) {
+                return@withContext AgentDecision(
+                    reply = "Website banana local model se nahi hoga — iske liye AI Brain me Gemini ya Groq chuno, phir dobara bolo; ya Projects tab me Create Website Project dabao aur file khud edit karo.",
+                    thought = "Local provider cannot emit project actions",
                     action = "NONE",
                     isCompleted = true
                 )
@@ -199,6 +218,28 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         }
     }
 
+    /** True when the user is asking to build or edit a website/page
+     *  (English + Hinglish triggers). Used only by the LOCAL-provider
+     *  guard above — cloud prompts carry the full builder rules. */
+    private fun isCodeBuilderRequest(text: String): Boolean {
+        val lower = text.lowercase()
+        if (lower.contains("website") || lower.contains("web site") ||
+            lower.contains("webpage") || lower.contains("web page") ||
+            lower.contains("portfolio") || lower.contains("landing page")
+        ) return true
+        if (lower.contains("rang badal") || lower.contains("color badal") ||
+            lower.contains("page jodo") || lower.contains("section add") ||
+            lower.contains("button ka") || lower.contains("naya page")
+        ) return true
+        val buildVerb = lower.contains("banao") || lower.contains("bana do") ||
+            lower.contains("banado") || lower.contains("banaye") ||
+            lower.contains("create") || lower.contains("build")
+        val buildObject = lower.contains("site") || lower.contains("page") ||
+            lower.contains("app") || lower.contains("calculator") ||
+            lower.contains("todo")
+        return buildVerb && buildObject
+    }
+
     private fun buildSystemPrompt(): String {
         val memories = prefs.getMemories().joinToString("; ")
         return """
@@ -212,7 +253,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
-            5. CODE BUILDER: If the user asks you to make a website/app/page (e.g. "is ki website banao", "ek portfolio site banao", "ek calculator page banao"), do NOT open a browser. Use action="CREATE_PROJECT" first with `projectName` (short, no spaces) and `fileContent` = the complete index.html for that site (full, working, mobile-friendly, creamy theme, with style.css/script.js links — the app already provides default style.css/script.js if you only write index.html). Then, if needed, use action="WRITE_PROJECT_FILE" with `projectName`, `fileName` ("style.css" or "script.js") and `fileContent` for custom CSS/JS. Each project is saved in its OWN folder, and the user previews it on localhost inside the app (Projects tab). Never mix two projects into one folder.
+            5. CODE BUILDER — WEBSITE BUILD (multi-step, never one-and-done): If the user asks you to make a website/app/page — Hinglish or English, e.g. "ek website banao", "website bana do", "meri portfolio/dukaan/restaurant ki site banao", "ek calculator/todo page banao", "is ki website banao" — do NOT open a browser. Build it in EXACTLY these steps, one action per step, with the SAME projectName (short, no spaces, same spelling and case) on every step:
+               Step 1: action="CREATE_PROJECT", projectName=<name>, fileContent=the COMPLETE index.html (full, working, mobile-friendly, creamy theme). index.html MUST contain exactly `<link rel="stylesheet" href="style.css">` and `<script src="script.js"></script>` and NO other local file reference unless you also write that file. Set isCompleted=false on this step — the build is NOT done yet.
+               Step 2: action="WRITE_PROJECT_FILE", same projectName, fileName="style.css", fileContent=the COMPLETE custom CSS for this site (all classes the HTML uses). Set isCompleted=false.
+               Step 3: action="WRITE_PROJECT_FILE", same projectName, fileName="script.js", fileContent=the COMPLETE custom JS for this site (every id the HTML references must exist in the JS, every JS getElementById target must exist in the HTML). Set isCompleted=true, and your reply MUST be the build summary: files created (index.html, style.css, script.js), the project name, and "Projects tab me Preview dabao, ya Browser me kholo".
+               EXCEPTION — single-file build ONLY when the user explicitly asks for one file ("sirf ek file", "single file page"): then do ONE step, action="CREATE_PROJECT" with a fully self-contained index.html (inline <style> and <script> inside the HTML, NO href="style.css" and NO src="script.js"), isCompleted=true, and say it is a single-file build. Never mix the two modes: a 3-file HTML must never reference files you did not write, and a single-file HTML must never reference external files.
+            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps with isCompleted=false then true. Set isCompleted=true on the last edit step and reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho".
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):
             - "NONE": No screen action needed (casual chat, asking user a question, or task already complete).
@@ -221,6 +267,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             - "YOUTUBE_PLAY": Search YouTube AND play the first video result automatically. Fill `text` with search query. Use this when the user said play/chalao/bajao.
             - "WHATSAPP_SEND": Open a WhatsApp chat and send a NEW message (not a notification reply). Fill `contact` (name or number) and `text` (message). Use ONLY after the user explicitly said to send this message to this person — a sent message cannot be unsent.
             - "OPEN_URL": Open any website or deep link directly. Fill `text` with URL.
+            - "OPEN_BROWSER": In-app browser, never leaves the app. For ANY web question/lookup use this, never OPEN_URL. Fill `browserUrl` with the page the user named (or the exact page Jarvis proposed and the user approved). `browserShowPage=true` ONLY when the user explicitly said they want to SEE the page ("dikhao", "khol ke dikhao", "page dikhao"); otherwise false (background answer, no tab switch). `browserSpeakSummary=true` for question-answering.
             - "REPLY_NOTIFICATION": Reply directly in background to a recent WhatsApp/Instagram/SMS notification without opening the app! Fill `contact` (sender name filter) and `text` (reply message).
             - "TAP_NODE": Click a UI element from the live screen list by its integer `[ID]`. Fill `nodeId`.
             - "TAP_XY": Tap exact screen coordinates `(x, y)`. Fill `x` and `y`.
@@ -244,7 +291,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             {
               "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, 1-2 short sentences for step updates, never a lecture, never 'As an AI'",
               "thought": "Your internal reasoning for this step",
-              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | YOUTUBE_PLAY | WHATSAPP_SEND | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
+              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | YOUTUBE_PLAY | WHATSAPP_SEND | OPEN_URL | OPEN_BROWSER | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
               "appName": "",
               "nodeId": -1,
               "x": -1,
@@ -262,6 +309,9 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
               "projectName": "",
               "fileName": "",
               "fileContent": "",
+              "browserUrl": "",
+              "browserSpeakSummary": true,
+              "browserShowPage": false,
               "askUser": false,
               "isCompleted": false
             }
@@ -393,7 +443,26 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             .removePrefix("```")
             .removeSuffix("```")
             .trim()
-        val obj = JSONObject(cleaned)
+        // Robust extraction: some models wrap the JSON in prose even
+        // with responseMimeType/json_object. Parsing the first '{'
+        // .. last '}' substring recovers the decision instead of
+        // failing the whole build step with an API error.
+        val obj = runCatching { JSONObject(cleaned) }.getOrElse {
+            val start = cleaned.indexOf('{')
+            val end = cleaned.lastIndexOf('}')
+            if (start >= 0 && end > start) JSONObject(cleaned.substring(start, end + 1)) else throw it
+        }
+        // Normalise project/file names through the store's ONE
+        // canonical form (audit S7): raw model spellings ("Meri
+        // Portfolio" vs "meri-portfolio", "style.css " vs
+        // "/style.css") used to land in different folders / miss the
+        // href="style.css" reference, so the preview showed defaults
+        // or 404s. An unsafe fileName falls back to index.html
+        // instead of creating a traversal/odd file.
+        val rawProject = obj.optString("projectName", "")
+        val rawFile = obj.optString("fileName", "")
+        val projectName = if (rawProject.isBlank()) "" else ProjectStore.sanitizeProjectName(rawProject)
+        val fileName = if (rawFile.isBlank()) "" else (ProjectStore.sanitizeFileName(rawFile) ?: "index.html")
         return AgentDecision(
             reply = obj.optString("reply", ""),
             thought = obj.optString("thought", ""),
@@ -412,9 +481,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             alarmHour = obj.optInt("alarmHour", 7),
             alarmMinute = obj.optInt("alarmMinute", 0),
             memoryNote = obj.optString("memoryNote", ""),
-            projectName = obj.optString("projectName", ""),
-            fileName = obj.optString("fileName", ""),
+            projectName = projectName,
+            fileName = fileName,
             fileContent = obj.optString("fileContent", ""),
+            browserUrl = obj.optString("browserUrl", ""),
+            browserSpeakSummary = obj.optBoolean("browserSpeakSummary", true),
+            browserShowPage = obj.optBoolean("browserShowPage", false),
             askUser = obj.optBoolean("askUser", false),
             isCompleted = obj.optBoolean("isCompleted", true)
         )

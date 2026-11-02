@@ -16,25 +16,32 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONArray
 import java.io.File
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Kokoro offline voice for Jarvis (user order 2026-11-02) — the
  * voice Flora chose: Kokoro hf_alpha (Hindi female), run fully
- * on-device via Sherpa-ONNX, no key, no quota, no network after
- * the one-time model download.
+ * on-device via Sherpa-ONNX, no key, no quota, no network.
  *
- * Model: Kokoro multi-lang v1.0 INT8, Hugging Face repo
- * csukuangfj/kokoro-int8-multi-lang-v1_0, downloaded UNPACKED
- * via the HF tree API (recursive) + resolve URLs — no tar/bzip2
- * extraction needed on the phone. Total ~190 MB (model.int8.onnx
- * ~109 MB + voices.bin ~28 MB + espeak-ng-data ~18 MB + lexicons
- * + dict). Files land in app external files dir Kokoro/.
+ * 1.4.0 — BUNDLED, asset-first (no network download on the phone):
+ * CI downloads the sherpa-onnx kokoro-int8-multi-lang-v1_0 tarball
+ * and extracts it into app/src/main/assets/kokoro/ (never
+ * committed to git). On first use, [ensureAssetsReady] copies
+ * assets/kokoro/ (model.int8.onnx ~109 MB + voices.bin + tokens.txt
+ * + espeak-ng-data/ + lexicons/dict if present) into the existing
+ * model dir (app external files dir Kokoro/) with progress
+ * callbacks and a free-space check, and the engine then loads
+ * from that dir exactly as before. A previously downloaded model
+ * dir is still accepted as-is ([isDownloaded] short-circuits the
+ * copy), so phones that already downloaded under 1.3.0 keep
+ * working without re-copying.
+ *
+ * Total unpacked ~190 MB. The copy is NOT zero-time on first run
+ * (see INTEGRATION_NOTES_Kokoro.md §5): the coordinator MUST
+ * drive [ensureAssetsReady] from the UI at app launch behind a
+ * visible creamy-theme progress screen, so the user never stares
+ * at a blank hang while ~190 MB copies.
  *
  * Sherpa API (verified against the bundled AAR 1.13.4 classes,
  * not guessed): OfflineTts(null, config) for file-based models,
@@ -56,16 +63,25 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object KokoroTtsClient {
 
-    private const val REPO = "csukuangfj/kokoro-int8-multi-lang-v1_0"
     private const val MODEL_FILE = "model.int8.onnx"
     private const val VOICES_FILE = "voices.bin"
     private const val TOKENS_FILE = "tokens.txt"
     private const val HF_ALPHA_SID = 31
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
-        .build()
+    /** Asset folder CI fills from the sherpa-onnx tarball (see build-apk.yml). */
+    private const val ASSET_DIR = "kokoro"
+
+    /**
+     * Free-space floor for a FRESH first-run copy: ~200 MB
+     * (200 MiB = 209,715,200 bytes), i.e. the ~190 MB unpacked
+     * bundle plus margin. On a partial copy (app killed mid-copy)
+     * the floor is instead remaining-bytes + 10 MB, so a resumed
+     * copy is not blocked by the full 200 MB rule — see
+     * [ensureAssetsReady].
+     */
+    const val REQUIRED_FREE_BYTES_FRESH_COPY = 200L * 1024L * 1024L
+    private const val COPY_RESUME_MARGIN_BYTES = 10L * 1024L * 1024L
+    private const val FALLBACK_BUNDLED_BYTES = 190_000_000L
 
     private val engineLock = Mutex()
     private var engine: OfflineTts? = null
@@ -99,83 +115,171 @@ object KokoroTtsClient {
         return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 
+    // ---------- Bundled-asset first run (1.4.0) ----------
+
+    /** True if this APK carries assets/kokoro/model.int8.onnx (CI-bundled build). */
+    fun hasBundledAssets(context: Context): Boolean {
+        return try {
+            context.assets.list(ASSET_DIR)?.contains(MODEL_FILE) == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Free bytes usable on the volume holding the model dir. */
+    fun availableFreeBytes(context: Context): Long {
+        val dir = modelDir(context)
+        runCatching { dir.mkdirs() }
+        return try {
+            dir.usableSpace
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
     /**
-     * Download the full model bundle. Returns Result; on failure the
-     * partial .tmp files are deleted, never half-installed.
+     * Recursively lists asset files under [ASSET_DIR] as relative
+     * paths (e.g. "espeak-ng-data/phontab"). AssetManager.list()
+     * returns null/empty for a file, non-empty for a directory; an
+     * empty directory is indistinguishable from a file, which is
+     * fine here because the Kokoro bundle has no empty dirs that
+     * matter (espeak-ng-data files are what Sherpa reads).
      */
-    suspend fun download(
+    private fun listBundledFiles(context: Context, relDir: String = ""): List<String> {
+        val assetPath = if (relDir.isEmpty()) ASSET_DIR else "$ASSET_DIR/$relDir"
+        val children = try {
+            context.assets.list(assetPath)
+        } catch (e: Exception) {
+            null
+        } ?: return listOf(relDir)
+        if (children.isEmpty()) return listOf(relDir)
+        val out = mutableListOf<String>()
+        for (child in children) {
+            val childRel = if (relDir.isEmpty()) child else "$relDir/$child"
+            out += listBundledFiles(context, childRel)
+        }
+        return out
+    }
+
+    private fun bundledFileBytes(context: Context, relPath: String): Long {
+        return try {
+            context.assets.openFd("$ASSET_DIR/$relPath").use { it.length }
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    /**
+     * Ensures the model dir is ready, copying bundled assets on
+     * first use. Idempotent: if [isDownloaded] is already true
+     * (bundled copy done, or a 1.3.0 download), this returns
+     * success immediately without copying anything.
+     *
+     * Progress stages reported to [onProgress] (stage, copiedMB,
+     * totalMB) — the coordinator MUST surface these on a visible
+     * screen (see INTEGRATION_NOTES_Kokoro.md §5), never a blank
+     * hang:
+     *  - "checking_space": free-space check running (copied=0).
+     *  - "copying": files copying (copied grows to total).
+     *  - "ready": model dir verified complete.
+     * On failure the returned Result carries a user-showable
+     * message (free-space failure names the MB available vs
+     * needed). Partial copies are KEPT (not deleted) so a relaunch
+     * resumes instead of restarting from zero; already-copied
+     * files with matching size are skipped.
+     *
+     * Free-space rule: fresh copy (no model files present yet)
+     * requires [REQUIRED_FREE_BYTES_FRESH_COPY] (~200 MB) free;
+     * a resumed partial copy requires remaining-bytes + 10 MB.
+     * Failure message format (show verbatim):
+     * "Kokoro setup needs ~XXX MB free space — only YYY MB
+     * available. Please free space and relaunch Jarvis."
+     */
+    suspend fun ensureAssetsReady(
         context: Context,
-        onProgress: (downloadedMB: Long, totalMB: Long) -> Unit
+        onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit = { _, _, _ -> }
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            if (isDownloaded(context)) {
+                val totalMB = downloadedBytes(context) / 1_000_000L
+                onProgress("ready", totalMB, totalMB)
+                return@runCatching
+            }
+            if (!hasBundledAssets(context)) {
+                throw IllegalStateException(
+                    "Kokoro voice missing: this APK has no bundled Kokoro " +
+                        "model and no downloaded model exists. Reinstall the " +
+                        "bundled 1.4.0 APK — no other voice will be used."
+                )
+            }
+            onProgress("checking_space", 0L, 0L)
             val dir = modelDir(context)
             dir.mkdirs()
-            val treeUrl =
-                "https://huggingface.co/api/models/$REPO/tree/main?recursive=true"
-            val treeJson = http.newCall(Request.Builder().url(treeUrl).build())
-                .execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IllegalStateException("Kokoro file list nahi mili: HTTP ${resp.code}")
-                    }
-                    resp.body?.string() ?: throw IllegalStateException("Empty file list")
-                }
-            val arr = JSONArray(treeJson)
-            val entries = mutableListOf<Pair<String, Long>>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                if (obj.optString("type") != "file") continue
-                val path = obj.getString("path")
-                if (path == ".gitattributes" || path == "LICENSE" || path == "README.md") continue
-                entries.add(path to obj.optLong("size", 0L))
+            val files = listBundledFiles(context)
+            val sizes = files.associateWith { bundledFileBytes(context, it) }
+            val totalBytes = sizes.values.filter { it > 0 }.sum()
+                .takeIf { it > 0 } ?: FALLBACK_BUNDLED_BYTES
+            val totalMB = totalBytes / 1_000_000L
+            // Bytes still to copy (skip targets already present at full size).
+            var remainingBytes = 0L
+            for ((rel, size) in sizes) {
+                val target = File(dir, rel)
+                if (size > 0 && target.exists() && target.length() == size) continue
+                remainingBytes += if (size > 0) size else 0L
             }
-            if (entries.none { it.first == MODEL_FILE }) {
-                throw IllegalStateException("Kokoro model file list me $MODEL_FILE nahi mila")
+            val alreadyPresent = dir.walkTopDown().any { it.isFile }
+            val requiredBytes = if (!alreadyPresent) {
+                REQUIRED_FREE_BYTES_FRESH_COPY
+            } else {
+                remainingBytes + COPY_RESUME_MARGIN_BYTES
             }
-            val total = entries.sumOf { it.second }.let { if (it > 0) it else 190_000_000L }
-            var downloaded = 0L
-            for ((path, size) in entries) {
-                val target = File(dir, path)
-                if (target.exists() && size > 0 && target.length() == size) {
-                    downloaded += size
-                    onProgress(downloaded / 1_000_000L, total / 1_000_000L)
-                    continue
-                }
+            val freeBytes = availableFreeBytes(context)
+            if (freeBytes < requiredBytes) {
+                val msg = "Kokoro setup needs ~${requiredBytes / 1_000_000L} MB free " +
+                    "space — only ${freeBytes / 1_000_000L} MB available. " +
+                    "Please free space and relaunch Jarvis."
+                JarvisStateRepository.addLog(msg)
+                throw IllegalStateException(msg)
+            }
+            var copiedBytes = totalBytes - remainingBytes
+            onProgress("copying", copiedBytes / 1_000_000L, totalMB)
+            for (rel in files) {
+                val target = File(dir, rel)
+                val size = sizes[rel] ?: -1L
+                if (size > 0 && target.exists() && target.length() == size) continue
                 target.parentFile?.mkdirs()
                 val tmp = File(target.parentFile, "${target.name}.tmp")
-                val encodedPath = path.split("/").joinToString("/") {
-                    it.replace(" ", "%20")
-                }
-                val fileUrl =
-                    "https://huggingface.co/$REPO/resolve/main/$encodedPath?download=true"
-                http.newCall(Request.Builder().url(fileUrl).build()).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        tmp.delete()
-                        throw IllegalStateException("Kokoro download fail ($path): HTTP ${resp.code}")
-                    }
-                    val body = resp.body ?: throw IllegalStateException("Empty body: $path")
-                    body.byteStream().use { input ->
+                try {
+                    context.assets.open("$ASSET_DIR/$rel").use { input ->
                         tmp.outputStream().use { output ->
                             val buf = ByteArray(64 * 1024)
                             while (true) {
                                 val n = input.read(buf)
                                 if (n < 0) break
                                 output.write(buf, 0, n)
-                                downloaded += n
-                                onProgress(downloaded / 1_000_000L, total / 1_000_000L)
+                                copiedBytes += n
                             }
                         }
                     }
-                }
-                if (path == MODEL_FILE && tmp.length() <= 50_000_000L) {
+                    if (target.exists()) target.delete()
+                    check(tmp.renameTo(target)) { "Save nahi hua: $rel" }
+                } catch (e: Exception) {
                     tmp.delete()
-                    throw IllegalStateException("Kokoro model incomplete (${tmp.length()} bytes)")
+                    throw e
                 }
-                if (target.exists()) target.delete()
-                check(tmp.renameTo(target)) { "Save nahi hua: $path" }
+                onProgress("copying", copiedBytes / 1_000_000L, totalMB)
             }
             if (!isDownloaded(context)) {
-                throw IllegalStateException("Kokoro download ke baad bhi incomplete hai")
+                throw IllegalStateException(
+                    "Kokoro copy finished but the model is still incomplete — " +
+                        "relaunch Jarvis to resume the copy."
+                )
             }
+            onProgress("ready", totalMB, totalMB)
+            JarvisStateRepository.addLog(
+                "Kokoro bundled model ready (${downloadedBytes(context) / 1_000_000L} MB, " +
+                    "copied from APK assets — no download needed)."
+            )
         }
     }
 
@@ -190,7 +294,28 @@ object KokoroTtsClient {
 
     suspend fun speak(context: Context, text: String): Boolean {
         if (text.isBlank()) return false
-        if (!isDownloaded(context)) return false
+        if (!isDownloaded(context)) {
+            // First run: copy bundled assets (visible progress is
+            // the coordinator's launch screen; here we log progress
+            // so a speak-triggered copy is never a silent hang).
+            var lastLoggedMB = -1L
+            val ready = ensureAssetsReady(context) { stage, copiedMB, totalMB ->
+                if (stage == "copying" && totalMB > 0 && copiedMB - lastLoggedMB >= 25) {
+                    lastLoggedMB = copiedMB
+                    JarvisStateRepository.addLog(
+                        "Kokoro first-run copy: $copiedMB / $totalMB MB " +
+                            "(bundled assets, no download)."
+                    )
+                }
+            }
+            if (ready.isFailure) {
+                JarvisStateRepository.addLog(
+                    "Kokoro unavailable: ${ready.exceptionOrNull()?.message} " +
+                        "— no fallback voice in the Kokoro-only build."
+                )
+                return false
+            }
+        }
         stopped.set(false)
         return try {
             withContext(Dispatchers.IO) {
@@ -204,7 +329,10 @@ object KokoroTtsClient {
                 true
             }
         } catch (e: Exception) {
-            JarvisStateRepository.addLog("Kokoro TTS failed (${e.message}), falling back")
+            JarvisStateRepository.addLog(
+                "Kokoro TTS failed (${e.message}) — no fallback voice " +
+                    "in the Kokoro-only build."
+            )
             false
         }
     }
@@ -234,7 +362,11 @@ object KokoroTtsClient {
             provider = "cpu"
         )
         val config = OfflineTtsConfig(model = modelConfig)
-        // null AssetManager = file-based model (assets are NOT used).
+        // null AssetManager = file-based model: Sherpa reads the
+        // files-dir copies, never the APK assets directly. The
+        // assets are only the SOURCE that ensureAssetsReady copies
+        // from on first run — which is also why no aapt noCompress
+        // rule is needed (AssetManager streams decompress on copy).
         val created = OfflineTts(null, config)
         engine = created
         engineDir = dir

@@ -8,162 +8,102 @@ import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.Locale
-import java.util.UUID
 import kotlin.coroutines.resume
 
+/**
+ * VoiceManager — Kokoro ONLY (1.4.0).
+ *
+ * SPEECH (output) is Kokoro hf_alpha, on-device via Sherpa-ONNX, and
+ * nothing else. The 1.3.0 chain is gone, deliberately:
+ *  - Deepgram TTS (cloud, user key) — REMOVED.
+ *  - Gemini TTS Sulafat (cloud, user key, tiny free quota) — REMOVED.
+ *  - Android system TextToSpeech (incl. its init, language setup and
+ *    female-voice selection) — REMOVED as a voice. System STT below
+ *    (SpeechRecognizer) is a different API and is UNTOUCHED.
+ *
+ * If Kokoro is unavailable, [speakAndWait] returns false and logs a
+ * clear message. It NEVER silently falls back to another voice, and
+ * it never leaves the caller guessing: false means "nothing was
+ * spoken". Callers that only need fire-and-forget speech can ignore
+ * the return value — the service lambda
+ * `onSpeakAndAwait = { text -> voiceManager.speakAndWait(text) }`
+ * still compiles unchanged, because a Boolean result is coerced to
+ * Unit for a `suspend (String) -> Unit` function type.
+ *
+ * Signature change (documented, see INTEGRATION_NOTES_Kokoro.md):
+ *  - 1.3.0: `suspend fun speakAndWait(text: String)` (Unit)
+ *  - 1.4.0: `suspend fun speakAndWait(text: String): Boolean`
+ * [stopSpeaking] is unchanged in signature.
+ *
+ * First-run behaviour: the first call triggers
+ * KokoroTtsClient's bundled-asset copy (assets/kokoro/ -> files
+ * dir Kokoro/) with progress logging. That copy must ALSO be
+ * driven from the UI at app launch with a VISIBLE progress screen
+ * (see INTEGRATION_NOTES_Kokoro.md §5) — this class only logs, it
+ * cannot show a screen, so a speak-triggered copy is the safety
+ * net, not the intended first-run UX.
+ *
+ * prefs.voiceSpeed / prefs.voicePitch are no longer applied here:
+ * they only ever tuned system TTS. Kokoro speaks at its fixed
+ * speed (1.0f in KokoroTtsClient). The prefs fields themselves
+ * live in JarvisPreferences (outside this worker's ownership) and
+ * are listed as dead in the integration notes until the
+ * coordinator removes or rewires the slider.
+ */
 class VoiceManager(
     private val context: Context,
     private val prefs: JarvisPreferences,
     private val onWakeCommandDetected: (String) -> Unit
-) : TextToSpeech.OnInitListener {
+) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var tts: TextToSpeech? = null
-    private var isTtsReady = false
-    private val geminiTts = GeminiTtsClient()
-    private val deepgramTts = DeepgramTtsClient()
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListeningActive = false
     private var pendingSingleReplyCallback: ((String?) -> Unit)? = null
 
-    init {
-        tts = TextToSpeech(context, this)
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val locale = Locale("en", "IN")
-            val res = tts?.setLanguage(locale)
-            if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
-                tts?.language = Locale.US
-            }
-            selectFemaleVoice()
-            isTtsReady = true
-            JarvisStateRepository.addLog("TTS Voice Engine Ready (en-IN / Hinglish).")
-        }
-    }
-
-    // Best-effort female voice: Android TTS has no gender flag, so pick
-    // a voice whose name marks it female (Google TTS names do), preferring
-    // en-IN, then hi-IN, then en-US. If the phone has no female voice
-    // installed, the higher pitch default (1.15) still makes the default
-    // voice sound more female — a true human-like cloud voice (e.g.
-    // Edge-TTS Swara) would need a server/key and is NOT claimed here.
-    private fun selectFemaleVoice() {
-        val voices = try {
-            tts?.voices?.toList() ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
-        }
-        if (voices.isEmpty()) return
-        val isFemaleName = { name: String ->
-            val n = name.lowercase()
-            n.contains("female") || n.contains("-f-") || n.contains("_f_") ||
-                n.contains("f1") || n.contains("woman")
-        }
-        val localeOrder = listOf("en_IN", "hi_IN", "en_US", "en_GB")
-        val picked = localeOrder.firstNotNullOfOrNull { want ->
-            voices.firstOrNull { v ->
-                v.locale.toString() == want && isFemaleName(v.name)
-            }
-        } ?: voices.firstOrNull { isFemaleName(it.name) }
-        if (picked != null) {
-            runCatching { tts?.voice = picked }
-            JarvisStateRepository.addLog("Female TTS voice selected: ${picked.name}")
-        }
-    }
-
-    suspend fun speakAndWait(text: String) {
-        if (text.isBlank()) return
+    /**
+     * Speaks [text] with Kokoro only. Returns true if the full text
+     * was spoken, false if nothing (or only part) was spoken — e.g.
+     * Kokoro disabled in prefs, bundled model missing, free space
+     * too low for the first-run copy, or playback interrupted by
+     * [stopSpeaking]. On false, the reason is in the app log.
+     */
+    suspend fun speakAndWait(text: String): Boolean {
+        if (text.isBlank()) return false
         stopListeningInternal()
 
-        // Jarvis's voice order (1.3.0):
-        // 1. Kokoro hf_alpha (offline, Flora's voice) — Hindi ke liye
-        //    sabse sahi, bina key/quota ke, bas ek baar download.
-        // 2. Deepgram Theia (cloud, user key) — English-focused.
-        // 3. Gemini Sulafat (cloud, user key, chhota free quota).
-        // 4. System TTS — kabhi silent nahi.
-        // Har engine fail hone par agla try hota hai.
-        if (prefs.kokoroEnabled && KokoroTtsClient.isDownloaded(context)) {
-            val ok = KokoroTtsClient.speak(context, text)
-            if (ok) {
-                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
-                    startWakeWordListening()
-                }
-                return
-            }
+        if (!prefs.kokoroEnabled) {
+            JarvisStateRepository.addLog(
+                "Kokoro voice OFF in settings — nothing spoken " +
+                    "(Kokoro-only build: no other voice is used)."
+            )
+            return false
         }
 
-        if (prefs.deepgramTtsEnabled && prefs.deepgramApiKey.isNotBlank()) {
-            val ok = deepgramTts.speak(text, prefs.deepgramApiKey, prefs.deepgramVoice)
-            if (ok) {
-                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
-                    startWakeWordListening()
-                }
-                return
-            }
-        }
-
-        // Jarvis's voice = Gemini TTS (Sulafat, warm female, romantic
-        // deep style) when the user has a Gemini key and quota left.
-        // Any failure falls back to system TTS below — never silent.
-        if (prefs.geminiTtsEnabled && prefs.apiKey.isNotBlank()) {
-            val ok = geminiTts.speak(text, prefs.apiKey, prefs.geminiTtsVoice)
-            if (ok) {
-                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
-                    startWakeWordListening()
-                }
-                return
-            }
-        }
-
-        if (!isTtsReady) return
-
-        withTimeoutOrNull(25_000L) {
-            suspendCancellableCoroutine { cont ->
-                val utteranceId = UUID.randomUUID().toString()
-                tts?.setSpeechRate(prefs.voiceSpeed)
-                tts?.setPitch(prefs.voicePitch)
-
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) {
-                        if (id == utteranceId && cont.isActive) cont.resume(Unit)
-                    }
-
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) {
-                        if (id == utteranceId && cont.isActive) cont.resume(Unit)
-                    }
-                })
-
-                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-
-                cont.invokeOnCancellation {
-                    tts?.stop()
-                }
-            }
+        val ok = KokoroTtsClient.speak(context, text)
+        if (!ok) {
+            JarvisStateRepository.addLog(
+                "Kokoro unavailable — nothing spoken " +
+                    "(Kokoro-only build: no Deepgram / Gemini / " +
+                    "system-TTS fallback exists any more)."
+            )
+            return false
         }
 
         // Resume background wake-word listening if enabled and idle
         if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
             startWakeWordListening()
         }
+        return true
     }
 
     fun stopSpeaking() {
         KokoroTtsClient.stopPlayback()
-        deepgramTts.stopPlayback()
-        geminiTts.stopPlayback()
-        tts?.stop()
     }
 
     /**
@@ -313,8 +253,6 @@ class VoiceManager(
             runCatching {
                 speechRecognizer?.destroy()
                 speechRecognizer = null
-                tts?.stop()
-                tts?.shutdown()
             }
         }
     }
