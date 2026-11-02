@@ -528,7 +528,6 @@ fun CommandCenterScreen(
 }
 
 @Composable
-@Composable
 fun JarvisPersonaAvatar(
     state: AgentRunState,
     onClick: () -> Unit
