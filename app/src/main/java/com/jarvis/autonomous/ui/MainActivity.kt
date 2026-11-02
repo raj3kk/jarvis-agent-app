@@ -948,7 +948,7 @@ fun AiBrainSettingsScreen(
                     Text(
                         text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Gemma 3 270M Q8, ~304 MB, ek baar download). " +
                             "Casual baat-cheet isse tez aur bina internet ke hogi. " +
-                            "Ye gated model hai — download ke liye Hugging Face token chahiye (neeche daalo, token sirf phone par save hoga). Phone ke steps/kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-step JSON reliably nahi de sakta.",
+                            "Ye gated model hai — download ke liye owner ka token app me hi hota hai, tumhe koi token daalne ki zaroorat nahi hai. Agar tum apna token daalna chaho to neeche wala field optional hai (tumhara token owner wale se pehle use hoga). Phone ke steps/kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-step JSON reliably nahi de sakta.",
                         fontSize = 12.sp
                     )
                     Text(
@@ -968,7 +968,7 @@ fun AiBrainSettingsScreen(
                     OutlinedTextField(
                         value = hfToken,
                         onValueChange = { hfToken = it },
-                        label = { Text("Hugging Face Token (Gemma download ke liye)", fontSize = 12.sp) },
+                        label = { Text("Hugging Face Token (optional — khali chhodo to owner ka token use hoga)", fontSize = 12.sp) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )

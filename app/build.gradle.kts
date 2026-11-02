@@ -41,6 +41,23 @@ android {
         versionCode = 7
         versionName = "1.3.0-PRO"
 
+        // Owner's HF token for the gated Gemma download (user order
+        // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
+        // token use karo"). CI passes the GitHub Actions secret
+        // HF_TOKEN as an env var; when absent the field is "" and
+        // the app falls back to asking for a token in AI Brain.
+        // HONEST: this token IS embedded in the APK and CAN be
+        // extracted by a determined user — it is the owner's
+        // read-only Gemma-download token, revocable/rotatable from
+        // Hugging Face settings. It is never claimed unextractable.
+        // It is never printed to build logs (Gradle does not log
+        // buildConfigField values).
+        buildConfigField(
+            "String", "HF_TOKEN",
+            "\"" + (System.getenv("HF_TOKEN") ?: "")
+                .replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        )
+
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -80,10 +97,14 @@ android {
         }
     }
 
-    // NOTE: deliberately NO buildConfig and NO HF_TOKEN field here.
-    // A baked token would be extractable from a shared APK, so the
-    // token always comes from the phone owner's AI Brain field.
+    // Token policy change (user order 2026-11-02 21:28 IST): the
+    // owner's read-only Gemma-download HF token IS embedded via
+    // BuildConfig (see defaultConfig above) so the end user does
+    // NOT have to enter any HF token. It can be extracted from the
+    // APK by a determined user and is revocable/rotatable from HF
+    // settings — never claim otherwise.
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 

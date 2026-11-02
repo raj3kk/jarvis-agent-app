@@ -2,6 +2,7 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.os.Build
+import com.jarvis.autonomous.BuildConfig
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
@@ -25,13 +26,17 @@ import java.util.concurrent.TimeUnit
  * Gemma 3 270M IT, Q8 `.litertlm`, 304 MB, from litert-community/gemma-3-270m-it.
  * GATED: the user's Hugging Face account (raj3kk) accepted the free
  * Gemma licence on 2026-11-02 and the file was downloaded +
- * size/header-verified (304,005,120 bytes, LITERTLM magic). In-app
- * download needs the user's own HF access token (Bearer header) —
- * without it HF returns 401. The token stays on the phone
- * (SharedPreferences on the owner's phone only). NO token is baked
- * into the APK — the app will be shared, so a baked token could
- * be extracted by anyone who gets the APK. Qwen has been fully removed from Jarvis — no
- * Qwen code, file or download path remains.
+ * size/header-verified (304,005,120 bytes, LITERTLM magic).
+ * TOKEN POLICY (user order 2026-11-02 21:28 IST: "User kyun dega
+ * HF token? Mera wala token use karo"): the end user enters NO
+ * token. Download uses the owner's read-only Gemma-download token
+ * embedded via BuildConfig.HF_TOKEN (CI secret HF_TOKEN); an
+ * optionally typed AI Brain token overrides it. HONEST: the embedded
+ * token CAN be extracted from the APK by a determined user — it is
+ * read-only for the Gemma download and revocable/rotatable from
+ * Hugging Face settings, and is never claimed unextractable.
+ * Qwen has been fully removed from Jarvis — no Qwen code, file or
+ * download path remains.
  *
  * Honest limits (do not oversell to the user):
  * - 0.6B is a chat model, NOT a reliable JSON agent. It answers casual
@@ -88,12 +93,22 @@ object LocalLlmManager {
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
                 .build()
-            // SECURITY (user order 2026-11-02, app will be SHARED):
-            // NO token is ever baked into the APK. Anyone who gets the
-            // APK could extract a baked token, so the only token used
-            // here is the one the phone's owner entered in AI Brain
-            // (stored on that phone only, never in repo or APK source).
+            // TOKEN POLICY (user order 2026-11-02 21:28 IST: "User
+            // kyun dega HF token? Mera wala token use karo"):
+            // resolution order — 1) token the phone's owner typed in
+            // AI Brain (optional field), 2) the owner's token embedded
+            // via BuildConfig.HF_TOKEN from the CI secret HF_TOKEN.
+            // HONEST: the embedded token CAN be extracted from the APK
+            // by a determined user. It is the owner's READ-ONLY
+            // Gemma-download token (only used to download the gated
+            // Gemma model file from Hugging Face) and is revocable /
+            // rotatable from Hugging Face settings at any time.
+            // It is never printed to logs.
             val effectiveToken = hfToken?.takeIf { it.isNotBlank() }
+                ?: BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
+                ?: throw IllegalStateException(
+                    "Gemma download ke liye koi token nahi mila — AI Brain me apna Hugging Face access token daalo (jis account ne Gemma licence accept ki hai), phir dobara download karo."
+                )
             val requestBuilder = Request.Builder().url(MODEL_URL)
             if (!effectiveToken.isNullOrBlank()) {
                 requestBuilder.header("Authorization", "Bearer ${effectiveToken.trim()}")

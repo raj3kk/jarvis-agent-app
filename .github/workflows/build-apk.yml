@@ -75,6 +75,11 @@ jobs:
           test $(stat -c%s app/libs/sherpa-onnx.aar) -eq 37631864
 
       - name: Build Debug & Release APK
+        # Owner's HF token (read-only Gemma-download token) goes into
+        # BuildConfig.HF_TOKEN so the end user enters no token. The
+        # value is masked by GitHub in logs; Gradle never prints it.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 
       - name: Verify APKs (exist + badging + signature)
