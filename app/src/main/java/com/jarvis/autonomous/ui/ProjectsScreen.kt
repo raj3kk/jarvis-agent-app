@@ -43,7 +43,7 @@ import com.jarvis.autonomous.data.ProjectStore
  * - Har project apne folder me (koi mix nahi).
  * - File edit + Save = turant working copy + Documents/JarvisProjects
  *   me export (Files app me dikhega).
- * - Preview = NanoHTTPD localhost (127.0.0.1:8080) + WebView, bina
+ * - Preview = built-in localhost server (127.0.0.1:8080) + WebView, bina
  *   server/account/card ke.
  * Jarvis se banao: Command tab me bolo "meri portfolio website banao"
  * — wo CREATE_PROJECT action se yahin project bana dega.

@@ -106,8 +106,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven) + localhost
-    // preview server (NanoHTTPD, BSD). Neither needs an account/card.
+    // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
+    // Localhost preview uses plain java.net ServerSocket (no dependency):
+    // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
+    // broke CI dependency resolution on 2026-11-02, so it is NOT used.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
-    implementation("org.nanohttpd:nanohttpd:2.3.2")
 }

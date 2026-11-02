@@ -19,13 +19,13 @@ import java.io.File
  * - Every write is ALSO exported to Documents/JarvisProjects/<project>/
  *   via MediaStore, so the user can open the real folder in the Files
  *   app without any special permission or card/server.
- * - Preview is served by NanoHTTPD on 127.0.0.1 only (never exposed
+ * - Preview is served by the built-in ServerSocket server on 127.0.0.1 only (never exposed
  *   to the network) and rendered in the app's WebView, so a website
  *   Jarvis builds is viewable instantly at a localhost link.
  *
  * Stack (all free, open-source, serverless, no account):
  * - HTML + CSS + JavaScript, plain files (no build step, no bundler).
- * - NanoHTTPD (BSD licence) for the localhost server.
+ * - Plain java.net ServerSocket for the localhost server (no dependency).
  * - WebView (built into Android) for preview.
  */
 object ProjectStore {
