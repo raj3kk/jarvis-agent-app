@@ -36,8 +36,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.0.2-PRO"
+        versionCode = 4
+        versionName = "1.1.0-PRO"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -105,4 +105,9 @@ dependencies {
     // Coroutines & Networking
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven) + localhost
+    // preview server (NanoHTTPD, BSD). Neither needs an account/card.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+    implementation("org.nanohttpd:nanohttpd:2.3.2")
 }

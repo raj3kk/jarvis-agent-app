@@ -38,6 +38,11 @@
         android:theme="@style/Theme.JarvisAutonomous"
         android:usesCleartextTraffic="false">
 
+        <!-- LiteRT-LM GPU backend libraries: marked not required, so the
+             app still installs/runs on phones without OpenCL (CPU fallback). -->
+        <uses-native-library android:name="libvndksupport.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+
         <!-- Main Command Center UI -->
         <activity
             android:name=".ui.MainActivity"

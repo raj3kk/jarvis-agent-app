@@ -3,6 +3,7 @@ package com.jarvis.autonomous.agent
 import android.content.Context
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.data.ProjectStore
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
@@ -22,7 +23,7 @@ class JarvisAgentEngine(
     private val onRequestUserVoiceReply: suspend () -> String?
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private val llmClient = LlmClient(prefs)
+    private val llmClient = LlmClient(context, prefs)
     private var activeTaskJob: Job? = null
     private var chatRestored = false
 
@@ -343,6 +344,19 @@ class JarvisAgentEngine(
             "SAVE_MEMORY" -> {
                 prefs.addMemory(d.memoryNote)
                 "SAVE_MEMORY('${d.memoryNote}')"
+            }
+
+            "CREATE_PROJECT" -> {
+                val name = d.projectName.ifBlank { "jarvis-site" }
+                ProjectStore.createProject(context, name, d.fileContent.ifBlank { null })
+                "CREATE_PROJECT('$name') -> saved in its own folder, preview at ${ProjectStore.localhostUrl(name)}"
+            }
+
+            "WRITE_PROJECT_FILE" -> {
+                val name = d.projectName.ifBlank { "jarvis-site" }
+                val file = d.fileName.ifBlank { "index.html" }
+                ProjectStore.writeFile(context, name, file, d.fileContent)
+                "WRITE_PROJECT_FILE('$name/$file', ${d.fileContent.length} chars)"
             }
 
             else -> "UNKNOWN_ACTION(${d.action})"

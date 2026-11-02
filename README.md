@@ -68,3 +68,13 @@ Purani build me save hua dead model (`gemini-2.5-flash`, `llama-3.3-70b-versatil
 - **Persona:** default prompt ab dost jaisa hai — short, playful, normal Hinglish, no lecture, no "As an AI". Purana default save hua ho to nayi build usko bhi naye prompt par migrate kar degi; apna custom prompt untouched rahega.
 - **Memory:** chat history ab phone me save hoti hai (last 30 turns) aur app dobara kholne par wapas aati hai; long-term facts Memory tab me SAVE_MEMORY se save hote hain.
 - **Avatar:** Command Center me ab tumhari di hui image hi Jarvis hai — 3D-look ke liye deep shadow, glossy state ring aur speaking/listening par tez pulse diya gaya hai. Ek 2D photo se asli 3D mesh (glTF) phone par nahi banta, isliye ye depth-styled avatar hai, 3D model ka daava nahi.
+
+---
+
+## Free local model + Projects builder (v1.1.0)
+
+- **Free on-device model (sach):** LiteRT-LM 0.18.0 + Qwen3-0.6B mixed INT4 (~475 MB, Apache 2.0, ungated, Hugging Face litert-community/Qwen3-0.6B). AI Brain me "Download Free Local Model" se ek baar download hota hai, phir provider me Local chuno — koi API key, card, server nahi, casual baat bina internet ke. Gemma default NAHI hai kyunki uska repo gated hai (401 bina HF license accept kiye).
+- **Honest limit:** 0.6B chat ke liye hai, strict JSON phone-action ke liye reliable nahi hai — isliye phone ke kaam (WhatsApp/YouTube/action loop) abhi bhi Gemini/Groq Lite (free tier) par chalenge. Local mode me Jarvis chat ka jawab dega, screen action nahi karega.
+- **Delay ka asli hisaab:** casual chat ka delay network + bada model tha — local me wo khatam. Multi-step phone task ka delay abhi bhi cloud call + TTS + screen wait par depend karega; 1.0.2 wale fast defaults (650 ms, no intermediate TTS) us par bhi lage hue hain.
+- **Theme:** creamy whitish (FFF8ED background, white cards, dark-brown text, terracotta accent). Avatar 190x220 se 150x175 kiya gaya hai taaki chhote phone par chips + chat + input bar neeche se katna band ho — options ab hamesha dikhenge.
+- **Projects (code builder):** naya Projects tab. Jarvis ko bolo "meri portfolio website banao" to wo CREATE_PROJECT/WRITE_PROJECT_FILE action se alag folder me index.html + style.css + script.js banata hai. Har save par file Documents/JarvisProjects/<project>/ me bhi export hoti hai (Files app me dikhega). Preview NanoHTTPD se http://127.0.0.1:8080/<project>/ par, sirf isi phone par, WebView me. Stack: plain HTML/CSS/JS + NanoHTTPD (BSD) — koi build step, server, account ya card nahi.

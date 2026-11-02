@@ -71,7 +71,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -81,7 +81,9 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -104,6 +106,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.jarvis.autonomous.R
+import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -111,15 +114,18 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisForegroundService
 
-private val JarvisColorScheme = darkColorScheme(
-    primary = Color(0xFF00E5FF),
-    secondary = Color(0xFF00E676),
-    tertiary = Color(0xFFD500F9),
-    background = Color(0xFF050A14),
-    surface = Color(0xFF0D1627),
-    onPrimary = Color.Black,
-    onBackground = Color(0xFFE6F7FF),
-    onSurface = Color(0xFFE6F7FF)
+// Creamy whitish theme (user order 2026-11-02): warm cream background,
+// white cards, dark-brown text, terracotta accent — readable in daylight
+// and matching the Jarvis avatar's pink/cream palette.
+private val JarvisColorScheme = lightColorScheme(
+    primary = Color(0xFFB85C38),
+    secondary = Color(0xFF2E7D5B),
+    tertiary = Color(0xFFE75480),
+    background = Color(0xFFFFF8ED),
+    surface = Color(0xFFFFFFFF),
+    onPrimary = Color.White,
+    onBackground = Color(0xFF3B2F2A),
+    onSurface = Color(0xFF3B2F2A)
 )
 
 class MainActivity : ComponentActivity() {
@@ -203,7 +209,7 @@ fun JarvisMainApp(
 
     Scaffold(
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFF091120)) {
+            NavigationBar(containerColor = Color(0xFFFFFFFF)) {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
@@ -227,6 +233,12 @@ fun JarvisMainApp(
                     onClick = { selectedTab = 3 },
                     icon = { Icon(Icons.Default.List, contentDescription = null) },
                     label = { Text("Memory & Logs") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 4,
+                    onClick = { selectedTab = 4 },
+                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
+                    label = { Text("Projects") }
                 )
             }
         }
@@ -258,6 +270,8 @@ fun JarvisMainApp(
                         onSendTextCommand(prompt)
                     }
                 )
+
+                4 -> ProjectsScreen()
             }
         }
     }
@@ -303,19 +317,19 @@ fun CommandCenterScreen(
                     text = "J.A.R.V.I.S.",
                     fontSize = 22.sp,
                     fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF00E5FF)
+                    color = Color(0xFFB85C38)
                 )
                 Text(
                     text = "Autonomous Multi-Step Mobile Agent",
                     fontSize = 12.sp,
-                    color = Color(0xFF8AB4F8)
+                    color = Color(0xFF8A7A70)
                 )
             }
 
             // Accessibility status badge
             Surface(
                 shape = RoundedCornerShape(50),
-                color = if (isAccConnected) Color(0xFF0B3B24) else Color(0xFF3E1818),
+                color = if (isAccConnected) Color(0xFFD9EAD3) else Color(0xFFF5D6D6),
                 modifier = Modifier.clickable { onNavigatePermissions() }
             ) {
                 Row(
@@ -325,7 +339,7 @@ fun CommandCenterScreen(
                     Icon(
                         imageVector = if (isAccConnected) Icons.Default.CheckCircle else Icons.Default.Warning,
                         contentDescription = null,
-                        tint = if (isAccConnected) Color(0xFF00E676) else Color(0xFFFF5252),
+                        tint = if (isAccConnected) Color(0xFF2E7D5B) else Color(0xFFFF5252),
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
@@ -333,15 +347,19 @@ fun CommandCenterScreen(
                         text = if (isAccConnected) "Screen Control ON" else "Enable Accessibility",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color.White
+                        color = Color(0xFF3B2F2A)
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Jarvis persona avatar (uploaded image) with a 3D-look:
+        // Compact on purpose (was 190x220): on small phones the tall
+        // avatar pushed the chips + input bar off-screen, so options
+        // below it looked missing. Now it sits at the top, always
+        // visible, with chips + chat + input guaranteed below it.
         // deep shadow, glossy state-coloured ring and a live pulse that
         // speeds up while listening/speaking. A single 2D photo cannot
         // become a true 3D mesh on the phone, so this is a depth-styled
@@ -363,12 +381,12 @@ fun CommandCenterScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Live Step Telemetry Card
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF0D1B2A)),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF)),
             shape = RoundedCornerShape(14.dp)
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
@@ -381,7 +399,7 @@ fun CommandCenterScreen(
                         text = "STATUS: ${agentState.name}",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00E5FF)
+                        color = Color(0xFFB85C38)
                     )
                     if (agentState != AgentRunState.IDLE) {
                         Button(
@@ -404,7 +422,7 @@ fun CommandCenterScreen(
                         text = "Goal: $currentGoal",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFFFD54F),
+                        color = Color(0xFF8D4A2B),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -412,7 +430,7 @@ fun CommandCenterScreen(
                 Text(
                     text = stepInfo,
                     fontSize = 13.sp,
-                    color = Color(0xFFE0F7FA)
+                    color = Color(0xFF3B2F2A)
                 )
             }
         }
@@ -443,7 +461,7 @@ fun CommandCenterScreen(
                 .weight(1f)
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
-                .background(Color(0xFF08111E))
+                .background(Color(0xFFFFF1DC))
                 .padding(10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -454,7 +472,7 @@ fun CommandCenterScreen(
                     horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
                 ) {
                     Surface(
-                        color = if (isUser) Color(0xFF004D61) else Color(0xFF132238),
+                        color = if (isUser) Color(0xFFF5D6C6) else Color(0xFFFFFFFF),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth(0.86f)
                     ) {
@@ -467,7 +485,7 @@ fun CommandCenterScreen(
                                     text = item.sender,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (isUser) Color(0xFF80DEEA) else Color(0xFF00E676)
+                                    color = if (isUser) Color(0xFF8D4A2B) else Color(0xFF2E7D5B)
                                 )
                                 Text(
                                     text = item.timestamp,
@@ -479,7 +497,7 @@ fun CommandCenterScreen(
                             Text(
                                 text = item.message,
                                 fontSize = 13.sp,
-                                color = Color.White
+                                color = Color(0xFF3B2F2A)
                             )
                         }
                     }
@@ -515,12 +533,12 @@ fun CommandCenterScreen(
                 modifier = Modifier
                     .size(48.dp)
                     .clip(CircleShape)
-                    .background(Color(0xFF00E5FF))
+                    .background(Color(0xFFB85C38))
             ) {
                 Icon(
                     imageVector = if (textInput.isNotBlank()) Icons.Default.Send else Icons.Default.Mic,
                     contentDescription = "Send or Speak",
-                    tint = Color.Black
+                    tint = Color.White
                 )
             }
         }
@@ -548,10 +566,10 @@ fun JarvisPersonaAvatar(
     val ringColor by animateColorAsState(
         targetValue = when (state) {
             AgentRunState.IDLE -> Color(0xFFFF6EC7)
-            AgentRunState.LISTENING -> Color(0xFF00E676)
+            AgentRunState.LISTENING -> Color(0xFF2E7D5B)
             AgentRunState.THINKING -> Color(0xFFD500F9)
             AgentRunState.EXECUTING_STEP -> Color(0xFFFFAB00)
-            AgentRunState.WAITING_USER_REPLY -> Color(0xFF00E676)
+            AgentRunState.WAITING_USER_REPLY -> Color(0xFF2E7D5B)
             AgentRunState.SPEAKING -> Color(0xFF2979FF)
         },
         label = "persona_ring"
@@ -560,7 +578,7 @@ fun JarvisPersonaAvatar(
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(width = 190.dp, height = 220.dp)
+                .size(width = 150.dp, height = 175.dp)
                 .scale(scale)
                 .shadow(28.dp, RoundedCornerShape(28.dp))
                 .clip(RoundedCornerShape(28.dp))
@@ -580,7 +598,7 @@ fun JarvisPersonaAvatar(
             text = if (state == AgentRunState.IDLE) "TAP TO SPEAK" else "TAP TO STOP",
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
-            color = Color.White
+            color = Color(0xFF3B2F2A)
         )
     }
 }
@@ -603,11 +621,11 @@ fun ArcReactorOrb(
 
     val coreColor by animateColorAsState(
         targetValue = when (state) {
-            AgentRunState.IDLE -> Color(0xFF00E5FF)
-            AgentRunState.LISTENING -> Color(0xFF00E676)
+            AgentRunState.IDLE -> Color(0xFFB85C38)
+            AgentRunState.LISTENING -> Color(0xFF2E7D5B)
             AgentRunState.THINKING -> Color(0xFFD500F9)
             AgentRunState.EXECUTING_STEP -> Color(0xFFFFAB00)
-            AgentRunState.WAITING_USER_REPLY -> Color(0xFF00E676)
+            AgentRunState.WAITING_USER_REPLY -> Color(0xFF2E7D5B)
             AgentRunState.SPEAKING -> Color(0xFF2979FF)
         },
         label = "color"
@@ -702,7 +720,7 @@ fun PermissionsChecklistScreen() {
             text = "Permissions & System Setup",
             fontSize = 20.sp,
             fontWeight = FontWeight.Bold,
-            color = Color(0xFF00E5FF)
+            color = Color(0xFFB85C38)
         )
         Text(
             text = "Jarvis ko bina ruke har app control karne, tap/scroll karne aur background mein chalne ke liye niche diye gaye permissions ON karein:",
@@ -819,7 +837,7 @@ fun PermissionItemCard(
                     text = if (isGranted) "GRANTED ✅" else "REQUIRED ⚠️",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (isGranted) Color(0xFF00E676) else Color(0xFFFFAB00)
+                    color = if (isGranted) Color(0xFF2E7D5B) else Color(0xFFFFAB00)
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))
@@ -828,12 +846,12 @@ fun PermissionItemCard(
             Button(
                 onClick = onClick,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isGranted) Color(0xFF1E3A34) else Color(0xFF00E5FF)
+                    containerColor = if (isGranted) Color(0xFF1E3A34) else Color(0xFFB85C38)
                 )
             ) {
                 Text(
                     text = if (isGranted) "Re-check / Configure" else buttonText,
-                    color = if (isGranted) Color.White else Color.Black,
+                    color = Color.White,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -876,7 +894,7 @@ fun AiBrainSettingsScreen(
             text = "AI Brain, Voice & Safety Config",
             fontSize = 20.sp,
             fontWeight = FontWeight.Bold,
-            color = Color(0xFF00E5FF)
+            color = Color(0xFFB85C38)
         )
 
         // Provider Selector
@@ -899,6 +917,81 @@ fun AiBrainSettingsScreen(
             }
         }
 
+        // FREE on-device model (no key, no card, no server)
+        run {
+            val localContext = LocalContext.current
+            val localScope = rememberCoroutineScope()
+            var localDownloaded by remember {
+                mutableStateOf(LocalLlmManager.isDownloaded(localContext))
+            }
+            var localProgress by remember { mutableStateOf("") }
+            var localDownloading by remember { mutableStateOf(false) }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Free Local Model — Qwen3-0.6B (Offline, No Key, No Card)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Apache 2.0, ~475 MB, ek baar download). " +
+                            "Casual baat-cheet isse tez aur bina internet ke hogi. " +
+                            "Phone ke kaam (WhatsApp/YouTube/action JSON) ke liye chhota model reliable nahi hai, isliye wo abhi bhi Gemini/Groq Lite par chalenge.",
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        text = if (!LocalLlmManager.isDeviceSupported()) {
+                            "Is phone ka processor local model ko support nahi karta (sirf arm64/x86_64)."
+                        } else if (localDownloaded) {
+                            "Status: Downloaded ✅ (${LocalLlmManager.downloadedBytes(localContext) / 1_000_000L} MB) — provider me Local chuno aur baat karo."
+                        } else {
+                            "Status: Not downloaded — Wi-Fi par download karo, ek baar me ~475 MB lagega."
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (localProgress.isNotBlank()) {
+                        Text(localProgress, fontSize = 12.sp)
+                    }
+                    Button(
+                        enabled = LocalLlmManager.isDeviceSupported() && !localDownloading,
+                        onClick = {
+                            if (localDownloaded) {
+                                selectedProvider = AiProvider.LOCAL
+                                modelName = AiProvider.LOCAL.defaultModel
+                            } else {
+                                localDownloading = true
+                                localProgress = "Downloading… 0 / ~475 MB"
+                                localScope.launch {
+                                    val result = LocalLlmManager.download(localContext) { mb, total ->
+                                        localScope.launch { localProgress = "Downloading… $mb / $total MB" }
+                                    }
+                                    localDownloading = false
+                                    if (result.isSuccess) {
+                                        localDownloaded = true
+                                        localProgress = "Download complete ✅ — ab provider me Local chuno."
+                                        selectedProvider = AiProvider.LOCAL
+                                        modelName = AiProvider.LOCAL.defaultModel
+                                    } else {
+                                        localProgress = "Download fail: ${result.exceptionOrNull()?.message}"
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (localDownloaded) "Use Local Model" else "Download Free Local Model (~475 MB)")
+                    }
+                }
+            }
+        }
+
         // API Key Input
         OutlinedTextField(
             value = apiKey,
@@ -910,7 +1003,7 @@ fun AiBrainSettingsScreen(
                 Text(
                     text = if (showApiKey) "HIDE" else "SHOW",
                     fontSize = 11.sp,
-                    color = Color(0xFF00E5FF),
+                    color = Color(0xFFB85C38),
                     modifier = Modifier
                         .padding(end = 10.dp)
                         .clickable { showApiKey = !showApiKey }
@@ -953,7 +1046,7 @@ fun AiBrainSettingsScreen(
         // Toggles Card
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF0D1B2A))
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
         ) {
             Column(
                 modifier = Modifier.padding(14.dp),
@@ -1049,13 +1142,13 @@ fun AiBrainSettingsScreen(
                 saveBanner = "Settings Saved & Applied Successfully ✅"
             },
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85C38))
         ) {
-            Text("SAVE & APPLY CONFIGURATION", color = Color.Black, fontWeight = FontWeight.Bold)
+            Text("SAVE & APPLY CONFIGURATION", color = Color.White, fontWeight = FontWeight.Bold)
         }
 
         if (saveBanner.isNotEmpty()) {
-            Text(saveBanner, color = Color(0xFF00E676), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text(saveBanner, color = Color(0xFF2E7D5B), fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -1073,8 +1166,8 @@ fun SettingToggleRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-            Text(subtitle, fontSize = 11.sp, color = Color(0xFF90A4AE))
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF3B2F2A))
+            Text(subtitle, fontSize = 11.sp, color = Color(0xFF8A7A70))
         }
         Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
@@ -1105,31 +1198,31 @@ fun MemoryRoutinesLogsScreen(
             text = "Friend Memory, Voice Macros & Logs",
             fontSize = 20.sp,
             fontWeight = FontWeight.Bold,
-            color = Color(0xFF00E5FF)
+            color = Color(0xFFB85C38)
         )
 
         // Section 1: Custom Voice Routines (Macros)
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF0D1B2A))
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
         ) {
             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Custom Voice Routines (1-Command Multi-Step Macros)", fontWeight = FontWeight.Bold, color = Color(0xFF00E676))
+                Text("Custom Voice Routines (1-Command Multi-Step Macros)", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D5B))
                 routines.forEach { routine ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF14263B))
+                            .background(Color(0xFFFFF1DC))
                             .padding(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Say: \"${routine.triggerPhrase}\"", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF00E5FF))
+                            Text("Say: \"${routine.triggerPhrase}\"", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
                             Text(routine.actionPrompt, fontSize = 11.sp, color = Color.LightGray)
                         }
                         IconButton(onClick = { onRunRoutineNow(routine.actionPrompt) }) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Run", tint = Color(0xFF00E676))
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Run", tint = Color(0xFF2E7D5B))
                         }
                         IconButton(onClick = {
                             prefs.removeRoutine(routine.id)
@@ -1171,7 +1264,7 @@ fun MemoryRoutinesLogsScreen(
         // Section 2: Long-Term Friend Memory
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF0D1B2A))
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
         ) {
             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Long-Term Friend Memory (Facts Jarvis Remembers)", fontWeight = FontWeight.Bold, color = Color(0xFFFFD54F))
@@ -1215,7 +1308,7 @@ fun MemoryRoutinesLogsScreen(
         // Section 3: Live Execution Console Logs
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF070E17))
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
                 Row(
@@ -1223,7 +1316,7 @@ fun MemoryRoutinesLogsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Live Step & Accessibility Telemetry Logs", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF00E5FF))
+                    Text("Live Step & Accessibility Telemetry Logs", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
                     Text(
                         text = "CLEAR",
                         fontSize = 11.sp,

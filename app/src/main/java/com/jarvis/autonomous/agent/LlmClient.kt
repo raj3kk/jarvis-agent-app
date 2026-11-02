@@ -1,5 +1,6 @@
 package com.jarvis.autonomous.agent
 
+import android.content.Context
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import kotlinx.coroutines.Dispatchers
@@ -30,11 +31,14 @@ data class AgentDecision(
     val alarmHour: Int = 7,
     val alarmMinute: Int = 0,
     val memoryNote: String = "",
+    val projectName: String = "",
+    val fileName: String = "",
+    val fileContent: String = "",
     val askUser: Boolean = false,
     val isCompleted: Boolean = true
 )
 
-class LlmClient(private val prefs: JarvisPreferences) {
+class LlmClient(private val context: Context, private val prefs: JarvisPreferences) {
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
@@ -53,6 +57,41 @@ class LlmClient(private val prefs: JarvisPreferences) {
         isStuckWarning: Boolean = false,
         screenImageBase64: String? = null
     ): AgentDecision = withContext(Dispatchers.IO) {
+        // LOCAL fast path: casual chat answered by the on-device model
+        // with NO network call at all. This is the delay fix for chat:
+        // cloud calls wait on network + a big model; local answers are
+        // generated on the phone itself after the one-time load.
+        if (prefs.provider == AiProvider.LOCAL) {
+            if (!LocalLlmManager.isDownloaded(context)) {
+                return@withContext AgentDecision(
+                    reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~475 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
+                    thought = "Local model not downloaded",
+                    action = "NONE",
+                    isCompleted = true
+                )
+            }
+            return@withContext try {
+                val history = recentChat.takeLast(6).mapNotNull { line ->
+                    val idx = line.indexOf(": ")
+                    if (idx > 0) line.substring(0, idx) to line.substring(idx + 2) else null
+                }
+                val reply = LocalLlmManager.chat(
+                    context = context,
+                    systemPrompt = prefs.personaPrompt,
+                    userText = userGoal,
+                    recentChat = history
+                )
+                AgentDecision(reply = reply, thought = "Local Qwen3 chat", action = "NONE", isCompleted = true)
+            } catch (e: Exception) {
+                AgentDecision(
+                    reply = "Local model se jawab nahi aaya (${(e.message ?: "").take(120)}). AI Brain me dobara Gemini chuno ya model reload karo.",
+                    thought = "Local LLM error: ${e.message}",
+                    action = "NONE",
+                    isCompleted = true
+                )
+            }
+        }
+
         val apiKey = prefs.apiKey
         if (apiKey.isBlank()) {
             return@withContext AgentDecision(
@@ -173,6 +212,7 @@ class LlmClient(private val prefs: JarvisPreferences) {
             2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
+            5. CODE BUILDER: If the user asks you to make a website/app/page (e.g. "is ki website banao", "ek portfolio site banao", "ek calculator page banao"), do NOT open a browser. Use action="CREATE_PROJECT" first with `projectName` (short, no spaces) and `fileContent` = the complete index.html for that site (full, working, mobile-friendly, creamy theme, with style.css/script.js links — the app already provides default style.css/script.js if you only write index.html). Then, if needed, use action="WRITE_PROJECT_FILE" with `projectName`, `fileName` ("style.css" or "script.js") and `fileContent` for custom CSS/JS. Each project is saved in its OWN folder, and the user previews it on localhost inside the app (Projects tab). Never mix two projects into one folder.
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):
             - "NONE": No screen action needed (casual chat, asking user a question, or task already complete).
@@ -194,13 +234,15 @@ class LlmClient(private val prefs: JarvisPreferences) {
             - "CALL": Make a direct phone call. Fill `contact` (name or phone number).
             - "SET_ALARM": Set system alarm. Fill `alarmHour` (0-23), `alarmMinute` (0-59), `text` (label).
             - "SAVE_MEMORY": Save a fact to long-term friend memory. Fill `memoryNote`.
+            - "CREATE_PROJECT": Create a new website/app project in its own folder. Fill `projectName` and `fileContent` (complete index.html).
+            - "WRITE_PROJECT_FILE": Write/overwrite one file inside a project. Fill `projectName`, `fileName`, `fileContent`.
 
             OUTPUT FORMAT:
             Respond ONLY with a valid JSON object matching this exact schema (no markdown fences):
             {
               "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, 1-2 short sentences for step updates, never a lecture, never 'As an AI'",
               "thought": "Your internal reasoning for this step",
-              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY",
+              "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
               "appName": "",
               "nodeId": -1,
               "x": -1,
@@ -215,6 +257,9 @@ class LlmClient(private val prefs: JarvisPreferences) {
               "alarmHour": 7,
               "alarmMinute": 0,
               "memoryNote": "",
+              "projectName": "",
+              "fileName": "",
+              "fileContent": "",
               "askUser": false,
               "isCompleted": false
             }
@@ -365,6 +410,9 @@ class LlmClient(private val prefs: JarvisPreferences) {
             alarmHour = obj.optInt("alarmHour", 7),
             alarmMinute = obj.optInt("alarmMinute", 0),
             memoryNote = obj.optString("memoryNote", ""),
+            projectName = obj.optString("projectName", ""),
+            fileName = obj.optString("fileName", ""),
+            fileContent = obj.optString("fileContent", ""),
             askUser = obj.optBoolean("askUser", false),
             isCompleted = obj.optBoolean("isCompleted", true)
         )
