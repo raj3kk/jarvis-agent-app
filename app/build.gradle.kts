@@ -38,8 +38,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.2.0-PRO"
+        versionCode = 7
+        versionName = "1.3.0-PRO"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -110,6 +110,12 @@ dependencies {
     // Coroutines & Networking
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Sherpa-ONNX (Kokoro offline voice) — AAR is downloaded in CI,
+    // never committed (37 MB, would bloat the repo). The workflow
+    // downloads the same file to app/libs/sherpa-onnx.aar before
+    // building; local builds need that file present too.
+    implementation(files("libs/sherpa-onnx.aar"))
 
     // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
     // Localhost preview uses plain java.net ServerSocket (no dependency):

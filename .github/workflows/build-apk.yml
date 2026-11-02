@@ -65,6 +65,15 @@ jobs:
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
 
+      # Sherpa-ONNX AAR for Kokoro offline voice (never committed):
+      # downloaded fresh each build, size-checked (37,631,864 bytes).
+      - name: Download Sherpa-ONNX AAR (Kokoro voice engine)
+        run: |
+          mkdir -p app/libs
+          curl -sL -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-static-link-onnxruntime-1.13.4.aar
+          ls -lh app/libs/sherpa-onnx.aar
+          test $(stat -c%s app/libs/sherpa-onnx.aar) -eq 37631864
+
       - name: Build Debug & Release APK
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 

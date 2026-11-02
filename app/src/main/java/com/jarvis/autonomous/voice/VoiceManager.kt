@@ -28,6 +28,8 @@ class VoiceManager(
     private val mainHandler = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
+    private val geminiTts = GeminiTtsClient()
+    private val deepgramTts = DeepgramTtsClient()
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListeningActive = false
     private var pendingSingleReplyCallback: ((String?) -> Unit)? = null
@@ -80,8 +82,50 @@ class VoiceManager(
     }
 
     suspend fun speakAndWait(text: String) {
-        if (!isTtsReady || text.isBlank()) return
+        if (text.isBlank()) return
         stopListeningInternal()
+
+        // Jarvis's voice order (1.3.0):
+        // 1. Kokoro hf_alpha (offline, Flora's voice) — Hindi ke liye
+        //    sabse sahi, bina key/quota ke, bas ek baar download.
+        // 2. Deepgram Theia (cloud, user key) — English-focused.
+        // 3. Gemini Sulafat (cloud, user key, chhota free quota).
+        // 4. System TTS — kabhi silent nahi.
+        // Har engine fail hone par agla try hota hai.
+        if (prefs.kokoroEnabled && KokoroTtsClient.isDownloaded(context)) {
+            val ok = KokoroTtsClient.speak(context, text)
+            if (ok) {
+                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
+                    startWakeWordListening()
+                }
+                return
+            }
+        }
+
+        if (prefs.deepgramTtsEnabled && prefs.deepgramApiKey.isNotBlank()) {
+            val ok = deepgramTts.speak(text, prefs.deepgramApiKey, prefs.deepgramVoice)
+            if (ok) {
+                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
+                    startWakeWordListening()
+                }
+                return
+            }
+        }
+
+        // Jarvis's voice = Gemini TTS (Sulafat, warm female, romantic
+        // deep style) when the user has a Gemini key and quota left.
+        // Any failure falls back to system TTS below — never silent.
+        if (prefs.geminiTtsEnabled && prefs.apiKey.isNotBlank()) {
+            val ok = geminiTts.speak(text, prefs.apiKey, prefs.geminiTtsVoice)
+            if (ok) {
+                if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
+                    startWakeWordListening()
+                }
+                return
+            }
+        }
+
+        if (!isTtsReady) return
 
         withTimeoutOrNull(25_000L) {
             suspendCancellableCoroutine { cont ->
@@ -116,6 +160,9 @@ class VoiceManager(
     }
 
     fun stopSpeaking() {
+        KokoroTtsClient.stopPlayback()
+        deepgramTts.stopPlayback()
+        geminiTts.stopPlayback()
         tts?.stop()
     }
 

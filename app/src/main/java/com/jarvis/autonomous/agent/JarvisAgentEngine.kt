@@ -156,6 +156,106 @@ class JarvisAgentEngine(
                 return true
             }
         }
+        // ---- More no-AI routines (user order 2026-11-02: "jo kaam
+        // bina AI ke ho sakta hai, set trained karke") ----
+        // Time / date — no app, no network, instant.
+        if (lower.contains("time kya") || lower.contains("samay kya") ||
+            lower.contains("kitne baje") || lower.contains("date kya") ||
+            lower.contains("aaj kaun si date") || lower == "time" || lower == "date"
+        ) {
+            val now = java.time.LocalDateTime.now()
+            val answer = if (lower.contains("date")) {
+                "Aaj ki date hai ${now.dayOfMonth} ${now.month.name.lowercase().replaceFirstChar { it.uppercase() }} ${now.year}."
+            } else {
+                "Abhi time hai ${"%02d".format(now.hour)} baj kar ${"%02d".format(now.minute)} minute."
+            }
+            scope.launch { onSpeakAndAwait(answer) }
+            return true
+        }
+        if (acc != null) {
+            // Torch on/off
+            if (lower.contains("torch on") || lower.contains("torch jalao") ||
+                lower.contains("flashlight on")
+            ) {
+                val ok = acc.toggleFlashlight(true)
+                scope.launch { onSpeakAndAwait(if (ok) "Torch on kar diya." else "Torch on nahi ho payi.") }
+                return true
+            }
+            if (lower.contains("torch off") || lower.contains("torch bujhao") ||
+                lower.contains("flashlight off")
+            ) {
+                val ok = acc.toggleFlashlight(false)
+                scope.launch { onSpeakAndAwait(if (ok) "Torch off kar diya." else "Torch off nahi ho payi.") }
+                return true
+            }
+            // Volume: "volume 70 kar do"
+            val volMatch = Regex("volume\\s+(\\d{1,3})").find(lower)
+            if (volMatch != null) {
+                val pct = volMatch.groupValues[1].toInt().coerceIn(0, 100)
+                val ok = acc.setMediaVolumePercent(pct)
+                scope.launch { onSpeakAndAwait(if (ok) "Volume $pct percent kar diya." else "Volume set nahi ho paya.") }
+                return true
+            }
+            // Media: play/pause/next/previous
+            if (lower.contains("music pause") || lower.contains("gaana roko") ||
+                lower.contains("song pause")
+            ) {
+                acc.controlMediaPlayback("PLAY_PAUSE")
+                scope.launch { onSpeakAndAwait("Music pause kar diya.") }
+                return true
+            }
+            if (lower.contains("music play") || lower.contains("gaana chalao") ||
+                lower.contains("song play")
+            ) {
+                acc.controlMediaPlayback("PLAY_PAUSE")
+                scope.launch { onSpeakAndAwait("Music play kar diya.") }
+                return true
+            }
+            if (lower.contains("next song") || lower.contains("agla gaana") ||
+                lower.contains("next gaana")
+            ) {
+                acc.controlMediaPlayback("NEXT")
+                scope.launch { onSpeakAndAwait("Agla gaana chala diya.") }
+                return true
+            }
+            if (lower.contains("previous song") || lower.contains("pichla gaana")) {
+                acc.controlMediaPlayback("PREVIOUS")
+                scope.launch { onSpeakAndAwait("Pichla gaana chala diya.") }
+                return true
+            }
+            // Direct call: "<name> ko call karo/lagao"
+            val callMatch = Regex("(.+?)\\s+ko\\s+call\\s+(?:karo|lagao)\\s*$").find(lower)
+            if (callMatch != null) {
+                val contact = callMatch.groupValues[1].trim()
+                if (contact.isNotBlank()) {
+                    val ok = acc.makePhoneCall(contact)
+                    scope.launch { onSpeakAndAwait(if (ok) "$contact ko call laga raha hoon." else "$contact ko call nahi lag payi — contact phone book me nahi mila ho sakta hai.") }
+                    return true
+                }
+            }
+            // Alarm: "alarm 7 baje lagao" / "alarm 6:30 lagao"
+            val alarmMatch = Regex("alarm\\s+(\\d{1,2})(?::(\\d{2}))?").find(lower)
+            if (alarmMatch != null && lower.contains("lagao")) {
+                var hour = alarmMatch.groupValues[1].toInt()
+                val minute = alarmMatch.groupValues[2].ifBlank { "0" }.toInt()
+                if (lower.contains("pm") && hour < 12) hour += 12
+                if (hour in 0..23 && minute in 0..59) {
+                    val ok = acc.setSystemAlarm(hour, minute, "Jarvis Alarm")
+                    scope.launch { onSpeakAndAwait(if (ok) "Alarm $hour baj kar $minute minute par laga diya." else "Alarm nahi lag paya.") }
+                    return true
+                }
+            }
+            // Open app: "<app> kholo" (after YouTube/WhatsApp routines above)
+            val openMatch = Regex("(.+?)\\s+(?:kholo|khol\\s+do|open\\s+karo)\\s*$").find(lower)
+            if (openMatch != null) {
+                val app = openMatch.groupValues[1].trim()
+                if (app.isNotBlank() && app.length < 30) {
+                    val ok = acc.launchApp(app)
+                    scope.launch { onSpeakAndAwait(if (ok) "$app khol diya." else "$app nahi khul paya.") }
+                    return true
+                }
+            }
+        }
         return false
     }
 
@@ -174,13 +274,15 @@ class JarvisAgentEngine(
             return
         }
 
-        // No-AI routines first (YouTube play-first, WhatsApp send):
-        // deterministic steps, no LLM call, with ask-before-play/send.
-        if (tryNoAiRoutine(lower, trimmed)) return
-
         // Check if command matches any custom Voice Routine macro
+        // (user's own macros win over built-in no-AI routines).
         val matchedRoutine = prefs.getRoutines().firstOrNull { routine ->
             lower.contains(routine.triggerPhrase.lowercase())
+        }
+        if (matchedRoutine == null) {
+            // No-AI routines (YouTube play-first, WhatsApp send, ...):
+            // deterministic steps, no LLM call, with ask-before-play/send.
+            if (tryNoAiRoutine(lower, trimmed)) return
         }
         val effectiveGoal = if (matchedRoutine != null) {
             JarvisStateRepository.addLog("Matched Custom Routine '${matchedRoutine.triggerPhrase}'")

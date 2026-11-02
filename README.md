@@ -78,3 +78,11 @@ Purani build me save hua dead model (`gemini-2.5-flash`, `llama-3.3-70b-versatil
 - **Delay ka asli hisaab:** casual chat ka delay network + bada model tha — local me wo khatam. Multi-step phone task ka delay abhi bhi cloud call + TTS + screen wait par depend karega; 1.0.2 wale fast defaults (650 ms, no intermediate TTS) us par bhi lage hue hain.
 - **Theme:** creamy whitish (FFF8ED background, white cards, dark-brown text, terracotta accent). Avatar 190x220 se 150x175 kiya gaya hai taaki chhote phone par chips + chat + input bar neeche se katna band ho — options ab hamesha dikhenge.
 - **Projects (code builder):** naya Projects tab. Jarvis ko bolo "meri portfolio website banao" to wo CREATE_PROJECT/WRITE_PROJECT_FILE action se alag folder me index.html + style.css + script.js banata hai. Har save par file Documents/JarvisProjects/<project>/ me bhi export hoti hai (Files app me dikhega). Preview built-in ServerSocket server se http://127.0.0.1:8080/<project>/ par, sirf isi phone par, WebView me. Stack: plain HTML/CSS/JS + built-in ServerSocket — koi build step, external server, account ya card nahi.
+
+---
+
+## Voice stack (v1.3.0) — Kokoro first, Deepgram user-key
+
+- **Voice order:** 1) Kokoro hf_alpha (offline, Flora's voice) — Hindi female, phone par hi, bina key/quota ke; 2) Deepgram aura-2-theia-en (cloud, user ki apni Deepgram key se) — English-focused, Hindi English accent me bolega; 3) Gemini Sulafat (cloud, user ki Gemini key se, chhota free quota); 4) phone ka system TTS. Koi engine fail ho to agla try hota hai, Jarvis kabhi silent nahi rehta.
+- **Kokoro download:** AI Brain me "Download Kokoro Voice" — Kokoro multi-lang v1.0 INT8 (~185 MB, Hugging Face csukuangfj/kokoro-int8-multi-lang-v1_0) unpacked download hota hai (model.int8.onnx + voices.bin + tokens.txt + espeak-ng-data + lexicons), Sherpa-ONNX 1.13.4 AAR se chalta hai. AAR CI me download hota hai, repo me commit nahi hota. Budget phone par synthesis cloud se dheemi ho sakti hai (CPU tradeoff).
+- **Deepgram cost (sach):** Aura-2 $0.030/1000 chars pay-as-you-go, naye account ke one-time $200 credit ke baad — free forever nahi hai. Key sirf phone ke AI Brain field me save hoti hai; APK/repo me koi key nahi hai.

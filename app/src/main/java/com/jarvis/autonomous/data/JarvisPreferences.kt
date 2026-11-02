@@ -87,6 +87,49 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getString("api_key", "") ?: ""
         set(value) = prefs.edit().putString("api_key", value.trim()).apply()
 
+    // Gemini TTS voice (user order 2026-11-02): Jarvis's voice is
+    // Gemini's Sulafat (warm, female) spoken with a soft, slow,
+    // romantic, deep style prompt — NOT the phone's system TTS.
+    // HONEST LIMIT: Gemini free tier is NOT unlimited. Flash TTS
+    // free quota is tiny (a few requests/minute, ~10-15/day in
+    // published free-tier notes), so on any failure/quota error
+    // Jarvis silently falls back to system TTS instead of going
+    // silent. Shared-app users need their OWN Gemini API key
+    // (AI Brain field) — no key is ever baked into the APK.
+    var geminiTtsEnabled: Boolean
+        get() = prefs.getBoolean("gemini_tts_enabled", true)
+        set(value) = prefs.edit().putBoolean("gemini_tts_enabled", value).apply()
+
+    var geminiTtsVoice: String
+        get() = prefs.getString("gemini_tts_voice", "Sulafat") ?: "Sulafat"
+        set(value) = prefs.edit().putString("gemini_tts_voice", value.trim().ifBlank { "Sulafat" }).apply()
+
+    // Deepgram TTS (user order 2026-11-02): cloud voice, user ki apni
+    // Deepgram key se (AI Brain field, sirf phone par save). Koi key
+    // APK/repo me nahi hai. Default voice aura-2-theia-en (Aura-2,
+    // warm female, English). HONEST LIMIT: Deepgram English-focused
+    // hai — Hindi text English accent me bolega, isliye Hindi ke liye
+    // Kokoro (hf_alpha) pehle aata hai. Cost: Aura-2 $0.030/1000 chars
+    // pay-as-you-go, naye account ke one-time $200 credit ke baad.
+    var deepgramApiKey: String
+        get() = prefs.getString("deepgram_api_key", "") ?: ""
+        set(value) = prefs.edit().putString("deepgram_api_key", value.trim()).apply()
+
+    var deepgramTtsEnabled: Boolean
+        get() = prefs.getBoolean("deepgram_tts_enabled", true)
+        set(value) = prefs.edit().putBoolean("deepgram_tts_enabled", value).apply()
+
+    var deepgramVoice: String
+        get() = prefs.getString("deepgram_voice", "aura-2-theia-en") ?: "aura-2-theia-en"
+        set(value) = prefs.edit().putString("deepgram_voice", value.trim().ifBlank { "aura-2-theia-en" }).apply()
+
+    // Kokoro offline voice (user order 2026-11-02): Flora wali awaaz
+    // (hf_alpha, Hindi female) jo phone par hi chalti hai, bina key
+    // aur bina quota ke — sirf ek baar ~185 MB model download.
+    var kokoroEnabled: Boolean
+        get() = prefs.getBoolean("kokoro_enabled", true)
+        set(value) = prefs.edit().putBoolean("kokoro_enabled", value).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the

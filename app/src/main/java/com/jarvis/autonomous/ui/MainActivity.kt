@@ -108,6 +108,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentRunState
+import com.jarvis.autonomous.voice.KokoroTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -877,6 +878,10 @@ fun AiBrainSettingsScreen(
     var overlayEnabled by remember { mutableStateOf(prefs.floatingOverlayEnabled) }
     var confirmSensitive by remember { mutableStateOf(prefs.confirmSensitiveActions) }
     var speakIntermediate by remember { mutableStateOf(prefs.speakIntermediateSteps) }
+    var geminiTtsOn by remember { mutableStateOf(prefs.geminiTtsEnabled) }
+    var deepgramKey by remember { mutableStateOf(prefs.deepgramApiKey) }
+    var deepgramOn by remember { mutableStateOf(prefs.deepgramTtsEnabled) }
+    var kokoroOn by remember { mutableStateOf(prefs.kokoroEnabled) }
     var visionMode by remember { mutableStateOf(prefs.visionModeEnabled) }
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
@@ -1000,6 +1005,75 @@ fun AiBrainSettingsScreen(
             }
         }
 
+        // Kokoro offline voice (Flora wali awaaz, hf_alpha Hindi female)
+        run {
+            val kokoroContext = LocalContext.current
+            val kokoroScope = rememberCoroutineScope()
+            var kokoroDownloaded by remember {
+                mutableStateOf(KokoroTtsClient.isDownloaded(kokoroContext))
+            }
+            var kokoroProgress by remember { mutableStateOf("") }
+            var kokoroDownloading by remember { mutableStateOf(false) }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Kokoro Voice — hf_alpha (Offline, Flora's Voice)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = "Jarvis ki pehli awaaz: Kokoro hf_alpha Hindi female, phone par hi chalti hai — bina key, bina quota, bina internet (download ke baad). ~185 MB ek baar download. Budget phone par cloud voice se dheemi ho sakti hai.",
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        text = if (kokoroDownloaded) {
+                            "Status: Downloaded ✅ (${KokoroTtsClient.downloadedBytes(kokoroContext) / 1_000_000L} MB) — ab Jarvis isi awaaz me bolega (jab Kokoro toggle ON hai)."
+                        } else {
+                            "Status: Not downloaded — Wi-Fi par download karo, ek baar me ~185 MB lagega."
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (kokoroProgress.isNotBlank()) {
+                        Text(kokoroProgress, fontSize = 12.sp)
+                    }
+                    Button(
+                        enabled = !kokoroDownloading,
+                        onClick = {
+                            if (kokoroDownloaded) {
+                                kokoroOn = true
+                            } else {
+                                kokoroDownloading = true
+                                kokoroProgress = "Downloading… 0 / ~185 MB"
+                                kokoroScope.launch {
+                                    val result = KokoroTtsClient.download(kokoroContext) { mb, total ->
+                                        kokoroScope.launch { kokoroProgress = "Downloading… $mb / $total MB" }
+                                    }
+                                    kokoroDownloading = false
+                                    if (result.isSuccess) {
+                                        kokoroDownloaded = true
+                                        kokoroProgress = "Download complete ✅ — ab Jarvis Kokoro awaaz me bolega."
+                                        kokoroOn = true
+                                    } else {
+                                        kokoroProgress = "Download fail: ${result.exceptionOrNull()?.message}"
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (kokoroDownloaded) "Use Kokoro Voice" else "Download Kokoro Voice (~185 MB)")
+                    }
+                }
+            }
+        }
+
         // API Key Input
         OutlinedTextField(
             value = apiKey,
@@ -1028,6 +1102,21 @@ fun AiBrainSettingsScreen(
             label = { Text("Model Name (e.g., gemini-3.8-flash, gpt-4o-mini)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
+        )
+
+        // Deepgram API Key (cloud voice, user ki apni key — sirf phone par save)
+        OutlinedTextField(
+            value = deepgramKey,
+            onValueChange = { deepgramKey = it },
+            label = { Text("Deepgram API Key (cloud voice ke liye)") },
+            placeholder = { Text("Paste your Deepgram API key here...") },
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Text(
+            text = "Deepgram English-focused hai — Hindi English accent me bolega. Cost: Aura-2 $0.030/1000 chars, naye account ke one-time $200 credit ke baad. Key kabhi APK/repo me nahi jati.",
+            fontSize = 12.sp
         )
 
         // Language Mode Chips
@@ -1091,6 +1180,24 @@ fun AiBrainSettingsScreen(
                     onCheckedChange = { confirmSensitive = it }
                 )
                 SettingToggleRow(
+                    title = "Gemini Voice — Sulafat (warm, romantic)",
+                    subtitle = "Jarvis ki awaaz Gemini TTS se (free quota khatam hone par system voice par wapas)",
+                    checked = geminiTtsOn,
+                    onCheckedChange = { geminiTtsOn = it }
+                )
+                SettingToggleRow(
+                    title = "Deepgram Voice — Theia (warm, English)",
+                    subtitle = "Cloud voice, user ki Deepgram key se (Hindi English accent me bolega)",
+                    checked = deepgramOn,
+                    onCheckedChange = { deepgramOn = it }
+                )
+                SettingToggleRow(
+                    title = "Kokoro Voice — hf_alpha (offline, Hindi)",
+                    subtitle = "Flora wali awaaz, phone par hi (download hone ke baad, bina key/quota)",
+                    checked = kokoroOn,
+                    onCheckedChange = { kokoroOn = it }
+                )
+                SettingToggleRow(
                     title = "Speak Every Step (slower)",
                     subtitle = "OFF = fast: only final answers & questions are spoken, steps show in chat",
                     checked = speakIntermediate,
@@ -1144,6 +1251,10 @@ fun AiBrainSettingsScreen(
                 prefs.autoAnnounceNotifications = autoAnnounceNotifs
                 prefs.confirmSensitiveActions = confirmSensitive
                 prefs.speakIntermediateSteps = speakIntermediate
+                prefs.geminiTtsEnabled = geminiTtsOn
+                prefs.deepgramApiKey = deepgramKey
+                prefs.deepgramTtsEnabled = deepgramOn
+                prefs.kokoroEnabled = kokoroOn
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 prefs.voiceSpeed = voiceSpeed
