@@ -44,6 +44,16 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        // HF token for the gated Gemma download, injected at build time
+        // from the HF_TOKEN Actions secret. Empty on local builds without
+        // the secret — then the user-entered token in AI Brain is used.
+        // This value is in the built APK binary, never in repo source.
+        // (buildConfigField lives in defaultConfig, not in android{}.)
+        buildConfigField(
+            "String", "HF_TOKEN",
+            "\"" + (System.getenv("HF_TOKEN") ?: "") + "\""
+        )
     }
 
     buildTypes {
@@ -83,15 +93,6 @@ android {
         compose = true
         buildConfig = true
     }
-
-    // HF token for the gated Gemma download, injected at build time
-    // from the HF_TOKEN Actions secret. Empty on local builds without
-    // the secret — then the user-entered token in AI Brain is used.
-    // This value is in the built APK binary, never in repo source.
-    buildConfigField(
-        "String", "HF_TOKEN",
-        "\"" + (System.getenv("HF_TOKEN") ?: "") + "\""
-    )
 
     packaging {
         resources {
