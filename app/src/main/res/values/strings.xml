@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS AI Agent</string>
+    <string name="accessibility_service_label">JARVIS Autonomous Screen Controller</string>
+    <string name="accessibility_service_description">Allows JARVIS to read screen elements, open apps, tap buttons, type messages, and scroll automatically according to your voice commands.</string>
+    <string name="notification_service_label">JARVIS Notification Reader</string>
+</resources>

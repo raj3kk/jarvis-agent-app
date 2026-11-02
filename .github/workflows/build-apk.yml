@@ -1,0 +1,80 @@
+name: Build Jarvis Autonomous APK
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle (uses gradlew wrapper, Gradle 8.7)
+        uses: gradle/actions/setup-gradle@v3
+
+      # Production signing (optional, secret-gated):
+      # If the repo has ANDROID_KEYSTORE_BASE64 + passwords set as Secrets,
+      # decode them into keystore.properties + release.keystore (gitignored).
+      # If not set, the build falls back to the debug key and the verify
+      # step below labels the APK debug-signed — it is NOT claimed as
+      # production-signed in that case.
+      - name: Restore release keystore from Secrets (if configured)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > release.keystore
+          cat > keystore.properties <<EOF
+          storeFile=release.keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Build Debug & Release APK
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
+
+      - name: Verify APKs (exist + badging + signature)
+        run: |
+          set -e
+          ls -lh app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -1)
+          echo "aapt2: $AAPT2"
+          "$AAPT2" dump badging app/build/outputs/apk/release/*.apk | head -5
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/*.apk | head -20
+          if [ -f keystore.properties ]; then echo "SIGNING=production-keystore"; else echo "SIGNING=debug-fallback"; fi
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-Autonomous-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-Autonomous-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
