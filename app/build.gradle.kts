@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -10,7 +12,7 @@ plugins {
 // A debug-signed release must NOT be presented as production-signed:
 // changing the key later forces users to uninstall/reinstall.
 val keystorePropertiesFile = rootProject.file("keystore.properties")
-val keystoreProperties = java.util.Properties()
+val keystoreProperties = Properties()
 val hasReleaseKeystore = keystorePropertiesFile.exists().also {
     if (it) keystorePropertiesFile.inputStream().use { stream -> keystoreProperties.load(stream) }
 }
