@@ -65,6 +65,14 @@ class LlmClient(private val prefs: JarvisPreferences) {
         }
 
         val systemInstruction = buildSystemPrompt()
+        // Speed: a full 120-element screen tree is ~10k chars of tokens on
+        // EVERY step. Cap it — the agent only acts on the elements it can
+        // actually see in the prompt, so unseen tail nodes are useless cost.
+        val trimmedTree = if (screenTree.length > 8000) {
+            screenTree.take(8000) + "\n[Screen tree truncated for speed]"
+        } else {
+            screenTree
+        }
         val userPayload = buildString {
             appendLine("=== CURRENT USER GOAL / MESSAGE ===")
             appendLine(userGoal)
@@ -94,7 +102,7 @@ class LlmClient(private val prefs: JarvisPreferences) {
                 appendLine()
             }
             appendLine("=== LIVE ANDROID SCREEN UI HIERARCHY ===")
-            appendLine(screenTree)
+            appendLine(trimmedTree)
         }
 
         return@withContext try {
@@ -190,7 +198,7 @@ class LlmClient(private val prefs: JarvisPreferences) {
             OUTPUT FORMAT:
             Respond ONLY with a valid JSON object matching this exact schema (no markdown fences):
             {
-              "reply": "Short natural spoken response in ${prefs.languageMode} (keep step updates brief, friendly & natural)",
+              "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, 1-2 short sentences for step updates, never a lecture, never 'As an AI'",
               "thought": "Your internal reasoning for this step",
               "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | OPEN_URL | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY",
               "appName": "",

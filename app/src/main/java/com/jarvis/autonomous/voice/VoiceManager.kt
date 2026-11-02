@@ -43,8 +43,39 @@ class VoiceManager(
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
                 tts?.language = Locale.US
             }
+            selectFemaleVoice()
             isTtsReady = true
             JarvisStateRepository.addLog("TTS Voice Engine Ready (en-IN / Hinglish).")
+        }
+    }
+
+    // Best-effort female voice: Android TTS has no gender flag, so pick
+    // a voice whose name marks it female (Google TTS names do), preferring
+    // en-IN, then hi-IN, then en-US. If the phone has no female voice
+    // installed, the higher pitch default (1.15) still makes the default
+    // voice sound more female — a true human-like cloud voice (e.g.
+    // Edge-TTS Swara) would need a server/key and is NOT claimed here.
+    private fun selectFemaleVoice() {
+        val voices = try {
+            tts?.voices?.toList() ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (voices.isEmpty()) return
+        val isFemaleName = { name: String ->
+            val n = name.lowercase()
+            n.contains("female") || n.contains("-f-") || n.contains("_f_") ||
+                n.contains("f1") || n.contains("woman")
+        }
+        val localeOrder = listOf("en_IN", "hi_IN", "en_US", "en_GB")
+        val picked = localeOrder.firstNotNullOfOrNull { want ->
+            voices.firstOrNull { v ->
+                v.locale.toString() == want && isFemaleName(v.name)
+            }
+        } ?: voices.firstOrNull { isFemaleName(it.name) }
+        if (picked != null) {
+            runCatching { tts?.voice = picked }
+            JarvisStateRepository.addLog("Female TTS voice selected: ${picked.name}")
         }
     }
 
@@ -169,7 +200,7 @@ class VoiceManager(
                     pendingSingleReplyCallback = null
                     cb.invoke(null)
                 } else if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
-                    mainHandler.postDelayed({ startWakeWordListening() }, 1500L)
+                    mainHandler.postDelayed({ startWakeWordListening() }, 600L)
                 }
             }
 
@@ -203,7 +234,7 @@ class VoiceManager(
                 }
 
                 if (prefs.wakeWordEnabled && JarvisStateRepository.agentState.value == AgentRunState.IDLE) {
-                    mainHandler.postDelayed({ startWakeWordListening() }, 700L)
+                    mainHandler.postDelayed({ startWakeWordListening() }, 400L)
                 }
             }
 

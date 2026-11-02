@@ -24,6 +24,13 @@ class JarvisAgentEngine(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val llmClient = LlmClient(prefs)
     private var activeTaskJob: Job? = null
+    private var chatRestored = false
+
+    private fun persistChat() {
+        runCatching {
+            prefs.saveChatHistory(JarvisStateRepository.chatHistory.value)
+        }
+    }
 
     fun isTaskRunning(): Boolean = activeTaskJob?.isActive == true
 
@@ -82,7 +89,14 @@ class JarvisAgentEngine(
 
     private suspend fun runAutonomousLoop(initialGoal: String) {
         var currentGoal = initialGoal
+        if (!chatRestored) {
+            chatRestored = true
+            runCatching {
+                JarvisStateRepository.restoreChatHistory(prefs.getSavedChatHistory())
+            }
+        }
         JarvisStateRepository.addChatMessage("You", currentGoal)
+        persistChat()
         JarvisStateRepository.setCurrentGoal(currentGoal)
 
         val previousActions = mutableListOf<String>()
@@ -153,14 +167,23 @@ class JarvisAgentEngine(
                     "Step $step Decision: action=${decision.action}, thought=${decision.thought}"
                 )
 
-                // Speak reply if non-empty
+                // Speak reply if non-empty — but in fast mode (default),
+                // intermediate step updates are chat-only, NOT spoken aloud.
+                // Speaking every step serialises seconds of TTS in front of
+                // the next action and is the biggest perceived slowdown.
+                // Final answers, questions and casual chat are always spoken.
                 if (decision.reply.isNotBlank()) {
                     JarvisStateRepository.addChatMessage("Jarvis", decision.reply)
-                    JarvisStateRepository.setAgentState(
-                        AgentRunState.SPEAKING,
-                        "Speaking: ${decision.reply}"
-                    )
-                    onSpeakAndAwait(decision.reply)
+                    persistChat()
+                    val shouldSpeak = decision.isCompleted || decision.askUser ||
+                        decision.action == "NONE" || prefs.speakIntermediateSteps
+                    if (shouldSpeak) {
+                        JarvisStateRepository.setAgentState(
+                            AgentRunState.SPEAKING,
+                            "Speaking: ${decision.reply}"
+                        )
+                        onSpeakAndAwait(decision.reply)
+                    }
                 }
 
                 // If Jarvis needs to ask the user a mid-task question, listen for reply and continue
@@ -172,6 +195,7 @@ class JarvisAgentEngine(
                     val userAnswer = onRequestUserVoiceReply()
                     if (!userAnswer.isNullOrBlank()) {
                         JarvisStateRepository.addChatMessage("You", userAnswer)
+                        persistChat()
                         currentGoal = "$currentGoal (User clarified: $userAnswer)"
                         previousActions.add("Asked user: '${decision.reply}' -> User answered: '$userAnswer'")
                         step++
@@ -229,19 +253,19 @@ class JarvisAgentEngine(
         return when (d.action) {
             "OPEN_APP" -> {
                 val ok = acc?.launchApp(d.appName) ?: false
-                delay(1600L) // Give app time to cold start
+                delay(800L) // Cold start is observed on the next step anyway
                 "OPEN_APP('${d.appName}') -> success=$ok"
             }
 
             "YOUTUBE_SEARCH" -> {
                 val ok = acc?.searchYouTube(d.text.ifBlank { d.appName }) ?: false
-                delay(1800L)
+                delay(900L)
                 "YOUTUBE_SEARCH('${d.text}') -> success=$ok"
             }
 
             "OPEN_URL" -> {
                 val ok = acc?.openUrlOrDeepLink(d.text) ?: false
-                delay(1500L)
+                delay(800L)
                 "OPEN_URL('${d.text}') -> success=$ok"
             }
 
@@ -292,8 +316,8 @@ class JarvisAgentEngine(
             }
 
             "WAIT" -> {
-                delay(2000L)
-                "WAIT(2000ms)"
+                delay(1000L)
+                "WAIT(1000ms)"
             }
 
             "FLASHLIGHT" -> {

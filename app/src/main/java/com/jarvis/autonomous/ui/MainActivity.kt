@@ -20,6 +20,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -85,8 +86,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
@@ -99,6 +103,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.jarvis.autonomous.R
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -336,12 +341,17 @@ fun CommandCenterScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Animated Arc Reactor Core
+        // Jarvis persona avatar (uploaded image) with a 3D-look:
+        // deep shadow, glossy state-coloured ring and a live pulse that
+        // speeds up while listening/speaking. A single 2D photo cannot
+        // become a true 3D mesh on the phone, so this is a depth-styled
+        // avatar, not a glTF model — the face, outfit and pose are exactly
+        // the uploaded Jarvis image.
         Box(
             modifier = Modifier.fillMaxWidth(),
             contentAlignment = Alignment.Center
         ) {
-            ArcReactorOrb(
+            JarvisPersonaAvatar(
                 state = agentState,
                 onClick = {
                     if (agentState == AgentRunState.IDLE) {
@@ -514,6 +524,65 @@ fun CommandCenterScreen(
                 )
             }
         }
+    }
+}
+
+@Composable
+@Composable
+fun JarvisPersonaAvatar(
+    state: AgentRunState,
+    onClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "persona_pulse")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.97f,
+        targetValue = if (state == AgentRunState.IDLE) 1.03f else 1.09f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(
+                durationMillis = if (state == AgentRunState.IDLE) 1800 else 650,
+                easing = FastOutSlowInEasing
+            ),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "persona_scale"
+    )
+    val ringColor by animateColorAsState(
+        targetValue = when (state) {
+            AgentRunState.IDLE -> Color(0xFFFF6EC7)
+            AgentRunState.LISTENING -> Color(0xFF00E676)
+            AgentRunState.THINKING -> Color(0xFFD500F9)
+            AgentRunState.EXECUTING_STEP -> Color(0xFFFFAB00)
+            AgentRunState.WAITING_USER_REPLY -> Color(0xFF00E676)
+            AgentRunState.SPEAKING -> Color(0xFF2979FF)
+        },
+        label = "persona_ring"
+    )
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(width = 190.dp, height = 220.dp)
+                .scale(scale)
+                .shadow(28.dp, RoundedCornerShape(28.dp))
+                .clip(RoundedCornerShape(28.dp))
+                .background(Color.White)
+                .border(3.dp, ringColor, RoundedCornerShape(28.dp))
+                .clickable { onClick() }
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.jarvis_persona),
+                contentDescription = "Jarvis",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = if (state == AgentRunState.IDLE) "TAP TO SPEAK" else "TAP TO STOP",
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
     }
 }
 
@@ -789,6 +858,7 @@ fun AiBrainSettingsScreen(
     var wakeWordEnabled by remember { mutableStateOf(prefs.wakeWordEnabled) }
     var overlayEnabled by remember { mutableStateOf(prefs.floatingOverlayEnabled) }
     var confirmSensitive by remember { mutableStateOf(prefs.confirmSensitiveActions) }
+    var speakIntermediate by remember { mutableStateOf(prefs.speakIntermediateSteps) }
     var visionMode by remember { mutableStateOf(prefs.visionModeEnabled) }
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
@@ -920,6 +990,12 @@ fun AiBrainSettingsScreen(
                     checked = confirmSensitive,
                     onCheckedChange = { confirmSensitive = it }
                 )
+                SettingToggleRow(
+                    title = "Speak Every Step (slower)",
+                    subtitle = "OFF = fast: only final answers & questions are spoken, steps show in chat",
+                    checked = speakIntermediate,
+                    onCheckedChange = { speakIntermediate = it }
+                )
             }
         }
 
@@ -941,7 +1017,7 @@ fun AiBrainSettingsScreen(
         Slider(
             value = stepDelay,
             onValueChange = { stepDelay = it },
-            valueRange = 600f..3500f
+            valueRange = 300f..2500f
         )
 
         Text(
@@ -966,6 +1042,7 @@ fun AiBrainSettingsScreen(
                 prefs.visionModeEnabled = visionMode
                 prefs.autoAnnounceNotifications = autoAnnounceNotifs
                 prefs.confirmSensitiveActions = confirmSensitive
+                prefs.speakIntermediateSteps = speakIntermediate
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 prefs.voiceSpeed = voiceSpeed

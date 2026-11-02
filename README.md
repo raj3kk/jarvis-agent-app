@@ -58,3 +58,13 @@ Jab aap sideloaded `.apk` install karte hain, toh Android 13+ security ki wajah 
 | OpenRouter | `google/gemini-3.8-flash` | `google/gemini-3.5-flash-lite`, `google/gemini-3-flash-preview` |
 
 Purani build me save hua dead model (`gemini-2.5-flash`, `llama-3.3-70b-versatile` wagera) nayi build khud auto-migrate kar degi — dobara type karne ki zaroorat nahi. Koi model 404/503 de to app us provider ke fallback model par khud try karegi, phir bhi fail ho to poora error (code + reason) dikhayegi, 60 character me kaatke nahi.
+
+---
+
+## Speed / Voice / Persona update (v1.0.2)
+
+- **Slow kyun tha:** har step par 1400 ms fixed wait + har step ka poora jawab TTS se bolna + 120-element screen tree har call me + bada model. Ab: step wait default 650 ms, app-open waits aadhe, intermediate steps chat me dikhenge par bole nahi jayenge (final jawab hamesha bola jayega; AI Brain me "Speak Every Step" ON karke purana behaviour wapas la sakte ho), screen tree 8000 chars par cap, aur default model sabse fast Lite (Gemini 3.5-flash-lite / Groq gpt-oss-20b) jiska fallback bada model hai.
+- **Voice:** phone ke Google TTS me se female voice dhoondhkar lagayi jati hai (en-IN, phir hi-IN, phir en-US); agar phone me female voice installed nahi hai to pitch 1.15 se female-jaisa banega. 100% human jaisi cloud female voice (jaise Edge-TTS Swara) ke liye server/key chahiye — wo is on-device build me claim nahi kiya gaya hai. Voice speed default 1.30x hai.
+- **Persona:** default prompt ab dost jaisa hai — short, playful, normal Hinglish, no lecture, no "As an AI". Purana default save hua ho to nayi build usko bhi naye prompt par migrate kar degi; apna custom prompt untouched rahega.
+- **Memory:** chat history ab phone me save hoti hai (last 30 turns) aur app dobara kholne par wapas aati hai; long-term facts Memory tab me SAVE_MEMORY se save hote hain.
+- **Avatar:** Command Center me ab tumhari di hui image hi Jarvis hai — 3D-look ke liye deep shadow, glossy state ring aur speaking/listening par tez pulse diya gaya hai. Ek 2D photo se asli 3D mesh (glTF) phone par nahi banta, isliye ye depth-styled avatar hai, 3D model ka daava nahi.

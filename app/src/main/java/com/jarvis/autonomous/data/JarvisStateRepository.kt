@@ -87,6 +87,16 @@ object JarvisStateRepository {
         _chatHistory.value = updated
     }
 
+    // Restore a persisted conversation on app relaunch, but only when the
+    // in-memory history is still just the greeting — never overwrite a
+    // live conversation with a stale one.
+    fun restoreChatHistory(entries: List<ChatEntry>) {
+        if (entries.isEmpty()) return
+        if (_chatHistory.value.size <= 1) {
+            _chatHistory.value = entries.takeLast(30)
+        }
+    }
+
     fun addLog(log: String) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val entry = "[$time] $log"

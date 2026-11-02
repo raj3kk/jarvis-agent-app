@@ -14,11 +14,13 @@ enum class AiProvider(
     // Live-verified 2026-11-02: gemini-2.5-flash returns 404 "no longer
     // available to new users" (Google limits 2.5 to past users since Sep 2026;
     // its own 404 message names gemini-3.8-flash as replacement).
-    // gemini-3.8-flash is also Google's recommended model for UI/agent work.
+    // Speed update 2026-11-02: 3.5-flash-lite is the fastest Flash-Lite and
+    // is now primary; 3.8-flash (Google's UI/agent recommendation) is the
+    // fallback if Lite fails, so speed does not cost accuracy.
     GEMINI(
-        "Google Gemini (Recommended)", "gemini-3.8-flash",
+        "Google Gemini (Recommended)", "gemini-3.5-flash-lite",
         "https://generativelanguage.googleapis.com/v1beta",
-        listOf("gemini-3.5-flash-lite", "gemini-3-flash-preview")
+        listOf("gemini-3.8-flash", "gemini-3-flash-preview")
     ),
     // gpt-4o-mini still answers in Nov 2026; OpenAI shuts the GPT-4 family
     // down on 2027-01-14 (replacement gpt-6-luna, a reasoning model).
@@ -30,16 +32,19 @@ enum class AiProvider(
     // Live-verified 2026-11-02: llama-3.3-70b-versatile was decommissioned
     // by Groq on 2026-08-16 and now returns 404 model_not_found.
     // Groq's recommended replacement is openai/gpt-oss-120b (HTTP 200).
+    // Speed update 2026-11-02: the smaller 20b model is primary (much
+    // faster to answer); 120b is the fallback if 20b fails.
     GROQ(
-        "Groq (Ultra-Fast)", "openai/gpt-oss-120b",
+        "Groq (Ultra-Fast)", "openai/gpt-oss-20b",
         "https://api.groq.com/openai/v1/chat/completions",
-        listOf("openai/gpt-oss-20b")
+        listOf("openai/gpt-oss-120b")
     ),
     // Same 2.5 problem through OpenRouter's Google route.
+    // Speed: Lite first, 3.8-flash as fallback (same order as Gemini).
     OPENROUTER(
-        "OpenRouter / Custom", "google/gemini-3.8-flash",
+        "OpenRouter / Custom", "google/gemini-3.5-flash-lite",
         "https://openrouter.ai/api/v1/chat/completions",
-        listOf("google/gemini-3.5-flash-lite", "google/gemini-3-flash-preview")
+        listOf("google/gemini-3.8-flash", "google/gemini-3-flash-preview")
     )
 }
 
@@ -125,11 +130,27 @@ class JarvisPreferences(context: Context) {
         set(value) = prefs.edit().putString("language_mode", value).apply()
 
     var personaPrompt: String
-        get() = prefs.getString(
-            "persona_prompt",
-            "Tum Jarvis ho, user ke sabse close smart dost aur autonomous mobile assistant. Natural Hinglish mein friendly, witty aur helpful tarike se baat karo ('Haan bhai', 'Bilkul, abhi karta hoon')."
-        ) ?: ""
+        get() {
+            val newDefault = "Tum Jarvis ho — user ki sabse close dost, playful, smart aur bilkul normal insaan jaisi baat karne wali. Hinglish me short, natural jawab do, jaise dost chat me baat karta hai. Lambi lecture, formal robot-style aur 'As an AI' wali line kabhi mat do. Mazak halka rakho, kaam ki baat seedhi rakho, aur jab user kuch personal bataye to use yaad rakhne ki koshish karo."
+            val oldDefault = "Tum Jarvis ho, user ke sabse close smart dost aur autonomous mobile assistant. Natural Hinglish mein friendly, witty aur helpful tarike se baat karo ('Haan bhai', 'Bilkul, abhi karta hoon')."
+            val saved = prefs.getString("persona_prompt", newDefault) ?: newDefault
+            // One-time migration: users who saved the old default get the
+            // new friend persona automatically; a custom prompt is untouched.
+            if (saved == oldDefault) {
+                prefs.edit().putString("persona_prompt", newDefault).apply()
+                return newDefault
+            }
+            return saved
+        }
         set(value) = prefs.edit().putString("persona_prompt", value).apply()
+
+    // Fast mode: intermediate multi-step voice updates are OFF by default.
+    // Speaking every step aloud serialises TTS (seconds per step) in front
+    // of the next action; the chat feed still shows every step live, and
+    // the final answer / question is always spoken.
+    var speakIntermediateSteps: Boolean
+        get() = prefs.getBoolean("speak_intermediate_steps", false)
+        set(value) = prefs.edit().putBoolean("speak_intermediate_steps", value).apply()
 
     var wakeWordEnabled: Boolean
         get() = prefs.getBoolean("wake_word_enabled", true)
@@ -160,16 +181,65 @@ class JarvisPreferences(context: Context) {
         set(value) = prefs.edit().putInt("max_steps", value.coerceIn(5, 100)).apply()
 
     var stepDelayMs: Long
-        get() = prefs.getLong("step_delay_ms", 1400L)
-        set(value) = prefs.edit().putLong("step_delay_ms", value.coerceIn(500L, 5000L)).apply()
+        get() {
+            val v = prefs.getLong("step_delay_ms", 650L)
+            if (v == 1400L) {
+                prefs.edit().putLong("step_delay_ms", 650L).apply()
+                return 650L
+            }
+            return v
+        }
+        set(value) = prefs.edit().putLong("step_delay_ms", value.coerceIn(300L, 5000L)).apply()
 
     var voiceSpeed: Float
-        get() = prefs.getFloat("voice_speed", 1.05f)
+        get() {
+            val v = prefs.getFloat("voice_speed", 1.30f)
+            if (v == 1.05f) {
+                prefs.edit().putFloat("voice_speed", 1.30f).apply()
+                return 1.30f
+            }
+            return v
+        }
         set(value) = prefs.edit().putFloat("voice_speed", value.coerceIn(0.6f, 1.8f)).apply()
 
     var voicePitch: Float
-        get() = prefs.getFloat("voice_pitch", 0.95f)
+        get() {
+            val v = prefs.getFloat("voice_pitch", 1.15f)
+            if (v == 0.95f) {
+                prefs.edit().putFloat("voice_pitch", 1.15f).apply()
+                return 1.15f
+            }
+            return v
+        }
         set(value) = prefs.edit().putFloat("voice_pitch", value.coerceIn(0.6f, 1.5f)).apply()
+
+    // Persistent chat memory: the last 30 turns survive app restarts, so
+    // Jarvis does not forget the conversation (or the user) on relaunch.
+    // ChatEntry lives in this same package, so no import is needed.
+    fun getSavedChatHistory(): List<ChatEntry> {
+        val raw = prefs.getString("chat_history_json", "[]") ?: "[]"
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val obj = arr.getJSONObject(i)
+                ChatEntry(
+                    sender = obj.optString("sender", "Jarvis"),
+                    message = obj.optString("message", "")
+                )
+            }.filter { it.message.isNotBlank() }
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveChatHistory(entries: List<ChatEntry>) {
+        val arr = JSONArray()
+        entries.takeLast(30).forEach { e ->
+            arr.put(JSONObject().apply {
+                put("sender", e.sender)
+                put("message", e.message)
+            })
+        }
+        prefs.edit().putString("chat_history_json", arr.toString()).apply()
+    }
 
     // Long-term Friend Memory Notes
     fun getMemories(): List<String> {
