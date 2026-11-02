@@ -2,7 +2,6 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.os.Build
-import com.jarvis.autonomous.BuildConfig
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
@@ -29,8 +28,9 @@ import java.util.concurrent.TimeUnit
  * size/header-verified (304,005,120 bytes, LITERTLM magic). In-app
  * download needs the user's own HF access token (Bearer header) —
  * without it HF returns 401. The token stays on the phone
- * (SharedPreferences) or the build-time HF_TOKEN secret, never in
- * the repo source. Qwen has been fully removed from Jarvis — no
+ * (SharedPreferences on the owner's phone only). NO token is baked
+ * into the APK — the app will be shared, so a baked token could
+ * be extracted by anyone who gets the APK. Qwen has been fully removed from Jarvis — no
  * Qwen code, file or download path remains.
  *
  * Honest limits (do not oversell to the user):
@@ -88,8 +88,12 @@ object LocalLlmManager {
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
                 .build()
+            // SECURITY (user order 2026-11-02, app will be SHARED):
+            // NO token is ever baked into the APK. Anyone who gets the
+            // APK could extract a baked token, so the only token used
+            // here is the one the phone's owner entered in AI Brain
+            // (stored on that phone only, never in repo or APK source).
             val effectiveToken = hfToken?.takeIf { it.isNotBlank() }
-                ?: BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
             val requestBuilder = Request.Builder().url(MODEL_URL)
             if (!effectiveToken.isNullOrBlank()) {
                 requestBuilder.header("Authorization", "Bearer ${effectiveToken.trim()}")

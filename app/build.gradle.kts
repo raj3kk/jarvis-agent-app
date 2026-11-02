@@ -45,15 +45,6 @@ android {
             useSupportLibrary = true
         }
 
-        // HF token for the gated Gemma download, injected at build time
-        // from the HF_TOKEN Actions secret. Empty on local builds without
-        // the secret — then the user-entered token in AI Brain is used.
-        // This value is in the built APK binary, never in repo source.
-        // (buildConfigField lives in defaultConfig, not in android{}.)
-        buildConfigField(
-            "String", "HF_TOKEN",
-            "\"" + (System.getenv("HF_TOKEN") ?: "") + "\""
-        )
     }
 
     buildTypes {
@@ -89,9 +80,11 @@ android {
         }
     }
 
+    // NOTE: deliberately NO buildConfig and NO HF_TOKEN field here.
+    // A baked token would be extractable from a shared APK, so the
+    // token always comes from the phone owner's AI Brain field.
     buildFeatures {
         compose = true
-        buildConfig = true
     }
 
     packaging {
