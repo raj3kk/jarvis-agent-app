@@ -4,7 +4,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
+import android.provider.BaseColumns
 import android.provider.MediaStore
+import android.provider.MediaStore.MediaColumns
 import java.io.File
 
 /**
@@ -98,8 +100,8 @@ object ProjectStore {
             var existing: Uri? = null
             resolver.query(
                 collection,
-                arrayOf(MediaStore.Files._ID),
-                "${MediaStore.Files.DISPLAY_NAME}=? AND ${MediaStore.Files.RELATIVE_PATH}=?",
+                arrayOf(BaseColumns._ID),
+                "${MediaColumns.DISPLAY_NAME}=? AND ${MediaColumns.RELATIVE_PATH}=?",
                 arrayOf(fileName, relativePath),
                 null
             )?.use { cursor ->
@@ -110,9 +112,9 @@ object ProjectStore {
             }
             val uri = existing ?: run {
                 val values = ContentValues().apply {
-                    put(MediaStore.Files.DISPLAY_NAME, fileName)
-                    put(MediaStore.Files.MIME_TYPE, mimeFor(fileName))
-                    put(MediaStore.Files.RELATIVE_PATH, relativePath)
+                    put(MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaColumns.MIME_TYPE, mimeFor(fileName))
+                    put(MediaColumns.RELATIVE_PATH, relativePath)
                 }
                 resolver.insert(collection, values)
             } ?: return

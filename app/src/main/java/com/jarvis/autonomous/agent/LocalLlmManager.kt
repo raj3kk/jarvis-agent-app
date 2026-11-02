@@ -109,7 +109,7 @@ object LocalLlmManager {
                     throw IllegalStateException("Download incomplete (${tmp.length()} bytes) — dobara try karo.")
                 }
                 if (target.exists()) target.delete()
-                tmp.renameTo(target)
+                check(tmp.renameTo(target)) { "Model file save nahi hua." }
             }
         }
     }
