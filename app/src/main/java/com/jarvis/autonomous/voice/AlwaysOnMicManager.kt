@@ -656,7 +656,11 @@ class SherpaVadMonitor(
     init {
         available = runCatching {
             if (!modelFile.exists()) return@runCatching false
-            val config = getVadModelConfig(SAMPLE_RATE_HZ).copy(
+            // getVadModelConfig's Kotlin metadata declares a
+            // nullable return (VadModelConfig?), so a null result
+            // means VAD is unavailable — same as a missing model.
+            val baseConfig = getVadModelConfig(SAMPLE_RATE_HZ) ?: return@runCatching false
+            val config = baseConfig.copy(
                 sileroVadModelConfig = SileroVadModelConfig(
                     modelFile.absolutePath,
                     VAD_THRESHOLD,
