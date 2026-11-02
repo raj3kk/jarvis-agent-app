@@ -35,14 +35,20 @@ jobs:
       # If not set, the build falls back to the debug key and the verify
       # step below labels the APK debug-signed — it is NOT claimed as
       # production-signed in that case.
+      # NOTE: secrets cannot be used in an `if:` expression (GitHub rejects
+      # the workflow at parse time with "Unrecognized named-value: 'secrets'").
+      # So this step always runs and checks the variable inside bash instead.
       - name: Restore release keystore from Secrets (if configured)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "No production keystore configured — release will use the debug key."
+            exit 0
+          fi
           echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > release.keystore
           cat > keystore.properties <<EOF
           storeFile=release.keystore
