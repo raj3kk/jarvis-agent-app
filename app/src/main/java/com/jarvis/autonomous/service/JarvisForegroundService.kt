@@ -54,6 +54,9 @@ class JarvisForegroundService : Service() {
         const val NOTIFICATION_ID = 1001
 
         const val ACTION_START_LISTENING = "com.jarvis.autonomous.ACTION_START_LISTENING"
+        // 1.4.8 (G8 F4): standalone voice test — speaks a sample
+        // line through the normal speak path.
+        const val ACTION_SPEAK_TEST = "com.jarvis.autonomous.ACTION_SPEAK_TEST"
         const val ACTION_STOP_LISTENING = "com.jarvis.autonomous.ACTION_STOP_LISTENING"
         const val ACTION_RETRY_MIC = "com.jarvis.autonomous.ACTION_RETRY_MIC"
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
@@ -658,14 +661,36 @@ class JarvisForegroundService : Service() {
 
         floatingOverlay = FloatingJarvisOverlay(
             context = this,
-            // 1.4.5 (item 4): a suspended stream resumes on tap
-            // instead of opening a second listener; otherwise the
-            // tap opens the manual voice command as before.
+            // 1.4.8: the pill orb is now the mic ON/OFF toggle
+            // (user order 22:15 IST), synced with the live loop
+            // state. Loop OFF -> start via the SAME intent path
+            // as the Command-tab mic button (no duplicated start
+            // logic); loop ON + stream suspended -> resume now
+            // (the 1.4.5 tap-resume behavior, kept); loop ON +
+            // live -> stop (user-action off, same intent path as
+            // the Command-tab Mic-off button). The old tap =
+            // one-shot manual command behavior is replaced by
+            // the toggle: with the loop, one-shot is redundant
+            // on the pill, and the toggle is what the user
+            // asked for. Overlay permission flow untouched:
+            // this lambda only runs when the pill is shown,
+            // which already requires the grant (show() fails
+            // safe otherwise).
             onMicTap = {
-                if (::micManager.isInitialized && micManager.isDeepgramSuspended()) {
+                if (!JarvisStateRepository.micLoopEnabled.value) {
+                    startService(
+                        Intent(this, JarvisForegroundService::class.java).apply {
+                            action = ACTION_START_LISTENING
+                        }
+                    )
+                } else if (::micManager.isInitialized && micManager.isDeepgramSuspended()) {
                     micManager.resumeDeepgram("overlay-tap")
                 } else {
-                    voiceManager.triggerManualVoiceCommand()
+                    startService(
+                        Intent(this, JarvisForegroundService::class.java).apply {
+                            action = ACTION_STOP_LISTENING
+                        }
+                    )
                 }
             },
             // 1.4.5 (item 5): HUD stop actually stops SPEECH too —
@@ -798,6 +823,21 @@ class JarvisForegroundService : Service() {
             }
         }.start()
         when (intent?.action) {
+            // 1.4.8 (G8 F4): standalone voice test — speaks a
+            // sample line through the NORMAL speak path (the
+            // same speakWrapped as greetings/replies), so it
+            // exercises greeting/reply speech exactly, including
+            // :tts death + breaker behavior. No-op safeguard:
+            // speakWrapped itself refuses when Kokoro is OFF
+            // (KOKORO_OFF diagnostic); the button is also greyed
+            // out when OFF in AI Brain.
+            ACTION_SPEAK_TEST -> {
+                serviceScope.launch {
+                    runCatching {
+                        speakWrapped("Namaste, main Jarvis hoon. Awaaz test safal raha.")
+                    }
+                }
+            }
             ACTION_START_LISTENING -> {
                 // Always-on mic path (1.4.0): start once, stays on.
                 // Stop any wake-word recognizer first so two

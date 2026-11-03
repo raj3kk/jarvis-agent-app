@@ -1840,6 +1840,35 @@ fun AiBrainSettingsScreen(
                     ) {
                         Text("Kokoro reset — dobara copy karo")
                     }
+                    // 1.4.8 (G8 F4): standalone voice test — before
+                    // this, speech was only exercisable via the
+                    // greeting or task replies, so on a
+                    // breaker-skipped launch there was no way to
+                    // test voice alone. This speaks a sample line
+                    // through the normal speak path (service
+                    // ACTION_SPEAK_TEST). Greyed out unless Kokoro
+                    // is ready AND on (OFF would refuse with
+                    // KOKORO_OFF, and the OFF card already says so).
+                    Button(
+                        enabled = kokoroReady && kokoroOn,
+                        onClick = {
+                            val testIntent = Intent(
+                                aiBrainContext,
+                                JarvisForegroundService::class.java
+                            ).apply { action = JarvisForegroundService.ACTION_SPEAK_TEST }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                aiBrainContext.startForegroundService(testIntent)
+                            } else {
+                                aiBrainContext.startService(testIntent)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Test Voice — sample line suno")
+                    }
+                    if (!kokoroOn) {
+                        Text("Test ke liye Kokoro ON karo.", fontSize = 12.sp)
+                    }
                 }
             }
         }
@@ -2157,7 +2186,7 @@ fun AiBrainSettingsScreen(
                     Text("Deepgram STT (sunna) — saved state", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Text(
                         text = "STT path: $sttPath · $sttReason · Last transcript script: $lastScript · " +
-                            "Key saved: ${if (prefs.deepgramApiKey.isNotBlank()) "yes" else "NO — system mic chalega"}",
+                            "Key saved: ${if (prefs.deepgramApiKey.isNotBlank()) "yes" else "NO — mic nahi chalega, key daalo aur SAVE dabao"}",
                         fontSize = 12.sp
                     )
                     Button(
@@ -2249,6 +2278,8 @@ fun MemoryRoutinesLogsScreen(
             val micFatalState by JarvisStateRepository.micFatal.collectAsState()
             val micLoopOn by JarvisStateRepository.micLoopEnabled.collectAsState()
             val micLive by JarvisStateRepository.micListening.collectAsState()
+            // 1.4.8 (G8 F2): live wake state for the report's mode.
+            val wakeLive by JarvisStateRepository.wakeListening.collectAsState()
             var copiedNote by remember { mutableStateOf("") }
             var lastCrash by remember {
                 mutableStateOf(JarvisDiagnosticsFile.readLastCrash())
@@ -2290,7 +2321,7 @@ fun MemoryRoutinesLogsScreen(
                             onClick = {
                                 val report = buildDiagnosticsReport(
                                     diagContext, prefs, diagnostics,
-                                    micFatalState, micLoopOn, micLive, lastCrash
+                                    micFatalState, micLoopOn, micLive, wakeLive, lastCrash
                                 )
                                 val cm = diagContext.getSystemService(Context.CLIPBOARD_SERVICE)
                                     as ClipboardManager
@@ -2490,6 +2521,7 @@ private fun buildDiagnosticsReport(
     micFatal: com.jarvis.autonomous.data.MicFatalState?,
     micLoopOn: Boolean,
     micLive: Boolean,
+    wakeLive: Boolean,
     lastCrash: String?
 ): String {
     val sb = StringBuilder()
@@ -2500,7 +2532,18 @@ private fun buildDiagnosticsReport(
         "Time: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
     )
     sb.appendLine(
+        // 1.4.8: mode disambiguates the loop-OFF + listening-YES
+        // confusion (22:07:33 report): "loop" = command loop live,
+        // "wake" = loop off AND a wake session is actually
+        // running (speech without "Jarvis" is ignored by design
+        // — tap mic for full commands), "off" = neither.
+        // 1.4.8 (G8 F2): "wake" now reads the LIVE wake flow,
+        // not the wake-word preference (a dead/never-started
+        // session must never report as "wake"). The listening
+        // flag itself is race-guarded at its post site (see
+        // AlwaysOnMicManager onOpen).
         "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
+            "mode=${if (micLoopOn) "loop" else if (wakeLive) "wake" else "off"} · " +
             "last error code=${if (micFatal == null || micFatal.code < 0) "none" else micFatal.code.toString()} · " +
             "last reason=${micFatal?.reason ?: "none"}"
     )

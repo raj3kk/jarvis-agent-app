@@ -305,6 +305,21 @@ object JarvisStateRepository {
         _micListening.value = listening
     }
 
+    // 1.4.8 (G8 F2): LIVE wake-session state (not the preference).
+    // The bug report used to print mode=wake whenever the
+    // wake-word preference was ON, even if the session never
+    // started or died (no key, no permission, backoff) — a
+    // report could claim "wake" while nothing listened. This
+    // flow is true only while the wake pump is actually
+    // running (set at pump start, cleared on stop/restart
+    // backoff), so the report's mode reflects reality.
+    private val _wakeListening = MutableStateFlow(false)
+    val wakeListening: StateFlow<Boolean> = _wakeListening.asStateFlow()
+
+    fun setWakeListening(listening: Boolean) {
+        _wakeListening.value = listening
+    }
+
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())
     val recentNotifications: StateFlow<List<NotificationItem>> = _recentNotifications.asStateFlow()
 

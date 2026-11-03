@@ -89,6 +89,26 @@ object TtsProcessClient {
      * [pending] is non-null the kind belongs to the live holder. */
     private var pendingKind: String? = null
     private var nextReqId: Long = 0L
+    /** 1.4.8: application context of the live binding, kept so a
+     * death can unbind the stale connection (see
+     * onTtsProcessDied). Set on successful bind, cleared on
+     * unbind. */
+    private var boundContext: Context? = null
+    /** 1.4.8: death-episode dedupe. One :tts death can invoke
+     * onTtsProcessDied several times (DeathRecipient +
+     * onServiceDisconnected, once per accumulated connection),
+     * and the 22:07:33 phone report shows 10+ identical
+     * NATIVE_TTS_PROCESS_DIED lines per second per speak —
+     * the flood pushes the real markers out of the last-50
+     * window. So: the first death of an episode writes the
+     * full line (with the last :tts marker before it); later
+     * deaths in the same episode only increment the counter;
+     * the next successful bind closes the episode with one
+     * summary line. An episode ends ONLY on a successful
+     * bind. */
+    private var deathEpisodeActive: Boolean = false
+    private var deathEpisodeCount: Int = 0
+    private var deathEpisodeFirstMarker: String = "none"
 
     private val replyMessenger = Messenger(
         Handler(Looper.getMainLooper(), Handler.Callback { msg ->
@@ -128,22 +148,73 @@ object TtsProcessClient {
 
     private val deathRecipient = IBinder.DeathRecipient { onTtsProcessDied() }
 
+    /** Last :tts-area marker code in the in-memory diagnostics
+     * mirror (the last 150 persisted lines). Names the stage
+     * the dying process reached — the single most useful fact
+     * in the next phone report's death line. */
+    private fun lastTtsMarker(): String {
+        return runCatching {
+            JarvisStateRepository.diagnostics.value
+                .lastOrNull { it.area == "tts" }?.code ?: "none"
+        }.getOrDefault("none")
+    }
+
     private fun onTtsProcessDied() {
+        // Capture the stale connection + context under lock,
+        // then unbind OUTSIDE the lock (Binder call; never hold
+        // the lock across it). Unbinding matters twice: (a)
+        // with BIND_AUTO_CREATE the system would otherwise
+        // resurrect :tts after every death with no speak pending
+        // (the stray TTS_PROCESS_START lines in the 22:07:33
+        // report); (b) a never-unbound connection keeps
+        // receiving onServiceDisconnected on every later death,
+        // so the death-line count grows with every speak —
+        // the flood mechanism itself.
+        val staleConn: ServiceConnection?
+        val staleContext: Context?
+        val episodeStart: Boolean
+        val firstMarker: String
         synchronized(lock) {
             serviceMessenger = null
             bound = false
+            staleConn = connection
+            connection = null
+            staleContext = boundContext
+            boundContext = null
             pending?.complete(Outcome(false, true))
             pending = null
             pendingProgress = null
             pendingReq = null
+            pendingKind = null
+            if (!deathEpisodeActive) {
+                deathEpisodeActive = true
+                deathEpisodeCount = 1
+                deathEpisodeFirstMarker = lastTtsMarker()
+                episodeStart = true
+            } else {
+                deathEpisodeCount++
+                episodeStart = false
+            }
+            firstMarker = deathEpisodeFirstMarker
         }
         lastFailure = FAIL_NATIVE_DIED
-        JarvisStateRepository.addDiagnostic(
-            "tts", "NATIVE_TTS_PROCESS_DIED",
-            "Isolated TTS process died during speak (native crash or " +
-                "system kill in generate/playback) — UI process survived, " +
-                "speech degraded to visible failure."
-        )
+        if (staleConn != null && staleContext != null) {
+            runCatching { staleContext.unbindService(staleConn) }
+        }
+        // Only the episode-start death writes a full line;
+        // later deaths in the same episode only bump the
+        // counter (reported when the episode closes on the
+        // next successful bind).
+        if (episodeStart) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "NATIVE_TTS_PROCESS_DIED",
+                "Isolated TTS process died during speak (native crash or " +
+                    "system kill in generate/playback) — UI process survived, " +
+                    "speech degraded to visible failure. " +
+                    "Last :tts marker before death: $firstMarker. " +
+                    "Further deaths before the next successful bind are counted, not logged."
+            )
+        }
     }
 
     private suspend fun ensureBound(appContext: Context): Boolean {
@@ -161,10 +232,30 @@ object TtsProcessClient {
                     connected.complete(false)
                     return
                 }
+                // 1.4.8: close a death episode, if one is open.
+                // Captured under lock, written outside it (file
+                // append must never run while holding the lock).
+                var episodeSummary: Pair<Int, String>? = null
                 synchronized(lock) {
                     serviceMessenger = Messenger(binder)
                     connection = this
                     bound = true
+                    boundContext = appContext
+                    if (deathEpisodeActive) {
+                        episodeSummary = deathEpisodeCount to deathEpisodeFirstMarker
+                        deathEpisodeActive = false
+                        deathEpisodeCount = 0
+                    }
+                }
+                episodeSummary?.let { (total, marker) ->
+                    if (total > 1) {
+                        JarvisStateRepository.addDiagnostic(
+                            "tts", "NATIVE_TTS_PROCESS_DIED",
+                            "TTS death episode closed on rebind: $total deaths " +
+                                "(${total - 1} duplicates suppressed), " +
+                                "last :tts marker before first death: $marker."
+                        )
+                    }
                 }
                 connected.complete(true)
             }
@@ -195,6 +286,7 @@ object TtsProcessClient {
                     connection = null
                     serviceMessenger = null
                     bound = false
+                    boundContext = null
                 }
             }
         }
@@ -207,6 +299,7 @@ object TtsProcessClient {
             connection = null
             serviceMessenger = null
             bound = false
+            boundContext = null
             c
         }
         if (conn != null) runCatching { appContext.unbindService(conn) }

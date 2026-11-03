@@ -251,6 +251,11 @@ class AlwaysOnMicManager(
     private var oneShotJob: Job? = null
     @Volatile
     private var lastSpeechMs: Long = 0L
+    /** 1.4.8: last IDLE_RESUME time (pump thread + main thread).
+     * The flap guard: a resume must never be followed by an
+     * immediate re-suspend (see the pump suspend check). */
+    @Volatile
+    private var lastResumeMs: Long = 0L
     private var vadSegmentCallback: ((SpeechSegment) -> Unit)? = null
 
     /** Deepgram stream listener — one instance per loop start,
@@ -271,6 +276,15 @@ class AlwaysOnMicManager(
                 "Deepgram stream opened (recovered=$wasReconnecting)."
             )
             mainHandler.post {
+                // 1.4.8: this post runs LATER — a stop between
+                // onOpen and this post must not resurrect a stale
+                // listening=YES (the loop-OFF + listening-YES
+                // confusion in the 22:07:33 report: stop() sets
+                // deepgramActive=false synchronously, while this
+                // true was queued before the stop). Re-check live
+                // state at post time; a queued recovery line is
+                // dropped by the same guard.
+                if (!enabled || !deepgramActive) return@post
                 listeningActive = true
                 listener.onListeningStateChanged(true)
                 if (wasReconnecting) listener.onMicRecovered()
@@ -602,6 +616,18 @@ class AlwaysOnMicManager(
     fun resumeDeepgram(reason: String = "manual") {
         if (!enabled || !deepgramSuspended) return
         deepgramSuspended = false
+        // 1.4.8 — flap fix, part 1: the resume trigger IS speech
+        // (an RMS spike / VAD segment), so the silence clock
+        // restarts here. Without this, the pump's suspend check
+        // (now - lastSpeechMs > 120s, still true from the
+        // pre-suspend silence) fires on the very next pump
+        // iteration — RESUME -> SUSPEND -> RESUME in 2 s, the
+        // exact 22:04:49-51 pattern in the 22:07:33 report.
+        // Part 2 (grace + connecting guard) is in the pump
+        // suspend check below.
+        val nowMs = System.currentTimeMillis()
+        lastSpeechMs = nowMs
+        lastResumeMs = nowMs
         val key = deepgramKey()
         if (key.isBlank()) {
             stopPermanently(
@@ -860,7 +886,16 @@ class AlwaysOnMicManager(
                     }
                     // Idle-suspend (cost): 2 min without any
                     // transcript — WS closes, pump + VAD stay.
+                    // 1.4.8 — flap fix, part 2: never suspend
+                    // while a resume is still connecting
+                    // (deepgramActive stays true across the
+                    // close + reconnect, so the old check fired
+                    // mid-connect), and never within
+                    // IDLE_RESUME_GRACE_MS of a resume. The
+                    // 120 s silence band itself is untouched.
                     if (deepgramActive && !deepgramSuspended &&
+                        !deepgramConnecting &&
+                        System.currentTimeMillis() - lastResumeMs > IDLE_RESUME_GRACE_MS &&
                         System.currentTimeMillis() - lastSpeechMs > IDLE_SUSPEND_MS
                     ) {
                         deepgramSuspended = true
@@ -1317,10 +1352,18 @@ class AlwaysOnMicManager(
         }
         wakePumpThread = thread
         thread.start()
+        // 1.4.8 (G8 F2): the wake session is LIVE only now (the
+        // pump thread actually started) — not at wakeActive=true
+        // (which is set before record/client init can fail).
+        JarvisStateRepository.setWakeListening(true)
     }
 
     private fun scheduleWakeRestart() {
         if (!wakeActive) return
+        // 1.4.8 (G8 F2): backoff = NOT listening (the pump died
+        // or the stream errored/closed). The flag goes true
+        // again only if the restarted pump actually starts.
+        JarvisStateRepository.setWakeListening(false)
         wakeRestartRunnable?.let { mainHandler.removeCallbacks(it) }
         val delayMs = wakeBackoffMs
         wakeBackoffMs = (wakeBackoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
@@ -1342,6 +1385,8 @@ class AlwaysOnMicManager(
 
     fun stopWakeListening() {
         wakeActive = false
+        // 1.4.8 (G8 F2): live wake state clears with the session.
+        JarvisStateRepository.setWakeListening(false)
         wakeRestartRunnable?.let { mainHandler.removeCallbacks(it) }
         wakeRestartRunnable = null
         runCatching { wakeClient?.close() }
@@ -1432,6 +1477,9 @@ class AlwaysOnMicManager(
         /** 1.4.3: silence after which the Deepgram WS suspends
          *  (cost) while the pump + VAD tap keep running. */
         const val IDLE_SUSPEND_MS: Long = 120_000L
+        /** 1.4.8: hysteresis — never suspend within this long
+         *  of a resume (see the flap mechanism below). */
+        const val IDLE_RESUME_GRACE_MS: Long = 30_000L
         /** 1.4.7 (A2): not-ready audio buffer cap — 80 x 100ms
          *  chunks = 8s (256KB), oldest dropped. */
         const val MAX_SUSPEND_CHUNKS: Int = 80

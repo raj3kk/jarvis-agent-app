@@ -765,7 +765,15 @@ object KokoroTtsClient {
         )
         val modelConfig = OfflineTtsModelConfig(
             kokoro = kokoroConfig,
-            numThreads = 2,
+            // 1.4.8: threads 2 -> 1. The generate death (phone
+            // report 2026-11-03 22:07:33) happens inside native
+            // inference in a secondary process; a second intra-op
+            // thread buys parallel tensor workspace for ~nothing
+            // on short utterances and raises the RSS peak that
+            // Vivo LMK kills on. Single-threaded generate is
+            // marginally slower per chunk but measurably
+            // smaller at peak — the right trade for survival.
+            numThreads = 1,
             debug = false,
             provider = "cpu"
         )

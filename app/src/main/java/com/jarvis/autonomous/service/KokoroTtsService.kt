@@ -1,13 +1,22 @@
 package com.jarvis.autonomous.service
 
 import android.app.Service
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Message
 import android.os.Messenger
 import android.content.ComponentCallbacks2
+import androidx.core.app.NotificationCompat
+import com.jarvis.autonomous.R
+import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.voice.KokoroTtsClient
 import com.jarvis.autonomous.voice.TtsProcessClient
 import kotlinx.coroutines.CoroutineScope
@@ -88,6 +97,14 @@ class KokoroTtsService : Service() {
         const val STAGE_BUSY = "busy"
         const val STAGE_STOPPED = "stopped"
         const val STAGE_RESET = "reset"
+        // 1.4.8: speak-scoped foreground promotion (mediaPlayback).
+        // A second permanent notification is deliberately avoided:
+        // the promotion lives only for one speak (promote before
+        // generate, demote when the speak ends), which is exactly
+        // the LMK death window proven by the 22:07:33 phone report
+        // (ENGINE_END present, death after GENERATE_START).
+        const val TTS_CHANNEL_ID = "jarvis_tts_channel"
+        const val TTS_NOTIFICATION_ID = 1002
     }
 
     private lateinit var workerThread: HandlerThread
@@ -122,10 +139,90 @@ class KokoroTtsService : Service() {
     }
 
     private fun afterSpeakDone() {
+        // 1.4.8: demote first — the promotion lives only for the
+        // speak that just ended (see promoteToForeground). The
+        // service stays alive as a bound service afterwards, so
+        // the cached engine survives for the next speak.
+        demoteFromForeground()
         pendingRelease?.let { reason ->
             if (KokoroTtsClient.tryReleaseEngine(reason)) pendingRelease = null
         }
         scheduleIdleRelease()
+    }
+
+    /**
+     * 1.4.8 — LMK defense for the generate death (phone report
+     * 2026-11-03 22:07:33: ENGINE_END present, death after
+     * GENERATE_START, on EVERY speak, short and long alike).
+     * The :tts process is a SECONDARY process: even with
+     * BIND_IMPORTANT it is the first LMK victim on Vivo when
+     * the 114 MB model + inference tensors spike RSS. A
+     * foreground service has the highest oom_adj a background
+     * process can get, so the :tts service promotes itself
+     * for the duration of each speak. Best-effort by design:
+     * promotion failure (no notification permission, OEM
+     * quirk) is recorded as TTS_FG_FAILED and speech
+     * continues unpromoted — promotion must never break
+     * speech, and it cannot fix a true native segfault (if
+     * the next report still shows generate death WITH
+     * TTS_FG_STARTED, the LMK hypothesis is eliminated and
+     * the native path is the remaining suspect).
+     */
+    private var foregroundPromoted = false
+
+    private fun createTtsChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                TTS_CHANNEL_ID,
+                "JARVIS Voice",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Jarvis ke bolne ke dauran voice engine ko foreground me rakhta hai"
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildTtsNotification(): Notification {
+        return NotificationCompat.Builder(this, TTS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_jarvis_core)
+            .setContentTitle("Jarvis bol raha hai")
+            .setContentText("Voice engine foreground me hai taaki bolna beech me na ruke.")
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun promoteToForeground() {
+        if (foregroundPromoted) return
+        runCatching {
+            createTtsChannel()
+            val notification = buildTtsNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    TTS_NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+            } else {
+                startForeground(TTS_NOTIFICATION_ID, notification)
+            }
+            foregroundPromoted = true
+            JarvisStateRepository.addDiagnosticSync(
+                "tts", "TTS_FG_STARTED",
+                "TTS service promoted to foreground for this speak (mediaPlayback) — LMK survival."
+            )
+        }.onFailure {
+            JarvisStateRepository.addDiagnosticSync(
+                "tts", "TTS_FG_FAILED",
+                "Foreground promotion failed (${it.javaClass.simpleName}) — speaking continues unpromoted."
+            )
+        }
+    }
+
+    private fun demoteFromForeground() {
+        if (!foregroundPromoted) return
+        foregroundPromoted = false
+        runCatching { stopForeground(true) }
     }
 
     private val incomingCallback = Handler.Callback { msg ->
@@ -143,6 +240,13 @@ class KokoroTtsService : Service() {
                     // caller degrades to a visible failure.
                     replyTo?.let { sendDone(it, false, STAGE_BUSY, reqId) }
                 } else {
+                    // 1.4.8: promote BEFORE generate — the death
+                    // window proven by the 22:07:33 phone report
+                    // is generate (ENGINE_END present, death
+                    // after GENERATE_START), so the promotion
+                    // must already be active when generate
+                    // starts, not after it.
+                    promoteToForeground()
                     scope.launch {
                         try {
                             val ok = KokoroTtsClient.speak(applicationContext, text)

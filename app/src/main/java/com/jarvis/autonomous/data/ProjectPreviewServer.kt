@@ -126,6 +126,28 @@ class ProjectPreviewServer(
     }
 
     /**
+     * 1.4.8 (G8 F1): stops the server. The 1.4.6 debloat removed
+     * the old stop() as uncalled; it is back WITH callers now
+     * (ProjectsScreen stopPreview + delete-of-previewed). The
+     * accept loop exits because closing the socket unblocks
+     * accept(); pool threads are daemon, so shutdown() is
+     * enough (no await that could stall the UI thread).
+     * Benign race note: a stop racing an in-flight start can
+     * be undone by that start completing — the next Stop tap
+     * closes it, and the port is localhost-only in all cases.
+     */
+    @Synchronized
+    fun stop() {
+        if (!isAlive && serverSocket == null) return
+        isAlive = false
+        runCatching { serverSocket?.close() }
+        serverSocket = null
+        runCatching { acceptExecutor?.shutdown() }
+        acceptExecutor = null
+        acceptThread = null
+    }
+
+    /**
      * Starts (if needed) and suspends until a TCP connect to
      * 127.0.0.1:[port] actually succeeds, or [timeoutMs] elapses.
      * Returns true only when the server provably answers. The UI
@@ -454,6 +476,7 @@ class ProjectPreviewServer(
     }
 
     companion object {
+        @Volatile
         private var instance: ProjectPreviewServer? = null
         // B-L2: serialises server creation. A Mutex (not @Synchronized)
         // is required because startAndAwaitReady suspends; holding a
@@ -483,6 +506,19 @@ class ProjectPreviewServer(
                 instance = null
             }
             server to ready
+        }
+
+        /**
+         * 1.4.8 (G8 F1): stops the singleton server, if any, and
+         * clears the singleton so the next Preview starts fresh.
+         * Safe to call when nothing is running.
+         */
+        fun stopInstance() {
+            val current = instance
+            if (current != null) {
+                current.stop()
+                if (instance === current) instance = null
+            }
         }
 
     }

@@ -173,6 +173,21 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
      * error banner is shown and NO WebView is loaded — never a
      * silent blank preview.
      */
+    /**
+     * 1.4.8 (G8 F1): the preview server finally HAS a stop path
+     * (removed as "dead code" in the 1.4.6 debloat because
+     * nothing called it — now the UI calls it). Stops the
+     * singleton server + clears preview UI state. Safe to call
+     * when nothing is running (no-op).
+     */
+    fun stopPreview() {
+        ProjectPreviewServer.stopInstance()
+        previewBaseUrl = null
+        previewProject = null
+        previewError = null
+        status = "Preview band ho gaya."
+    }
+
     fun startPreview(project: String) {
         val clean = ProjectStore.sanitizeProjectName(project)
         selected = clean
@@ -356,6 +371,12 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                                         selected = null
                                     }
                                     if (previewProject == project.name) {
+                                        // 1.4.8 (G8 F1): deleting the
+                                        // previewed project stops its
+                                        // server too — serving deleted
+                                        // files from a held port is
+                                        // worse than useless.
+                                        ProjectPreviewServer.stopInstance()
                                         previewBaseUrl = null
                                         previewProject = null
                                         previewError = null
@@ -504,6 +525,13 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                         }
                     ) { Text("Save File") }
                     OutlinedButton(onClick = { startPreview(current) }) { Text("Preview") }
+                    // 1.4.8 (G8 F1): the server finally has a Stop
+                    // button — shown only while this project is
+                    // actually previewed, so it can never stop a
+                    // preview the user is not looking at.
+                    if (previewBaseUrl != null && previewProject == current) {
+                        OutlinedButton(onClick = { stopPreview() }) { Text("Stop Preview") }
+                    }
                     OutlinedButton(onClick = { openInBrowser(current) }) { Text("Browser me kholo") }
                 }
             }

@@ -79,7 +79,12 @@ class FloatingJarvisOverlay(
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 64f
-                setColor(Color.parseColor("#E6071120"))
+                // 1.4.8: slightly transparent (was 0xE6 = 90%
+                // opaque, now 0xB3 = 70%) — the pill sits lighter
+                // on screen, but text stays near-opaque so it
+                // remains readable and the pill stays tappable
+                // (never faded to invisible).
+                setColor(Color.parseColor("#B3071120"))
                 setStroke(3, Color.parseColor("#00E5FF"))
             }
         }
@@ -167,15 +172,31 @@ class FloatingJarvisOverlay(
 
         overlayScope = CoroutineScope(SupervisorJob() + Dispatchers.Main).apply {
             launch {
+                // 1.4.8: the pill now also follows the LIVE mic
+                // loop state (toggle + status need it) — agent
+                // state alone cannot tell "mic OFF" from "idle".
                 combine(
                     JarvisStateRepository.agentState,
-                    JarvisStateRepository.currentStepInfo
-                ) { state, step -> state to step }.collect { (state, step) ->
-                    updateHudAppearance(state, step)
+                    JarvisStateRepository.currentStepInfo,
+                    JarvisStateRepository.micLoopEnabled,
+                    JarvisStateRepository.micListening,
+                    JarvisStateRepository.micReconnecting
+                ) { state, step, loopOn, listening, reconnecting ->
+                    Quint(state, step, loopOn, listening, reconnecting)
+                }.collect { (state, step, loopOn, listening, reconnecting) ->
+                    updateHudAppearance(state, step, loopOn, listening, reconnecting)
                 }
             }
         }
     }
+
+    private data class Quint(
+        val state: AgentRunState,
+        val step: String,
+        val loopOn: Boolean,
+        val listening: Boolean,
+        val reconnecting: String?
+    )
 
     /** B-L13 failure channel: state log + notification, best effort
      *  (a missing notification permission must not throw here). */
@@ -207,24 +228,54 @@ class FloatingJarvisOverlay(
         }
     }
 
-    private fun updateHudAppearance(state: AgentRunState, step: String) {
+    /**
+     * 1.4.8: the pill shows ONLY true states (user order
+     * 22:15 IST: mic toggle + transparency + real status).
+     * Non-IDLE agent states keep their existing mapping.
+     * IDLE used to always read "JARVIS Ready", hiding whether
+     * the mic was even on — now IDLE resolves through the
+     * live mic flows: loop ON + listening = "Sun raha hoon",
+     * loop ON + reconnecting = "Dobara jud raha hoon…",
+     * loop ON + neither = "Mic ON — jud raha hai…"
+     * (connecting), loop OFF = "Mic OFF — tap karo" (this
+     * label IS the tap-to-start discoverability: the pill
+     * itself tells the user the mic is off and tappable).
+     * No state is invented: every branch reads a live flow.
+     */
+    private fun updateHudAppearance(
+        state: AgentRunState,
+        step: String,
+        loopOn: Boolean,
+        listening: Boolean,
+        reconnecting: String?
+    ) {
         val container = rootView ?: return
         val bg = container.background as? GradientDrawable
 
-        val (icon, borderColor, showStop) = when (state) {
-            AgentRunState.IDLE -> Triple("🎙️", "#00E5FF", false)
-            AgentRunState.LISTENING -> Triple("🟢", "#00E676", false)
-            AgentRunState.THINKING -> Triple("🧠", "#D500F9", true)
-            AgentRunState.EXECUTING_STEP -> Triple("⚡", "#FFAB00", true)
-            AgentRunState.WAITING_USER_REPLY -> Triple("❓", "#00E676", true)
-            AgentRunState.SPEAKING -> Triple("🔊", "#00B0FF", true)
+        val (icon, label, borderColor, showStop) = when {
+            state == AgentRunState.LISTENING -> Quad("🟢", step.ifBlank { "Sun raha hoon" }, "#00E676", false)
+            state == AgentRunState.THINKING -> Quad("🧠", step.ifBlank { "Soch raha hoon" }, "#D500F9", true)
+            state == AgentRunState.EXECUTING_STEP -> Quad("⚡", step.ifBlank { "Kaam kar raha hoon" }, "#FFAB00", true)
+            state == AgentRunState.WAITING_USER_REPLY -> Quad("❓", step.ifBlank { "Jawab ka intezar" }, "#00E676", true)
+            state == AgentRunState.SPEAKING -> Quad("🔊", step.ifBlank { "Bol raha hoon" }, "#00B0FF", true)
+            loopOn && reconnecting != null -> Quad("🟡", "Dobara jud raha hoon…", "#FFAB00", false)
+            loopOn && listening -> Quad("🟢", "Sun raha hoon", "#00E676", false)
+            loopOn -> Quad("🎙️", "Mic ON — jud raha hai…", "#00E5FF", false)
+            else -> Quad("🎙️", "Mic OFF — tap karo", "#00E5FF", false)
         }
 
         orbButton?.text = icon
-        statusTextView?.text = step.ifBlank { "JARVIS Ready" }
+        statusTextView?.text = label
         stopButton?.visibility = if (showStop) View.VISIBLE else View.GONE
         bg?.setStroke(3, Color.parseColor(borderColor))
     }
+
+    private data class Quad(
+        val icon: String,
+        val label: String,
+        val borderColor: String,
+        val showStop: Boolean
+    )
 
     fun hide() {
         overlayScope?.cancel()

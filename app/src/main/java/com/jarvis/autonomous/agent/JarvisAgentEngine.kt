@@ -326,16 +326,18 @@ class JarvisAgentEngine(
     fun announceIncomingCall(displayNameOrNumber: String) {
         if (isTaskRunning()) return
         scope.launch {
-            // C-B13: when the number is blank/unknown, announce
-            // GENERICALLY and honestly — never "unknown number se"
-            // and never a pretended contact name.
-            val announcement = if (displayNameOrNumber.isBlank() ||
-                displayNameOrNumber == "number nahi dikh raha"
-            ) {
-                "Bhai, call aa rahi hai, number nahi dikh raha."
-            } else {
-                "Bhai, call aa raha hai, $displayNameOrNumber se."
-            }
+            // 1.4.8 (G8 F3): GENERIC-ONLY by user decision — the
+            // display value is INTENTIONALLY IGNORED here and
+            // never spoken, even if the OS/OEM ever delivers a
+            // real number. The old code spoke it whenever
+            // non-blank, so permission absence was the ONLY
+            // thing keeping the announce generic; now the speak
+            // site itself enforces it. The parameter stays for
+            // call-site compatibility only (the receiver still
+            // passes whatever the OS delivered; nothing here
+            // reads it). No name/number ever reaches chat or
+            // speech from this path.
+            val announcement = "Bhai, call aa rahi hai."
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
             speak(announcement)
         }
