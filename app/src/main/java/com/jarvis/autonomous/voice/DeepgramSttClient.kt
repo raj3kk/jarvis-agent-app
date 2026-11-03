@@ -10,8 +10,8 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.Buffer
 import okio.ByteString
-import okio.toByteString
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -153,7 +153,11 @@ class DeepgramSttClient(private val apiKey: String) {
     fun sendPcm(bytes: ByteArray, length: Int): Boolean {
         if (closed.get()) return false
         val ws = webSocket ?: return false
-        val ok = ws.send(bytes.toByteString(0, length))
+        // Buffer.readByteString() is the version-proof binary
+        // path: ByteString.of() is ERROR-level deprecated under
+        // Okio 3.x, and the toByteString extension import does
+        // not resolve on this toolchain (CI-verified twice).
+        val ok = ws.send(Buffer().write(bytes, 0, length).readByteString())
         if (ok) lastSendMs = System.currentTimeMillis()
         return ok
     }
