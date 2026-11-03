@@ -156,6 +156,32 @@ class MainActivity : ComponentActivity() {
         JarvisStateRepository.addDiagnostic(
             "launch", "LAUNCH_START", "MainActivity created (launcher tap)."
         )
+        // 1.4.4 out-of-app report: detection + file write ALSO run
+        // here on a background thread — NOT only from the Command
+        // tab card. If the app bounces before any UI is composed,
+        // the card can never run, but this thread still writes the
+        // previous session's bounce report to
+        // Documents/JarvisDiagnostics/last-bounce-report.txt, so
+        // the user can copy it from a file manager even when the
+        // app never stays open. The next launch re-detects and
+        // rewrites it if this thread dies mid-write. Never on the
+        // main thread (a slow MediaStore write must not ANR the
+        // launch it is trying to diagnose). Fully best-effort:
+        // any failure is swallowed, launch continues normally.
+        Thread {
+            runCatching {
+                if (!LaunchSession.bounceChecked) {
+                    val found = detectPreviousBounce()
+                    LaunchSession.bounce = found
+                    if (found != null) {
+                        LaunchSession.bounceFilePath = writeBounceReportFile(
+                            this, buildBounceReportText(found)
+                        )
+                    }
+                    LaunchSession.bounceChecked = true
+                }
+            }
+        }.start()
         startJarvisBackgroundService()
         // 1.4.3: startup greeting — the service speaks it once
         // per service lifetime (ACTION_GREET is a no-op on
