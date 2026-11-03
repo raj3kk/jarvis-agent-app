@@ -403,17 +403,20 @@ class JarvisAccessibilityService : AccessibilityService() {
      */
     fun performSystemNavigation(navAction: String): Boolean {
         val target = navAction.uppercase()
-        // 1.4.4 "back na ho" startup guard: until the user has
-        // issued a command in THIS session AND the first UI has
-        // been composed, NO agent path may press HOME or BACK —
-        // a launch bounce must never be caused (or worsened) by
-        // the agent itself. Blocked attempts write
-        // NAV_BLOCKED_STARTUP and return false; they NEVER
-        // silently succeed and NEVER write NAV_EXEC (NAV_EXEC
-        // means "actually pressed"). The hardware Back button is
-        // NOT affected — this guard covers only the agent /
-        // accessibility path. After the first user command, normal
-        // in-task navigation works exactly as before.
+        // 1.4.4 "back na ho" startup guard: until THIS activity
+        // instance has composed UI AND a user command arrived
+        // after THIS launch, NO agent path may press HOME or BACK
+        // — a launch bounce must never be caused (or worsened) by
+        // the agent itself. The window resets on every activity
+        // launch (LaunchSession.onActivityLaunch); a pure
+        // background voice task with the app never opened is not
+        // blocked, because no reset happens without a launch.
+        // Blocked attempts write NAV_BLOCKED_STARTUP and return
+        // false; they NEVER silently succeed and NEVER write
+        // NAV_EXEC (NAV_EXEC means "actually pressed"). The
+        // hardware Back button is NOT affected — this guard
+        // covers only the agent / accessibility path. After the
+        // window lifts, normal in-task navigation works as before.
         if ((target == "HOME" || target == "BACK") &&
             !(com.jarvis.autonomous.data.LaunchSession.userCommandIssued &&
                 com.jarvis.autonomous.data.LaunchSession.uiStable)

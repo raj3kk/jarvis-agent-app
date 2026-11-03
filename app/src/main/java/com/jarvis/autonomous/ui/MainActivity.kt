@@ -156,6 +156,9 @@ class MainActivity : ComponentActivity() {
         JarvisStateRepository.addDiagnostic(
             "launch", "LAUNCH_START", "MainActivity created (launcher tap)."
         )
+        // 1.4.4 per-launch guard window: reset HOME/BACK blocking
+        // for THIS launch (see LaunchSession.onActivityLaunch).
+        LaunchSession.onActivityLaunch()
         // 1.4.4 out-of-app report: detection + file write ALSO run
         // here on a background thread — NOT only from the Command
         // tab card. If the app bounces before any UI is composed,
@@ -737,6 +740,66 @@ fun CommandCenterScreen(
                     }
                     if (bounceCopiedNote.isNotBlank()) {
                         Text(bounceCopiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                }
+            }
+        }
+        // 1.4.4 overlay-visibility fix (user evidence: "overlay
+        // permission NAHI mili hai"): the grant flow itself was
+        // already correct (Permissions tab intent + ON_RESUME
+        // status), but a launch-time overlay failure surfaced
+        // ONLY as a notification + log line — easy to miss, and
+        // then the HUD pill just never appears with no in-app
+        // reason. So the Command tab now says so plainly, with a
+        // one-tap grant. Shown only while the HUD toggle is ON
+        // (AI Brain me OFF karne se ye band ho jata hai) and
+        // re-checked on every resume, so granting in Settings
+        // clears it on return. NOTE: this banner is unreachable
+        // while every launch bounces (user cannot open the app)
+        // — it helps AFTER the bounce is fixed, it is NOT part
+        // of the bounce fix path (see LaunchBounceCatcher header).
+        val overlayLifecycleOwner = LocalLifecycleOwner.current
+        var overlayTick by remember { mutableIntStateOf(0) }
+        DisposableEffect(overlayLifecycleOwner) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) overlayTick++
+            }
+            overlayLifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { overlayLifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+        val overlayMissing = remember(overlayTick) {
+            val hudOn = whiteboardContext
+                .getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
+                .getBoolean("floating_overlay_enabled", true)
+            hudOn && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                !Settings.canDrawOverlays(whiteboardContext)
+        }
+        if (overlayMissing) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3D6))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Overlay permission nahi mili — HUD pill nahi dikhega",
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF7A5A00)
+                    )
+                    Text(
+                        "Floating pill ke liye 'Draw over apps' chahiye. Grant dabakar system screen me Jarvis ke liye toggle ON karo. (Nahi chahiye to AI Brain me Floating HUD OFF kar do.)",
+                        fontSize = 12.sp, color = Color(0xFF3B2F2A)
+                    )
+                    Button(
+                        onClick = {
+                            whiteboardContext.startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${whiteboardContext.packageName}")
+                                ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                            )
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85C38))
+                    ) {
+                        Text("Grant Overlay Permission", color = Color.White, fontSize = 12.sp)
                     }
                 }
             }

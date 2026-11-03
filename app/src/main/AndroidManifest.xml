@@ -153,6 +153,19 @@
             </intent-filter>
         </receiver>
 
+        <!-- 1.4.4: FileProvider ONLY for sharing the bounce report
+             file from the notification Share action (external
+             files dir, JarvisDiagnostics/). No other files are
+             shared; the provider is not exported. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

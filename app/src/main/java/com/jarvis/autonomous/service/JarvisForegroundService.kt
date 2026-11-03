@@ -17,10 +17,16 @@ import android.os.PowerManager
 import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.LaunchSession
+import com.jarvis.autonomous.data.bounceShareFile
+import com.jarvis.autonomous.data.buildBounceReportText
+import com.jarvis.autonomous.data.detectPreviousBounce
+import com.jarvis.autonomous.data.writeBounceReportFile
 import com.jarvis.autonomous.ui.JarvisBrowserHost
 import com.jarvis.autonomous.ui.MainActivity
 import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
@@ -97,6 +103,10 @@ class JarvisForegroundService : Service() {
      */
     private var greetingDone: Boolean = false
     private var pendingGreet: Boolean = false
+    // 1.4.4: true once the persistent notification has been
+    // re-issued WITH the "Share bounce report" action, so later
+    // service starts don't re-issue it pointlessly.
+    private var bounceShareActionAdded: Boolean = false
     /** B-M13: serialises speakWrapped so setSpeaking(true/false)
      * pairs never interleave across concurrent speaks. */
     private val speakMutex = kotlinx.coroutines.sync.Mutex()
@@ -490,6 +500,36 @@ class JarvisForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 1.4.4 SERVICE-side bounce report (UI-independent — this
+        // is the path that works when NO launch ever reaches UI):
+        // every service start re-runs previous-bounce detection on
+        // a background thread and writes the report file, then
+        // refreshes the persistent notification WITH the Share
+        // action. The Activity's own onCreate thread does the same
+        // write; whichever runs first wins, the other rewrites the
+        // identical file (idempotent). Fully best-effort: any
+        // failure is swallowed, the service command continues.
+        // Single process (no android:process in the manifest), so
+        // LaunchSession flags are shared with the Activity.
+        Thread {
+            runCatching {
+                if (!LaunchSession.bounceChecked) {
+                    val found = detectPreviousBounce()
+                    LaunchSession.bounce = found
+                    if (found != null) {
+                        LaunchSession.bounceFilePath = writeBounceReportFile(
+                            this, buildBounceReportText(found)
+                        )
+                        refreshBounceNotification()
+                    }
+                    LaunchSession.bounceChecked = true
+                } else if (LaunchSession.bounce != null && !bounceShareActionAdded) {
+                    // File was written by the Activity thread, but
+                    // this notification was built before it existed.
+                    refreshBounceNotification()
+                }
+            }
+        }.start()
         when (intent?.action) {
             ACTION_START_LISTENING -> {
                 // Always-on mic path (1.4.0): start once, stays on.
@@ -685,7 +725,38 @@ class JarvisForegroundService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // 1.4.4 notification Share action (UI-independent report
+        // path): when a bounce report file exists, the persistent
+        // notification gains "Share bounce report", which opens
+        // the SYSTEM share sheet with the report file — this works
+        // even if Jarvis UI never stays open, because the chooser
+        // is system UI, not Jarvis UI. The file is served via
+        // FileProvider (external files dir only); the URI grant
+        // is read-only and single-use per share.
+        val shareAction: NotificationCompat.Action? = runCatching {
+            val file = bounceShareFile(this) ?: return@runCatching null
+            val uri = FileProvider.getUriForFile(
+                this, "${packageName}.fileprovider", file
+            )
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Jarvis bounce report")
+                putExtra(
+                    Intent.EXTRA_TEXT,
+                    "Jarvis launch-bounce report (poori report file me hai)."
+                )
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(send, "Share bounce report")
+            val shareIntent = PendingIntent.getActivity(
+                this, 3, chooser,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            NotificationCompat.Action(0, "Share bounce report", shareIntent)
+        }.getOrNull()
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_jarvis_core)
             .setContentTitle("JARVIS AI Autonomous Agent")
             .setContentText(statusText)
@@ -693,7 +764,26 @@ class JarvisForegroundService : Service() {
             .setContentIntent(openAppIntent)
             .addAction(0, "🎙️ Speak", listenIntent)
             .addAction(0, "⏹ Stop Task", stopIntent)
-            .build()
+        if (shareAction != null) {
+            builder.addAction(shareAction)
+            bounceShareActionAdded = true
+        }
+        return builder.build()
+    }
+
+    /**
+     * 1.4.4: re-issue the persistent notification (same ID, same
+     * text) so a freshly written bounce report file gains its
+     * Share action. Calling startForeground again on a running
+     * service only updates the notification.
+     */
+    private fun refreshBounceNotification() {
+        runCatching {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("JARVIS Active — Listening in background")
+            )
+        }
     }
 
     override fun onDestroy() {

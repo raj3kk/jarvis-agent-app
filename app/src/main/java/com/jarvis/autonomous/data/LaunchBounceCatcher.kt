@@ -25,11 +25,59 @@ import java.util.Locale
  *      app staying open: a first-shown card on the Command tab AND
  *      a plain-text file the user can copy from a file manager.
  *
- * Session model (single process — no android:process anywhere, so
- * these statics are shared by Activity, Service and Accessibility
- * service): a "session" starts at a MainActivity LAUNCH_START line.
- * The previous session is the slice between the last two
- * MainActivity LAUNCH_START lines in the persisted file.
+ * Session model: a "session" starts at a MainActivity LAUNCH_START
+ * line, and the guard window RESETS on every activity launch
+ * (onActivityLaunch): HOME/BACK stay blocked until THIS activity
+ * instance composes UI AND a command arrives after THIS launch.
+ * The old process-lifetime reading was wrong for a long-lived
+ * service — a command from an hour ago must not leave the guard
+ * permanently open.
+ *
+ * DECISIVE USER EVIDENCE 2026-11-03 (rewrites the 1.4.3 reading):
+ * app runs in BACKGROUND + notification ALIVE after every bounce
+ * + overlay permission NOT granted. Manifest check
+ * (AndroidManifest.xml: MainActivity singleTop ~line 61,
+ * JarvisForegroundService ~line 90, NO android:process on ANY
+ * component — grep-verified zero matches): SINGLE PROCESS. A
+ * foreground-service notification vanishes when its process dies,
+ * so notification-alive = process-alive = the Activity did NOT
+ * crash the process. Process death / Java crash / Vivo
+ * battery-kill are therefore ELIMINATED as the bounce mechanism
+ * (a crash would also have left a crash entry + killed the
+ * notification). What remains, ranked: (1) agent HOME/BACK press
+ * (from a task or wake-word trigger in the still-alive service)
+ * — the per-launch guard + NAV_BLOCKED_STARTUP marker decide
+ * this; (2) a task/back-stack/intent effect pushing the activity
+ * behind (no launch-time settings/permission intent exists —
+ * MainActivity only requests runtime permissions at first
+ * composition, and overlay/battery intents are user-initiated
+ * buttons only); (3) activity finish — ELIMINATED, zero
+ * finish()/finishAndRemoveTask/moveTaskToBack calls anywhere.
+ *
+ * OVERLAY LOOP (separate pending item, NOT the bounce cause):
+ * launch-time overlay handling is safe — service onCreate calls
+ * FloatingJarvisOverlay.show() only when the HUD toggle is ON
+ * (default true), and show() early-returns on missing permission
+ * (FloatingJarvisOverlay.kt:44-53: reportShowFailure + return, no
+ * throw, no activity effect). Missing overlay therefore cannot
+ * bounce the launch. But the user cannot reach the in-app
+ * Permissions tab while every launch bounces, so the overlay
+ * grant is UNREACHABLE until the bounce is fixed — 1.4.4 does
+ * NOT depend on the in-app grant. The Command-tab banner is
+ * kept for AFTER the bounce is fixed; the bounce fix path is
+ * service/notification/file only.
+ *
+ * PRIMARY REPORT PATH (user: NO launch reaches UI at all):
+ * "show the report first on next UI" alone is INSUFFICIENT —
+ * that screen may never open. So the report is written from
+ * SERVICE/Application paths that do not need UI: the
+ * MainActivity.onCreate background thread AND the foreground
+ * service's onStartCommand thread both run previous-bounce
+ * detection and write Documents/JarvisDiagnostics/
+ * last-bounce-report.txt (+ external-files copy). The persistent
+ * notification gains a "Share bounce report" action (system
+ * share sheet via FileProvider, ACTION_SEND) — it works without
+ * Jarvis UI staying open, because the chooser is system UI.
  *
  * Reading guide (extends the 1.4.3 guide):
  *  - LAUNCH_START, no LAUNCH_UI after it, crash line present
@@ -73,6 +121,23 @@ object LaunchSession {
 
     @Volatile
     var bounceDismissed: Boolean = false
+
+    /**
+     * 1.4.4 per-launch guard window (user evidence 2026-11-03:
+     * service + notification ALIVE after a bounce, so the process
+     * did NOT die — the ACTIVITY left). The old process-lifetime
+     * flags were wrong for a long-lived service: a command from
+     * an hour ago would have left the guard permanently open.
+     * So every MainActivity launch RESETS the window: HOME/BACK
+     * stay blocked until THIS activity instance composes UI AND
+     * a command arrives after THIS launch. No activity launch =
+     * no reset, so a pure background voice task (app never
+     * opened) is NOT blocked by a stale window.
+     */
+    fun onActivityLaunch() {
+        userCommandIssued = false
+        uiStable = false
+    }
 
     fun markUserCommand() {
         userCommandIssued = true
@@ -185,13 +250,24 @@ fun buildBounceReportText(bounce: PreviousBounce): String {
 
 /**
  * Plain-text copy the user can reach WITHOUT the app staying open.
- * First tries Documents/JarvisDiagnostics/last-bounce-report.txt via
- * MediaStore (same proven pattern ProjectStore uses for
- * Documents/JarvisProjects) — visible in any file manager. Falls
- * back to the app's external files dir with a Share-ready path.
- * Returns a human-readable location string for the card.
+ * Writes BOTH copies every time: (1) Documents/JarvisDiagnostics/
+ * last-bounce-report.txt via MediaStore (same proven pattern
+ * ProjectStore uses for Documents/JarvisProjects) — visible in any
+ * file manager; (2) the app's external files dir copy, which is
+ * the one the notification Share action serves via FileProvider
+ * (a MediaStore URI cannot be shared the same way). Returns a
+ * human-readable location string for the card.
  */
 fun writeBounceReportFile(context: Context, text: String): String {
+    var externalOk = false
+    runCatching {
+        val dir = File(
+            context.getExternalFilesDir(null) ?: context.filesDir,
+            "JarvisDiagnostics"
+        ).apply { mkdirs() }
+        File(dir, "last-bounce-report.txt").writeText(text)
+        externalOk = true
+    }
     runCatching {
         val resolver = context.contentResolver
         val collection =
@@ -227,14 +303,16 @@ fun writeBounceReportFile(context: Context, text: String): String {
         }
         if (written) return "Documents/JarvisDiagnostics/last-bounce-report.txt (Files app se kholo)"
     }
-    return runCatching {
-        val dir = File(
-            context.getExternalFilesDir(null) ?: context.filesDir,
-            "JarvisDiagnostics"
-        ).apply { mkdirs() }
-        File(dir, "last-bounce-report.txt").writeText(text)
+    return if (externalOk) {
         "App files: Android/data/com.jarvis.autonomous/files/JarvisDiagnostics/last-bounce-report.txt"
-    }.getOrDefault(
+    } else {
         "File save nahi ho paya — app ke andar Copy button se copy karo."
-    )
+    }
+}
+
+/** External-files copy for the notification Share action, if present. */
+fun bounceShareFile(context: Context): File? {
+    val dir = context.getExternalFilesDir(null) ?: return null
+    val f = File(dir, "JarvisDiagnostics/last-bounce-report.txt")
+    return if (f.exists()) f else null
 }

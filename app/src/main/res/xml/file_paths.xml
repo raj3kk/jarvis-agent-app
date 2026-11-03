@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 1.4.4: only the bounce-report dir is shareable, nothing else. -->
+<paths>
+    <external-files-path name="bounce_reports" path="JarvisDiagnostics/" />
+</paths>
