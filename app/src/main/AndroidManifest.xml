@@ -96,6 +96,18 @@
                 android:value="Autonomous voice assistant and multi-step accessibility agent" />
         </service>
 
+        <!-- 1.4.5: Kokoro TTS in an ISOLATED process (:tts). A
+             native Sherpa/ONNX death during model load / generate
+             kills only this process, never the UI process — the
+             main-process client (TtsProcessClient) observes the
+             binder death and degrades to a visible failure.
+             Not exported: only this app binds to it. -->
+        <service
+            android:name=".service.KokoroTtsService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":tts" />
+
         <!-- Floating Whiteboard over other apps (S4, 1.4.0) -->
         <service
             android:name=".service.JarvisWhiteboardService"

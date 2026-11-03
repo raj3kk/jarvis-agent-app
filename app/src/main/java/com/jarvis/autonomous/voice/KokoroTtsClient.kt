@@ -449,6 +449,20 @@ object KokoroTtsClient {
             }
         }
         stopped.set(false)
+        // 1.4.5: GENERATE-stage markers are PRIMARY now (user
+        // evidence 2026-11-03: NO greeting audio heard at all, so
+        // death was BEFORE the first audible sample — playback is
+        // eliminated as the death stage). SPK_ENGINE_START without
+        // SPK_ENGINE_END = death during native model load (114 MB
+        // ONNX load / native allocation / LMK kill); GENERATE_START
+        // without GENERATE_END = death during ONNX inference.
+        // These run in the :tts process and land in the SHARED
+        // diagnostics.jsonl file, so they survive a :tts death
+        // and name the stage that killed it. Never the text.
+        JarvisStateRepository.addDiagnostic(
+            "tts", "SPK_ENGINE_START",
+            "Kokoro engine load started (native model load)."
+        )
         // B-C1: engine-init failure is NOT terminal. A corrupt
         // model dir is deleted and re-copied fresh, then the
         // engine is retried once — speak() must never return
@@ -472,17 +486,43 @@ object KokoroTtsClient {
                     "Kokoro still unavailable after fresh copy — no " +
                         "fallback voice in the Kokoro-only build."
                 )
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "SPK_ENGINE_END",
+                    "Kokoro engine unavailable after fresh copy."
+                )
                 return false
             }
             recoveredTts
         }
+        JarvisStateRepository.addDiagnostic(
+            "tts", "SPK_ENGINE_END",
+            "Kokoro engine ready (cached or freshly loaded)."
+        )
         return try {
             withContext(Dispatchers.IO) {
-                for (chunk in splitChunks(text, 600)) {
+                val chunks = splitChunks(text, 600)
+                for ((index, chunk) in chunks.withIndex()) {
                     if (stopped.get()) return@withContext false
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_GENERATE_START",
+                        "Generate chunk ${index + 1}/${chunks.size} (chars=${chunk.length})."
+                    )
                     val audio = tts.generate(chunk, HF_ALPHA_SID, 1.0f)
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_GENERATE_END",
+                        "Generate chunk ${index + 1} done (samples=${audio.samples.size})."
+                    )
                     if (stopped.get()) return@withContext false
-                    if (!playAudio(audio)) return@withContext false
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_PLAY_START",
+                        "Playback chunk ${index + 1}/${chunks.size}."
+                    )
+                    val played = playAudio(audio)
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_PLAY_END",
+                        "Playback chunk ${index + 1} ok=$played."
+                    )
+                    if (!played) return@withContext false
                 }
                 true
             }

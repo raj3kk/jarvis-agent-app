@@ -26,6 +26,7 @@ import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.bounceShareFile
 import com.jarvis.autonomous.data.buildBounceReportText
 import com.jarvis.autonomous.data.detectPreviousBounce
+import com.jarvis.autonomous.data.wasLastDeathDuringGreetingSpeak
 import com.jarvis.autonomous.data.writeBounceReportFile
 import com.jarvis.autonomous.ui.JarvisBrowserHost
 import com.jarvis.autonomous.ui.MainActivity
@@ -33,6 +34,7 @@ import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
 import com.jarvis.autonomous.voice.DeepgramSttClient
+import com.jarvis.autonomous.voice.TtsProcessClient
 import com.jarvis.autonomous.voice.VoiceManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -103,6 +105,17 @@ class JarvisForegroundService : Service() {
      */
     private var greetingDone: Boolean = false
     private var pendingGreet: Boolean = false
+    // 1.4.5: greeting-speak flight flag + deferred VAD start.
+    // The 1.4.4 bounce died during greeting native load; the
+    // pre-existing Sherpa VAD native init (startVadMonitor) must
+    // not spike native allocation at the same moment, so while
+    // a greeting speak is in flight, VAD init waits and runs
+    // right after the greeting finishes (pendingVadStart).
+    // VAD is optional (mic-busy degrades to VAD-off by design);
+    // greeting is the priority, so VAD yields, never the reverse.
+    @Volatile
+    private var greetingSpeakInProgress: Boolean = false
+    private var pendingVadStart: Boolean = false
     // 1.4.4: true once the persistent notification has been
     // re-issued WITH the "Share bounce report" action, so later
     // service starts don't re-issue it pointlessly.
@@ -185,13 +198,69 @@ class JarvisForegroundService : Service() {
             base
         }
         JarvisStateRepository.addChatMessage("Jarvis", full)
+        // 1.4.5 CIRCUIT BREAKER (WhopClip-style catcher bridge —
+        // diagnostic + usability bridge, NOT a substitute for the
+        // isolated-process TTS fix): if the previous process died
+        // during greeting speak (GREET_START with no SPK_END),
+        // skip greeting speak for exactly ONE launch and show
+        // the breaker card instead (see Command tab). Two things
+        // happen at once: (a) if the app then stays open, that
+        // PROVES greeting speak was the trigger; (b) the user
+        // gets a readable catcher (banner + full report + Copy)
+        // while the app stays open. Self-clearing: a skipped
+        // greeting writes no GREET_START, so the next launch
+        // cannot trip again and greeting resumes normally.
+        // The skip itself is recorded as GREET_SKIPPED_AFTER_SPK_DEATH.
+        if (wasLastDeathDuringGreetingSpeak()) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "GREET_SKIPPED_AFTER_SPK_DEATH",
+                "Previous session died during greeting speak — " +
+                    "greeting speak skipped once so the app stays open " +
+                    "(circuit breaker; next launch greets normally)."
+            )
+            JarvisStateRepository.setGreetSkippedAfterSpeakDeath(true)
+            JarvisStateRepository.addChatMessage(
+                "System",
+                "Pichhli baar greeting bolte waqt app band hua, " +
+                    "isliye is baar greeting skip ki gayi taaki app khula rahe."
+            )
+            return
+        }
+        // 1.4.5 GREET_START: the greeting-specific start marker.
+        // speakWrapped writes SPK_END unconditionally, so the
+        // breaker detector reads GREET_START-without-SPK_END as
+        // death-during-greeting. Written BEFORE the speak launch
+        // so even a death before speakWrapped starts is caught.
+        JarvisStateRepository.addDiagnostic(
+            "tts", "GREET_START",
+            "Startup greeting speak started."
+        )
+        greetingSpeakInProgress = true
         serviceScope.launch {
             val ok = runCatching { speakWrapped(full) }.getOrDefault(false)
+            greetingSpeakInProgress = false
+            // Deferred VAD init (see startVadMonitor): run it now
+            // that greeting native work is done, so the two native
+            // loads never spike together at launch.
+            if (pendingVadStart) {
+                pendingVadStart = false
+                startVadMonitor()
+            }
             if (!ok) {
                 JarvisStateRepository.addDiagnostic(
                     "tts", "GREET_FAIL",
                     "Startup greeting could not be spoken (Kokoro OFF or TTS failed) — text shown in chat."
                 )
+                // 1.4.5 visible failure: if the isolated TTS
+                // process died mid-greeting, say so in chat
+                // (the app stayed open — that IS the fix working).
+                if (TtsProcessClient.lastFailure == TtsProcessClient.FAIL_NATIVE_DIED) {
+                    JarvisStateRepository.addChatMessage(
+                        "System",
+                        "Awaaz wala process band ho gaya, isliye greeting " +
+                            "sunai nahi di — app khula hua hai, baat chat me padh sakte ho."
+                    )
+                }
             }
         }
     }
@@ -252,7 +321,32 @@ class JarvisForegroundService : Service() {
      * A missing asset only logs — it never breaks the mic loop.
      */
     private fun startVadMonitor() {
+        // 1.4.5 serialization: while a greeting speak is in
+        // flight, its native Kokoro load is running — do not
+        // stack the Sherpa VAD native init on top of it. Defer
+        // (VAD is optional; greeting is the priority) and run
+        // right after the greeting finishes (see speakGreeting).
+        // Cross-process note: after 1.4.5 isolation, Kokoro runs
+        // in :tts and VAD in the main process, so they share no
+        // native state any more — this deferral only avoids a
+        // simultaneous native-allocation spike at launch.
+        if (greetingSpeakInProgress) {
+            pendingVadStart = true
+            JarvisStateRepository.addDiagnostic(
+                "tts", "VAD_DEFERRED",
+                "Sherpa VAD init deferred until greeting speak " +
+                    "finishes (native loads serialized at launch)."
+            )
+            return
+        }
         serviceScope.launch {
+            // 1.4.5 overlap markers: VAD_INIT_START/END timestamps
+            // against SPK_ENGINE_/SPK_GENERATE_ markers show
+            // whether VAD init overlapped greeting speak.
+            JarvisStateRepository.addDiagnostic(
+                "tts", "VAD_INIT_START",
+                "Sherpa VAD init started."
+            )
             val started = runCatching {
                 val target = File(filesDir, "silero_vad.onnx")
                 val assetSize = runCatching {
@@ -270,6 +364,10 @@ class JarvisForegroundService : Service() {
                     // the recognizer timer remains the primary path.
                 }
             }.getOrDefault(false)
+            JarvisStateRepository.addDiagnostic(
+                "tts", "VAD_INIT_END",
+                "Sherpa VAD init finished (started=$started)."
+            )
             JarvisStateRepository.addLog(
                 "Silero VAD monitor started=$started " +
                     "(mic-busy degrades to VAD-off by design)."
@@ -509,8 +607,10 @@ class JarvisForegroundService : Service() {
         // write; whichever runs first wins, the other rewrites the
         // identical file (idempotent). Fully best-effort: any
         // failure is swallowed, the service command continues.
-        // Single process (no android:process in the manifest), so
-        // LaunchSession flags are shared with the Activity.
+        // 1.4.5: UI + this service share the MAIN process; only
+        // Kokoro TTS runs in :tts (see KokoroTtsService). So
+        // LaunchSession flags are shared with the Activity (same
+        // process), and the :tts process never touches them.
         Thread {
             runCatching {
                 if (!LaunchSession.bounceChecked) {

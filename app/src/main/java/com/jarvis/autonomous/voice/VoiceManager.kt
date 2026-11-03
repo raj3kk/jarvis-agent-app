@@ -120,12 +120,16 @@ class VoiceManager(
                 return@withLock false
             }
 
-            // B-M13: transient audio focus per utterance, so music
-            // / other audio ducks for exactly this utterance.
+            // 1.4.5: synthesis runs in the ISOLATED :tts process
+            // (TtsProcessClient) — a native Sherpa/ONNX death
+            // during model load / generate kills only TTS, never
+            // this UI process. On :tts death this returns false
+            // (with tts/NATIVE_TTS_PROCESS_DIED recorded) instead
+            // of the app vanishing; see KokoroTtsService.
             val focus = requestTransientFocus()
             speakInProgress = true
             val ok = try {
-                KokoroTtsClient.speak(context, text)
+                TtsProcessClient.speak(context, text)
             } finally {
                 speakInProgress = false
                 abandonFocus(focus)
@@ -169,7 +173,10 @@ class VoiceManager(
         JarvisStateRepository.addDiagnostic(
             "tts", "SPEAK_ABORT", "Speech stopped: $reason"
         )
-        KokoroTtsClient.stopPlayback()
+        // 1.4.5: playback lives in the :tts process — stop it
+        // there. (The old main-process stopPlayback() call is
+        // gone: no AudioTrack exists in this process any more.)
+        TtsProcessClient.stop()
     }
 
     /** B-M13: transient focus for one utterance; null if unavailable. */

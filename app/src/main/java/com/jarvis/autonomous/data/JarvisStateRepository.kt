@@ -116,6 +116,18 @@ object JarvisStateRepository {
     private val _lastTranscriptScript = MutableStateFlow("latin")
     val lastTranscriptScript: StateFlow<String> = _lastTranscriptScript.asStateFlow()
 
+    // 1.4.5 circuit breaker: true on the launch where greeting
+    // speak was skipped because the previous process died during
+    // greeting speak. In-memory only (main process); the skip
+    // itself writes no GREET_START, so the breaker self-clears
+    // on the next launch. Read by the Command-tab breaker card.
+    private val _greetSkippedAfterSpeakDeath = MutableStateFlow(false)
+    val greetSkippedAfterSpeakDeath: StateFlow<Boolean> = _greetSkippedAfterSpeakDeath.asStateFlow()
+
+    fun setGreetSkippedAfterSpeakDeath(value: Boolean) {
+        _greetSkippedAfterSpeakDeath.value = value
+    }
+
     fun setSttPath(path: String, reason: String) {
         _sttPath.value = path
         _sttPathReason.value = reason

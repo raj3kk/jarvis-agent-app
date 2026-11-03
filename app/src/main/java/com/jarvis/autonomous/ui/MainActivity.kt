@@ -695,6 +695,73 @@ fun CommandCenterScreen(
                 bounceInfo = found
             }
         }
+        // 1.4.5 CIRCUIT BREAKER card (WhopClip-style catcher:
+        // app stays OPEN, full problem visible, copyable). Shown
+        // ONLY on the launch where greeting speak was skipped
+        // because the previous process died during greeting
+        // speak (GREET_START without SPK_END). It sits directly
+        // ABOVE the 1.4.4 bounce card, so the skip explanation
+        // reads first and the FULL bounce report + its Copy
+        // button follow right below it. Two proofs in one view:
+        // (a) if the app stays open with greeting skipped, that
+        // PROVES greeting speak was the trigger; (b) the user
+        // can copy the full report without the app closing.
+        // Next launch greets normally (the skip writes no
+        // GREET_START, so the breaker self-clears).
+        val greetSkipped by JarvisStateRepository.greetSkippedAfterSpeakDeath.collectAsState()
+        var breakerDismissed by remember { mutableStateOf(false) }
+        var breakerCopiedNote by remember { mutableStateOf("") }
+        if (greetSkipped && !breakerDismissed) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3D6))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Pichhli baar greeting bolte waqt app band hua, isliye is baar greeting skip ki gayi taaki app khula rahe",
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF7A5A00)
+                    )
+                    Text(
+                        "Agar is baar app khula rehta hai to ye proof hai ki greeting speak hi trigger tha. " +
+                            "Agli launch par greeting wapas normal hogi. Poori report neeche wale bounce card me hai — wahan se bhi copy kar sakte ho.",
+                        fontSize = 12.sp, color = Color(0xFF3B2F2A)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val cm = whiteboardContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as ClipboardManager
+                                val text = bounceInfo?.let { buildBounceReportText(it) }
+                                    ?: "=== Jarvis greeting-speak breaker ===\n" +
+                                        "Previous session died during greeting speak " +
+                                        "(GREET_START without SPK_END) — greeting speak " +
+                                        "skipped once so the app stays open.\n" +
+                                        "=== end ==="
+                                cm.setPrimaryClip(
+                                    ClipData.newPlainText("Jarvis bounce report", text)
+                                )
+                                breakerCopiedNote = "Copied — ab mujhe paste kar do."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85C38))
+                        ) {
+                            Text("Copy poori report", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                JarvisStateRepository.setGreetSkippedAfterSpeakDeath(false)
+                                breakerDismissed = true
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Band karo", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                    if (breakerCopiedNote.isNotBlank()) {
+                        Text(breakerCopiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                }
+            }
+        }
         if (bounceInfo != null && !bounceDismissed) {
             val bounce = bounceInfo!!
             Card(

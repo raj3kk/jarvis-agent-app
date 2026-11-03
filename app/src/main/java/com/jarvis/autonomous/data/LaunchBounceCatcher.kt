@@ -164,6 +164,46 @@ private fun tsOf(line: String): String {
 }
 
 /**
+ * 1.4.5 CIRCUIT BREAKER detector (WhopClip-style catcher bridge).
+ * Returns true when the PREVIOUS process died DURING greeting
+ * speak: its session slice contains a GREET_START with NO
+ * SPK_END after it. speakWrapped writes SPK_END unconditionally
+ * (even on failure), so a missing SPK_END after GREET_START
+ * means the process died mid-greeting — native crash, LMK kill,
+ * or any other death the Java handler could not record. This is
+ * the exact 2026-11-03 18:54:49 signature (SPK_START, no
+ * SPK_END, no destroy markers, new process 2 s later).
+ *
+ * Boundaries are Application LAUNCH_START lines (one per cold
+ * process start) — NOT MainActivity LAUNCH_START lines, because
+ * a warm tap writes no new process marker. If fewer than two
+ * process markers exist (fresh install / first run), false.
+ * Self-clearing: a skipped greeting writes NO GREET_START, so
+ * the next launch's previous slice cannot trip again — the
+ * breaker fires for exactly ONE launch, then normal greeting
+ * resumes (see speakGreeting).
+ */
+fun wasLastDeathDuringGreetingSpeak(): Boolean {
+    val lines = JarvisDiagnosticsFile.readLast(300)
+    if (lines.isEmpty()) return false
+    val appStarts = lines.indices.filter { i ->
+        lines[i].contains("\"code\":\"LAUNCH_START\"") &&
+            lines[i].contains("App process started")
+    }
+    if (appStarts.size < 2) return false
+    val prevStart = appStarts[appStarts.size - 2]
+    val curStart = appStarts[appStarts.size - 1]
+    val slice = lines.subList(prevStart, curStart)
+    val lastGreet = slice.indexOfLast { it.contains("\"code\":\"GREET_START\"") }
+    if (lastGreet < 0) return false
+    // Any SPK_END after the last GREET_START = the greeting
+    // speak finished (even as a failure) — no death mid-speak.
+    return slice.subList(lastGreet, slice.size).none {
+        it.contains("\"code\":\"SPK_END\"")
+    }
+}
+
+/**
  * Previous-session bounce detection. Returns null when there is no
  * previous launch to judge, or when the previous session ended
  * normally (backgrounding / rotation / clean close) — no card then.
