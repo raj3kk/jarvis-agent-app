@@ -179,7 +179,44 @@ fun detectPreviousBounce(): PreviousBounce? {
         lines[i].contains("\"code\":\"LAUNCH_START\"") &&
             lines[i].contains("MainActivity created")
     }
-    if (activityStarts.size < 2) return null
+    if (activityStarts.size < 2) {
+        // 1.4.4 LEGACY fallback (deep-verification audit): 1.4.3
+        // never wrote LAUNCH_START, so the FIRST 1.4.4 launch has
+        // only one Activity LAUNCH_START and the slice logic above
+        // would report nothing — yet the OLD 1.4.3 diagnostics
+        // file already holds LIFE/NAV/SPK markers, and THOSE are
+        // what decide candidate (a) agent-HOME vs (b) OEM
+        // backgrounding. So: when no LAUNCH_START pair exists yet
+        // but 1.4.3-era markers are present, surface the last 30
+        // lines as a clearly-labeled LEGACY trail (not a fresh
+        // bounce verdict). Gated on marker presence, so a fresh
+        // install (no markers) still reports nothing. After the
+        // second 1.4.4 launch, the normal slice path takes over
+        // and this fallback stops firing.
+        val hasLegacyMarkers = lines.any { line ->
+            val c = codeOf(line)
+            c.startsWith("LIFE_") || c.startsWith("NAV_") || c.startsWith("SPK_")
+        }
+        if (!hasLegacyMarkers) return null
+        val tail = lines.takeLast(30)
+        val crash = tail.lastOrNull { it.contains("\"area\":\"crash\"") }
+        val lastMarkers = tail.filter { line ->
+            val c = codeOf(line)
+            c.startsWith("LIFE_") || c.startsWith("NAV_") || c.startsWith("SPK_")
+        }.takeLast(6).joinToString("; ") { "${codeOf(it)} @ ${tsOf(it)}" }
+        return PreviousBounce(
+            classification = "LEGACY TRAIL (1.4.3 markers, pre-LAUNCH_START — " +
+                "first 1.4.4 launch; this decides agent-HOME vs OEM backgrounding)",
+            detail = "Last markers: ${if (lastMarkers.isBlank()) "none" else lastMarkers}. " +
+                "NAV_EXEC HOME present = agent pressed HOME (1.4.3 wrote no " +
+                "USER_CMD markers, so task context comes from SPK/step lines, " +
+                "not from a USER_CMD order check). No NAV_EXEC + " +
+                "LIFE_PAUSE/DESTROY = OEM backgrounding (b). " +
+                "Crash in trail: ${if (crash != null) "YES" else "no"}.",
+            sessionLines = tail,
+            lastCrash = crash
+        )
+    }
     val prevStart = activityStarts[activityStarts.size - 2]
     val curStart = activityStarts[activityStarts.size - 1]
     val slice = lines.subList(prevStart, curStart)
