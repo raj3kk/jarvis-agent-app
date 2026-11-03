@@ -70,7 +70,7 @@ class JarvisForegroundService : Service() {
     private val wakeLockHandler = Handler(Looper.getMainLooper())
     // A-M8 wake-lock renewal: re-acquires before the timeout
     // expires, so the lock never silently lapses mid-session.
-    private val wakeLockRenewalRunnable = Runnable {
+    private val wakeLockRenewalRunnable: Runnable = Runnable {
         runCatching {
             if (wakeLock?.isHeld == true) {
                 wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
@@ -412,8 +412,11 @@ class JarvisForegroundService : Service() {
                 // A-M8: non-reference-counted + timed acquire,
                 // renewed by wakeLockRenewalRunnable before expiry
                 // (re-acquire extends the timeout) — the old fixed
-                // 4h acquire silently lapsed after 4 hours.
-                isReferenceCounted = false
+                // 4h acquire silently lapsed after 4 hours. NOTE:
+                // WakeLock has no Kotlin-readable isReferenceCounted
+                // property (setter only), so call setReferenceCounted
+                // explicitly — property syntax does not compile here.
+                setReferenceCounted(false)
                 acquire(WAKE_LOCK_TIMEOUT_MS)
             }
             wakeLockHandler.postDelayed(

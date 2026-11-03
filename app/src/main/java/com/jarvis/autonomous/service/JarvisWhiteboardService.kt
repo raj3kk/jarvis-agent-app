@@ -305,7 +305,7 @@ class JarvisWhiteboardService : Service() {
                 else -> false
             }
         }
-        runCatching {
+        return runCatching {
             manager.addView(pill, params)
             collapsedView = pill
             currentParams = params
