@@ -35,9 +35,10 @@ data class DiagnosticEntry(
     val message: String
 )
 
-/** 1.4.2: a terminal mic death that the user must SEE (banner +
- *  spoken reason + Retry), not a log line. `code` is the raw
- *  SpeechRecognizer error code (-1 when unknown). */
+/** 1.4.2: a mic failure the user must SEE (banner + spoken
+ *  reason + Retry), not a log line. `code` is -1 under the
+ *  Deepgram-only policy (no system recognizer codes any more);
+ *  the banner hides the code line when code < 0. */
 data class MicFatalState(
     val reason: String,
     val code: Int,
@@ -103,15 +104,68 @@ object JarvisStateRepository {
     private val _micListening = MutableStateFlow(false)
     val micListening: StateFlow<Boolean> = _micListening.asStateFlow()
 
-    // 1.4.3: live STT path (deepgram|system) + switch reason +
-    // last Deepgram transcript script, written by the mic manager
-    // (and mirrored by the service's onSttPathChanged), read by
-    // the Diagnostics report. Values only — never a key.
-    private val _sttPath = MutableStateFlow("system")
+    // 1.4.3: live STT path + switch reason + last Deepgram
+    // transcript script, written by the mic manager (and
+    // mirrored by the service's onSttPathChanged), read by the
+    // Diagnostics report. Values only — never a key.
+    // 1.4.5 part 3 (FINAL mic policy 2026-11-03): Deepgram ONLY
+    // — the path is always "deepgram" once started; "not
+    // started" before the first user-enabled start.
+    private val _sttPath = MutableStateFlow("not started")
     val sttPath: StateFlow<String> = _sttPath.asStateFlow()
 
     private val _sttPathReason = MutableStateFlow("not started")
     val sttPathReason: StateFlow<String> = _sttPathReason.asStateFlow()
+
+    // 1.4.5 part 3: mic auto-reconnect state (FINAL policy:
+    // transient Deepgram failures NEVER silently kill the loop).
+    // Non-null reason = the loop is user-enabled but currently
+    // reconnecting (amber banner, Retry + Mic off offered);
+    // null = connected, or loop off. Set by the service's
+    // onMicReconnecting / onMicRecovered.
+    private val _micReconnecting = MutableStateFlow<String?>(null)
+    val micReconnecting: StateFlow<String?> = _micReconnecting.asStateFlow()
+
+    fun setMicReconnecting(reason: String?) {
+        _micReconnecting.value = reason
+    }
+
+    // 1.4.5 part 3: Kokoro ON/OFF as Compose state. prefs
+    // .kokoroEnabled is a plain SharedPreferences read — it does
+    // NOT trigger recomposition, so the persistent Kokoro-OFF
+    // header card stayed stale after an AI Brain Save (the Save
+    // only recomposed the settings screen, never the parent).
+    // This flow is the single source the card reads; it is set
+    // from prefs at MainActivity launch and on every Save /
+    // setup / reset that changes the toggle.
+    private val _kokoroEnabled = MutableStateFlow(true)
+    val kokoroEnabled: StateFlow<Boolean> = _kokoroEnabled.asStateFlow()
+
+    fun setKokoroEnabled(value: Boolean) {
+        _kokoroEnabled.value = value
+    }
+
+    // 1.4.5 part 3: bounce detection as observable state
+    // (research: atomic detection + durable evidence). The old
+    // design kept the result in LaunchSession @Volatile vars
+    // that Compose never observed, so a card composed before
+    // the background detection finished stayed empty forever.
+    // The single claiming detector thread sets these; all cards
+    // collect them and recompose when detection lands.
+    private val _bounceReport = MutableStateFlow<PreviousBounce?>(null)
+    val bounceReport: StateFlow<PreviousBounce?> = _bounceReport.asStateFlow()
+
+    private val _bounceChecked = MutableStateFlow(false)
+    val bounceChecked: StateFlow<Boolean> = _bounceChecked.asStateFlow()
+
+    private val _bounceFilePath = MutableStateFlow("")
+    val bounceFilePath: StateFlow<String> = _bounceFilePath.asStateFlow()
+
+    fun setBounceReport(report: PreviousBounce?, filePath: String) {
+        _bounceReport.value = report
+        _bounceFilePath.value = filePath
+        _bounceChecked.value = true
+    }
 
     private val _lastTranscriptScript = MutableStateFlow("latin")
     val lastTranscriptScript: StateFlow<String> = _lastTranscriptScript.asStateFlow()
@@ -158,6 +212,79 @@ object JarvisStateRepository {
         _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
         runCatching { JarvisDiagnosticsFile.append(entry) }
         if (area == "llm") _lastLlmError.value = "$code: $clean"
+    }
+
+    /**
+     * Sync variant: same mirror update, but the file write is
+     * fsynced (see JarvisDiagnosticsFile.appendSync). Used by
+     * speak-path stage markers so the marker naming a killing
+     * stage survives even a device crash.
+     */
+    fun addDiagnosticSync(area: String, code: String, message: String) {
+        val clean = sanitizeDiagnosticMessage(message)
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        val entry = DiagnosticEntry(time, area, code, clean)
+        _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
+        runCatching { JarvisDiagnosticsFile.appendSync(entry) }
+        if (area == "llm") _lastLlmError.value = "$code: $clean"
+    }
+
+    /**
+     * 1.4.5 part 3 — durable evidence for a fresh launch
+     * (research: in-memory mirror khaali dikhta hai). On a fresh
+     * process the mirror starts empty, so the Diagnostics
+     * section showed nothing until NEW entries arrived — a
+     * post-bounce launch looked evidence-free. This seeds the
+     * mirror from the persisted file (last 150 lines, parsed
+     * back into entries). Called once from MainActivity launch
+     * on a background thread; never re-appends to the file.
+     */
+    fun loadPersistedDiagnostics() {
+        runCatching {
+            val lines = JarvisDiagnosticsFile.readLast(150)
+            if (lines.isEmpty()) return
+            val parsed = lines.mapNotNull { parseDiagnosticLine(it) }
+            if (parsed.isNotEmpty()) {
+                _diagnostics.value = parsed.takeLast(150)
+            }
+        }
+    }
+
+    private fun parseDiagnosticLine(line: String): DiagnosticEntry? {
+        fun field(name: String): String? {
+            val key = "\"$name\":\""
+            val start = line.indexOf(key)
+            if (start < 0) return null
+            var i = start + key.length
+            val sb = StringBuilder()
+            while (i < line.length) {
+                val c = line[i]
+                if (c == '\\' && i + 1 < line.length) {
+                    val n = line[i + 1]
+                    when (n) {
+                        '\\' -> sb.append('\\')
+                        '"' -> sb.append('"')
+                        'n' -> sb.append(' ')
+                        'r' -> sb.append(' ')
+                        else -> sb.append(n)
+                    }
+                    i += 2
+                } else if (c == '"') {
+                    return sb.toString()
+                } else {
+                    sb.append(c)
+                    i++
+                }
+            }
+            return null
+        }
+        val ts = field("ts") ?: return null
+        val area = field("area") ?: return null
+        val code = field("code") ?: return null
+        val msg = field("msg") ?: return null
+        // File ts is yyyy-MM-dd HH:mm:ss; mirror shows HH:mm:ss.
+        val time = ts.takeLast(8).takeIf { it.length == 8 } ?: ts
+        return DiagnosticEntry(time, area, code, msg)
     }
 
     fun clearDiagnostics() {

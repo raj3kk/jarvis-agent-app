@@ -417,7 +417,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         userPrompt: String,
         imageBase64: String? = null
     ): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+        // 1.4.5 (item 8): key via HEADER, never the URL query.
+        // The step-call path put the key in ?key= (logged URLs,
+        // proxies, and the diagnostics sanitizer's ?key= strip all
+        // treat query keys as leakable); testApiKey already used
+        // the x-goog-api-key header — now the real call does too.
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
         val userParts = JSONArray().apply {
             put(JSONObject().put("text", userPrompt))
             if (!imageBase64.isNullOrBlank()) {
@@ -447,6 +452,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
 
         val req = Request.Builder()
             .url(url)
+            .addHeader("x-goog-api-key", apiKey)
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .build()
 

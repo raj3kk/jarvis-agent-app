@@ -74,28 +74,47 @@ object TtsProcessClient {
 
     private data class Outcome(val ok: Boolean, val died: Boolean)
 
+    /** Request id echoed in every DONE/PROGRESS reply (item 5). */
+    const val KEY_REQ = "req_id"
+
     private val lock = Any()
     private var serviceMessenger: Messenger? = null
     private var connection: ServiceConnection? = null
     private var bound: Boolean = false
     private var pending: CompletableDeferred<Outcome>? = null
     private var pendingProgress: ((String, Long, Long) -> Unit)? = null
+    private var pendingReq: Long? = null
+    private var nextReqId: Long = 0L
 
     private val replyMessenger = Messenger(
         Handler(Looper.getMainLooper(), Handler.Callback { msg ->
             if (msg.what == KokoroTtsService.MSG_DONE) {
+                // 1.4.5 (item 5): complete ONLY on request-id match.
+                // A late DONE from a timed-out request (after an
+                // unbind + rebind) must never complete a NEW pending
+                // speak/reset/ensure — that was the second half of
+                // the stuck-flag bug (stale replies landing on the
+                // wrong request). Mismatches are ignored.
+                val req = msg.data?.getLong(KEY_REQ, -1L) ?: -1L
                 val ok = msg.data?.getBoolean(KokoroTtsService.KEY_OK) ?: false
                 synchronized(lock) {
-                    pending?.complete(Outcome(ok, false))
-                    pending = null
-                    pendingProgress = null
+                    if (pendingReq != null && pendingReq == req) {
+                        pending?.complete(Outcome(ok, false))
+                        pending = null
+                        pendingProgress = null
+                        pendingReq = null
+                    }
                 }
                 true
             } else if (msg.what == KokoroTtsService.MSG_PROGRESS) {
+                val req = msg.data?.getLong(KEY_REQ, -1L) ?: -1L
                 val stage = msg.data?.getString(KokoroTtsService.KEY_STAGE) ?: ""
                 val copied = msg.data?.getLong(KokoroTtsService.KEY_COPIED) ?: 0L
                 val total = msg.data?.getLong(KokoroTtsService.KEY_TOTAL) ?: 0L
-                synchronized(lock) { pendingProgress }?.invoke(stage, copied, total)
+                val cb = synchronized(lock) {
+                    if (pendingReq != null && pendingReq == req) pendingProgress else null
+                }
+                cb?.invoke(stage, copied, total)
                 true
             } else {
                 false
@@ -112,6 +131,7 @@ object TtsProcessClient {
             pending?.complete(Outcome(false, true))
             pending = null
             pendingProgress = null
+            pendingReq = null
         }
         lastFailure = FAIL_NATIVE_DIED
         JarvisStateRepository.addDiagnostic(
@@ -202,6 +222,7 @@ object TtsProcessClient {
             return false
         }
         val deferred = CompletableDeferred<Outcome>()
+        val reqId = synchronized(lock) { ++nextReqId }
         synchronized(lock) {
             if (pending != null) {
                 lastFailure = FAIL_BUSY
@@ -213,10 +234,14 @@ object TtsProcessClient {
                 return false
             }
             pending = deferred
+            pendingReq = reqId
         }
         val sent = runCatching {
             val msg = Message.obtain(null, KokoroTtsService.MSG_SPEAK)
-            msg.data = Bundle().apply { putString(KokoroTtsService.KEY_TEXT, text) }
+            msg.data = Bundle().apply {
+                putString(KokoroTtsService.KEY_TEXT, text)
+                putLong(KEY_REQ, reqId)
+            }
             msg.replyTo = replyMessenger
             val messenger = synchronized(lock) { serviceMessenger }
                 ?: throw RemoteException("TTS service messenger gone")
@@ -224,7 +249,10 @@ object TtsProcessClient {
         }
         if (sent.isFailure) {
             synchronized(lock) {
-                if (pending == deferred) pending = null
+                if (pending == deferred) {
+                    pending = null
+                    pendingReq = null
+                }
             }
             // A dead binder here is the same native-death case;
             // the death handler may already have recorded it.
@@ -241,6 +269,18 @@ object TtsProcessClient {
         if (outcome == null) {
             stop()
             unbind(appContext)
+            // 1.4.5 (item 5): THE STUCK-FLAG BUG — the old timeout
+            // branch never cleared `pending`, so every later speak
+            // returned TTS_BUSY forever (a 5-minute timeout became
+            // a permanent speech outage). Clear it here, and the
+            // req-id check above makes any late DONE harmless.
+            synchronized(lock) {
+                if (pending == deferred) {
+                    pending = null
+                    pendingProgress = null
+                    pendingReq = null
+                }
+            }
             lastFailure = FAIL_TIMEOUT
             JarvisStateRepository.addDiagnostic(
                 "tts", "TTS_PROCESS_TIMEOUT",
@@ -290,6 +330,7 @@ object TtsProcessClient {
             return false
         }
         val deferred = CompletableDeferred<Outcome>()
+        val reqId = synchronized(lock) { ++nextReqId }
         synchronized(lock) {
             if (pending != null) {
                 lastFailure = FAIL_BUSY
@@ -297,9 +338,11 @@ object TtsProcessClient {
             }
             pending = deferred
             pendingProgress = onProgress
+            pendingReq = reqId
         }
         val sent = runCatching {
             val msg = Message.obtain(null, KokoroTtsService.MSG_RESET)
+            msg.data = Bundle().apply { putLong(KEY_REQ, reqId) }
             msg.replyTo = replyMessenger
             val messenger = synchronized(lock) { serviceMessenger }
                 ?: throw RemoteException("TTS service messenger gone")
@@ -310,6 +353,7 @@ object TtsProcessClient {
                 if (pending == deferred) {
                     pending = null
                     pendingProgress = null
+                    pendingReq = null
                 }
             }
             if (lastFailure == null) {
@@ -327,10 +371,104 @@ object TtsProcessClient {
         val outcome = withTimeoutOrNull(600_000L) { deferred.await() }
         if (outcome == null) {
             unbind(appContext)
+            // 1.4.5 (item 5): same stuck-flag fix as speak().
+            synchronized(lock) {
+                if (pending == deferred) {
+                    pending = null
+                    pendingProgress = null
+                    pendingReq = null
+                }
+            }
             lastFailure = FAIL_TIMEOUT
             JarvisStateRepository.addDiagnostic(
                 "tts", "TTS_PROCESS_TIMEOUT",
                 "No TTS reset reply in 600s — unbound; next request rebinds fresh."
+            )
+            return false
+        }
+        if (outcome.died) {
+            lastFailure = FAIL_NATIVE_DIED
+            return false
+        }
+        return outcome.ok
+    }
+
+    /**
+     * 1.4.5 part 3 (item 1a): route ALL asset copies through :tts
+     * (single writer). Main-process callers — MainActivity launch
+     * copy and the AI Brain Kokoro setup button — call this
+     * instead of KokoroTtsClient.ensureAssetsReady directly, or
+     * the per-process copyMutex cannot protect the shared *.tmp
+     * files against a concurrent :tts copy. Mirrors reset():
+     * MSG_ENSURE, 600 s bound, same death/timeout handling
+     * (including the stuck-flag fix). Read-only isDownloaded
+     * checks stay main-process (manifest + size reads, safe
+     * cross-process).
+     */
+    suspend fun ensure(
+        context: Context,
+        onProgress: (String, Long, Long) -> Unit = { _, _, _ -> }
+    ): Boolean {
+        lastFailure = null
+        val appContext = context.applicationContext
+        if (!ensureBound(appContext)) {
+            lastFailure = FAIL_BIND
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_BIND_FAILED",
+                "Could not bind the isolated TTS process for asset ensure."
+            )
+            return false
+        }
+        val deferred = CompletableDeferred<Outcome>()
+        val reqId = synchronized(lock) { ++nextReqId }
+        synchronized(lock) {
+            if (pending != null) {
+                lastFailure = FAIL_BUSY
+                return false
+            }
+            pending = deferred
+            pendingProgress = onProgress
+            pendingReq = reqId
+        }
+        val sent = runCatching {
+            val msg = Message.obtain(null, KokoroTtsService.MSG_ENSURE)
+            msg.data = Bundle().apply { putLong(KEY_REQ, reqId) }
+            msg.replyTo = replyMessenger
+            val messenger = synchronized(lock) { serviceMessenger }
+                ?: throw RemoteException("TTS service messenger gone")
+            messenger.send(msg)
+        }
+        if (sent.isFailure) {
+            synchronized(lock) {
+                if (pending == deferred) {
+                    pending = null
+                    pendingProgress = null
+                    pendingReq = null
+                }
+            }
+            if (lastFailure == null) {
+                lastFailure = FAIL_BIND
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_BIND_FAILED",
+                    "TTS service messenger gone while sending ensure."
+                )
+            }
+            return false
+        }
+        val outcome = withTimeoutOrNull(600_000L) { deferred.await() }
+        if (outcome == null) {
+            unbind(appContext)
+            synchronized(lock) {
+                if (pending == deferred) {
+                    pending = null
+                    pendingProgress = null
+                    pendingReq = null
+                }
+            }
+            lastFailure = FAIL_TIMEOUT
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_PROCESS_TIMEOUT",
+                "No TTS ensure reply in 600s — unbound; next request rebinds fresh."
             )
             return false
         }

@@ -100,7 +100,8 @@ class JarvisPreferences(context: Context) {
     // 1.4.3: Deepgram STT key (listening/transcription ONLY —
     // speaking stays bundled Kokoro; Deepgram TTS/Aura is never
     // used). Stored on the phone, never in the APK or repo, never
-    // logged. Empty = Deepgram unavailable -> system fallback.
+    // logged. 1.4.5 FINAL policy: empty = CANNOT LISTEN (system
+    // fallback REMOVED entirely — no fallback exists any more).
     var deepgramApiKey: String
         get() = prefs.getString("deepgram_api_key", "") ?: ""
         set(value) = prefs.edit().putString("deepgram_api_key", value.trim()).apply()

@@ -7,8 +7,13 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Message
 import android.os.Messenger
+import android.content.ComponentCallbacks2
 import com.jarvis.autonomous.voice.KokoroTtsClient
+import com.jarvis.autonomous.voice.TtsProcessClient
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -71,6 +76,7 @@ class KokoroTtsService : Service() {
         const val MSG_SPEAK = 1
         const val MSG_STOP = 2
         const val MSG_RESET = 3
+        const val MSG_ENSURE = 4
         const val MSG_DONE = 11
         const val MSG_PROGRESS = 12
         const val KEY_TEXT = "text"
@@ -88,34 +94,70 @@ class KokoroTtsService : Service() {
     private lateinit var incoming: Messenger
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val speakBusy = AtomicBoolean(false)
+    // 1.4.5 (item 2c): engine release/trim handling. A release
+    // requested while a speak is in flight is DEFERRED (never
+    // release under a running generate — native use-after-release)
+    // and executed when the speak completes. Idle release runs
+    // 15 minutes after the last speak; the timer resets on every
+    // new speak. Trim (memory pressure) releases immediately when
+    // idle, else defers the same way.
+    @Volatile
+    private var pendingRelease: String? = null
+    private var idleReleaseJob: Job? = null
+
+    private fun requestRelease(reason: String) {
+        if (speakBusy.get()) {
+            pendingRelease = reason
+            return
+        }
+        if (KokoroTtsClient.tryReleaseEngine(reason)) pendingRelease = null
+    }
+
+    private fun scheduleIdleRelease() {
+        idleReleaseJob?.cancel()
+        idleReleaseJob = scope.launch {
+            delay(15L * 60L * 1000L)
+            requestRelease("idle-15min")
+        }
+    }
+
+    private fun afterSpeakDone() {
+        pendingRelease?.let { reason ->
+            if (KokoroTtsClient.tryReleaseEngine(reason)) pendingRelease = null
+        }
+        scheduleIdleRelease()
+    }
 
     private val incomingCallback = Handler.Callback { msg ->
         when (msg.what) {
             MSG_SPEAK -> {
                 val text = msg.data?.getString(KEY_TEXT).orEmpty()
                 val replyTo = msg.replyTo
+                val reqId = msg.data?.getLong(TtsProcessClient.KEY_REQ, -1L) ?: -1L
+                idleReleaseJob?.cancel()
                 if (text.isBlank()) {
-                    replyTo?.let { sendDone(it, false, STAGE_DONE) }
+                    replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
                 } else if (!speakBusy.compareAndSet(false, true)) {
                     // Main process serialises speaks; a busy reply
                     // is honest (never a silent queue) and the
                     // caller degrades to a visible failure.
-                    replyTo?.let { sendDone(it, false, STAGE_BUSY) }
+                    replyTo?.let { sendDone(it, false, STAGE_BUSY, reqId) }
                 } else {
                     scope.launch {
                         try {
                             val ok = KokoroTtsClient.speak(applicationContext, text)
                             replyTo?.let {
-                                sendDone(it, ok, if (ok) STAGE_DONE else STAGE_STOPPED)
+                                sendDone(it, ok, if (ok) STAGE_DONE else STAGE_STOPPED, reqId)
                             }
                         } catch (t: Throwable) {
                             // Java throws from the speak path are
                             // recorded by KokoroTtsClient itself;
                             // this catch only guarantees a reply
                             // so the main process never hangs.
-                            replyTo?.let { sendDone(it, false, STAGE_DONE) }
+                            replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
                         } finally {
                             speakBusy.set(false)
+                            afterSpeakDone()
                         }
                     }
                 }
@@ -129,6 +171,27 @@ class KokoroTtsService : Service() {
                 KokoroTtsClient.stopPlayback()
                 true
             }
+            MSG_ENSURE -> {
+                // 1.4.5 (item 1a): single-writer asset ensure for
+                // main-process callers (launch copy, AI Brain setup
+                // button). No busy refusal: copyMutex inside :tts
+                // serialises this with speak-triggered copies and
+                // with reset (resetAndCopy holds the same lock for
+                // delete + copy). Progress streams with the req id.
+                val replyTo = msg.replyTo
+                val reqId = msg.data?.getLong(TtsProcessClient.KEY_REQ, -1L) ?: -1L
+                scope.launch {
+                    try {
+                        val result = KokoroTtsClient.ensureAssetsReady(applicationContext) { stage, copied, total ->
+                            sendProgress(replyTo, stage, copied, total, reqId)
+                        }
+                        replyTo?.let { sendDone(it, result.isSuccess, STAGE_DONE, reqId) }
+                    } catch (t: Throwable) {
+                        replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
+                    }
+                }
+                true
+            }
             MSG_RESET -> {
                 // 1.4.5 REDO: the Settings reset MUST run here,
                 // in the :tts process — the old main-process call
@@ -137,25 +200,18 @@ class KokoroTtsService : Service() {
                 // native use-after-delete. Refused while a speak
                 // is in flight (busy = retry after speech ends).
                 val replyTo = msg.replyTo
+                val reqId = msg.data?.getLong(TtsProcessClient.KEY_REQ, -1L) ?: -1L
                 if (speakBusy.get()) {
-                    replyTo?.let { sendDone(it, false, STAGE_BUSY) }
+                    replyTo?.let { sendDone(it, false, STAGE_BUSY, reqId) }
                 } else {
                     scope.launch {
                         try {
                             val result = KokoroTtsClient.resetAndCopy(applicationContext) { stage, copied, total ->
-                                runCatching {
-                                    val progress = Message.obtain(null, MSG_PROGRESS)
-                                    progress.data = android.os.Bundle().apply {
-                                        putString(KEY_STAGE, stage)
-                                        putLong(KEY_COPIED, copied)
-                                        putLong(KEY_TOTAL, total)
-                                    }
-                                    replyTo?.send(progress)
-                                }
+                                sendProgress(replyTo, stage, copied, total, reqId)
                             }
-                            replyTo?.let { sendDone(it, result.isSuccess, STAGE_RESET) }
+                            replyTo?.let { sendDone(it, result.isSuccess, STAGE_RESET, reqId) }
                         } catch (t: Throwable) {
-                            replyTo?.let { sendDone(it, false, STAGE_RESET) }
+                            replyTo?.let { sendDone(it, false, STAGE_RESET, reqId) }
                         }
                     }
                 }
@@ -165,14 +221,28 @@ class KokoroTtsService : Service() {
         }
     }
 
-    private fun sendDone(replyTo: Messenger, ok: Boolean, stage: String) {
+    private fun sendDone(replyTo: Messenger, ok: Boolean, stage: String, reqId: Long = -1L) {
         runCatching {
             val msg = Message.obtain(null, MSG_DONE)
             msg.data = android.os.Bundle().apply {
                 putBoolean(KEY_OK, ok)
                 putString(KEY_STAGE, stage)
+                putLong(TtsProcessClient.KEY_REQ, reqId)
             }
             replyTo.send(msg)
+        }
+    }
+
+    private fun sendProgress(replyTo: Messenger?, stage: String, copied: Long, total: Long, reqId: Long) {
+        runCatching {
+            val progress = Message.obtain(null, MSG_PROGRESS)
+            progress.data = android.os.Bundle().apply {
+                putString(KEY_STAGE, stage)
+                putLong(KEY_COPIED, copied)
+                putLong(KEY_TOTAL, total)
+                putLong(TtsProcessClient.KEY_REQ, reqId)
+            }
+            replyTo?.send(progress)
         }
     }
 
@@ -188,7 +258,23 @@ class KokoroTtsService : Service() {
         return incoming.binder
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // 1.4.5 (item 2c): the engine holds ~114 MB native. On
+        // memory pressure, release it (or defer if speaking) so
+        // the system need not LMK-kill this process mid-generate.
+        // The old code never released the engine at all.
+        if (level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE
+        ) {
+            requestRelease("trim-$level")
+        }
+    }
+
     override fun onDestroy() {
+        idleReleaseJob?.cancel()
+        runCatching { KokoroTtsClient.tryReleaseEngine("service-destroy") }
         runCatching { KokoroTtsClient.stopPlayback() }
         scope.cancel()
         runCatching { workerThread.quitSafely() }

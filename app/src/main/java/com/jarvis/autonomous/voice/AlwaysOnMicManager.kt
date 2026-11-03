@@ -10,13 +10,9 @@ import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
@@ -106,9 +102,25 @@ import kotlinx.coroutines.withContext
  *   are never acted on mid-TTS by this class; the coordinator
  *   decides whether to queue or drop a turn that lands mid-speech.
  *
- * THREADING: SpeechRecognizer must run on the main thread, so all
- * recognizer work and turn checks use [mainHandler]. Task work
- * never runs here. The VAD loop runs on [vadScope] (IO).
+ * 1.4.5 FINAL MIC POLICY (user order 2026-11-03 ~19:36 IST,
+ * SUPERSEDES the 16:18 fallback decision): system SpeechRecognizer
+ * is REMOVED ENTIRELY from this app — loop, one-shot, wake-word,
+ * everywhere. Listening is Deepgram ONLY. There is no fallback:
+ * every Deepgram gap (idle-resume incl. null VAD, one-shot
+ * endpointing, key-change restart, chat/diagnostic lines, barge-in,
+ * hung-connect timeout, dead-loop re-tap) is therefore a MUST-FIX
+ * in this file, not an optional improvement. Mic does NOT
+ * auto-start on app open (tap-to-start); once the user enables it,
+ * it stays ON with visible reconnect + auto-revive — the 1.4.1
+ * terminal-stop permanent-silence design is dead. Mic off happens
+ * only on the user's explicit OFF action. Trade-off (user-decided):
+ * no internet = no listening; speaking still works offline via
+ * bundled Kokoro.
+ *
+ * THREADING: turn checks use [mainHandler]; Deepgram callbacks
+ * arrive on OkHttp threads and are marshalled to main where
+ * noted. Task work never runs here. The VAD loop runs on
+ * [vadScope] (IO).
  *
  * PERMISSIONS (audited, see INTEGRATION_NOTES_Mic.md): the
  * manifest already declares RECORD_AUDIO, FOREGROUND_SERVICE (+
@@ -131,30 +143,14 @@ class AlwaysOnMicManager(
     private val turnDetector = TurnDetector()
     private val vadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var speechRecognizer: SpeechRecognizer? = null
     private var vadMonitor: SherpaVadMonitor? = null
     private var vadJob: Job? = null
 
     private var enabled: Boolean = false
     private var listeningActive: Boolean = false
 
-    /** 1.4.2: raw SpeechRecognizer error code of the most recent
-     *  onError (-1 when none). Terminal deaths previously surfaced
-     *  only a reason string, so the code was lost before any UI
-     *  could name it — the bug catcher and the Retry banner read
-     *  this, and the diagnostics store records it. */
-    var lastRecognizerErrorCode: Int = -1
-        private set
     private var currentSessionId: Int = 0
     private var lastPartialSessionId: Int = -1
-    private var restartPending: Boolean = false
-    /** A-H6: the single cancellable restart handle (cancelled in [stop]). */
-    private var restartRunnable: Runnable? = null
-    /** A-H6: last successful recognizer start, for the 150ms double-start guard. */
-    private var lastStartMs: Long = 0L
-    /** A-H4/A-H5: consecutive counted (non-transient) errors; reset
-     * on any recognizer progress, never reset by wall-clock time. */
-    private var consecutiveErrorCount: Int = 0
     /** B-C3: transcripts that arrived while speaking, held until
      * post-TTS silence instead of feeding the turn mid-speech. */
     private var quarantinedWhileSpeaking: MutableList<QuarantinedTranscript> = mutableListOf()
@@ -183,10 +179,11 @@ class AlwaysOnMicManager(
     private var rmsBaselineDb: Float? = null
     private var lastRmsDb: Float? = null
 
-    // ---- 1.4.3 Deepgram-primary STT state (system loop stays as
-    // fallback — nothing below deletes a system path). ----
-    /** Active STT path: "deepgram" or "system" (Diagnostics + UI). */
-    var sttPath: String = "system"
+    // ---- Deepgram-ONLY STT state (1.4.5 FINAL policy: no system
+    // path exists any more — sttPath is "deepgram" once started,
+    // "not started" before the first user-enabled start). ----
+    /** Active STT path: "deepgram" once started (Diagnostics + UI). */
+    var sttPath: String = "not started"
         private set
     /** Why the current path is active (Diagnostics + UI line). */
     var sttPathReason: String = "not started"
@@ -204,19 +201,30 @@ class AlwaysOnMicManager(
     @Volatile
     private var deepgramSuspended: Boolean = false
     private var deepgramFallbackTried: Boolean = false
-    // 1.4.5 cascade fix (1.4.1 regression: terminal stop killed
-    // listening permanently on the first network/server blip —
-    // the user's "listen band ho gaya" cascade start). Two
-    // bounded escapes before a terminal stop: (a) reverse
-    // fallback system -> Deepgram, once per start(); (b) bounded
-    // retry of transient NETWORK/SERVER errors (3 x 30 s).
-    // Both are observed (diagnostics) and both terminate:
-    // reverse fallback is once-only, retries are capped, and
-    // fallbackToSystem refuses to restart a system path that
-    // already failed terminally (both-paths-exhausted stop).
-    private var systemToDeepgramTried: Boolean = false
-    private var terminalRetryCount: Int = 0
-    private var terminalRetryRunnable: Runnable? = null
+    // 1.4.5 (FINAL policy): NO terminal-stop design any more.
+    // A Deepgram failure while the user-enabled loop runs enters
+    // RECONNECTING (visible banner + capped exponential backoff
+    // 5s -> 30s, forever until the user turns the mic off) instead
+    // of permanent silence. Only two failures are PERMANENT (the
+    // loop cannot fix them by retrying): RECORD_AUDIO revoked and
+    // Deepgram key missing/blank — those stop with onMicError
+    // (banner) via stopPermanently(). Everything else revives.
+    @Volatile
+    private var reconnecting: Boolean = false
+    private var reconnectAttempt: Int = 0
+    private var reconnectRunnable: Runnable? = null
+    private var connectTimeoutRunnable: Runnable? = null
+    // Wake-word session (Deepgram-only, loop OFF only — see A-H3
+    // gate in startWakeListening): own client/record/pump.
+    private var wakeClient: DeepgramSttClient? = null
+    private var wakeRecord: AudioRecord? = null
+    private var wakePumpThread: Thread? = null
+    private var wakeCallback: ((String) -> Unit)? = null
+    private var wakeActive: Boolean = false
+    private var wakeRestartRunnable: Runnable? = null
+    private var wakeBackoffMs: Long = WAKE_RESTART_BASE_MS
+    // One-shot session (loop OFF only).
+    private var oneShotJob: Job? = null
     @Volatile
     private var lastSpeechMs: Long = 0L
     private var vadSegmentCallback: ((SpeechSegment) -> Unit)? = null
@@ -226,13 +234,22 @@ class AlwaysOnMicManager(
     private val deepgramListener: DeepgramSttClient.Listener = object : DeepgramSttClient.Listener {
         override fun onOpen() {
             if (!enabled) return
+            cancelConnectTimeout()
+            val wasReconnecting = reconnecting
             deepgramConnecting = false
             deepgramActive = true
             deepgramSuspended = false
+            reconnecting = false
+            reconnectAttempt = 0
             lastSpeechMs = System.currentTimeMillis()
+            JarvisStateRepository.addDiagnostic(
+                "stt", "DEEPGRAM_OPEN",
+                "Deepgram stream opened (recovered=$wasReconnecting)."
+            )
             mainHandler.post {
                 listeningActive = true
                 listener.onListeningStateChanged(true)
+                if (wasReconnecting) listener.onMicRecovered()
             }
             // 1.4.3: an idle-resume reconnect must NOT start a
             // second pump — the original pump thread is still
@@ -276,18 +293,29 @@ class AlwaysOnMicManager(
                     val client = DeepgramSttClient(key)
                     deepgramClient = client
                     client.connect(deepgramListener, useFallback = true)
+                    scheduleConnectTimeout()
                     return
                 }
             }
+            cancelConnectTimeout()
+            JarvisStateRepository.addDiagnostic(
+                "stt", "DEEPGRAM_ERROR",
+                "Deepgram error $code: ${message.take(120)} — entering reconnect (no fallback exists)."
+            )
             mainHandler.post {
-                fallbackToSystem("Deepgram $code: ${message.take(120)}")
+                enterReconnecting("Deepgram $code: ${message.take(120)}")
             }
         }
 
         override fun onClosed() {
             if (!enabled || (!deepgramActive && !deepgramConnecting) || deepgramSuspended) return
+            cancelConnectTimeout()
+            JarvisStateRepository.addDiagnostic(
+                "stt", "DEEPGRAM_CLOSED",
+                "Deepgram stream closed unexpectedly — entering reconnect (no fallback exists)."
+            )
             mainHandler.post {
-                fallbackToSystem("Deepgram stream closed unexpectedly.")
+                enterReconnecting("Deepgram stream closed unexpectedly.")
             }
         }
     }
@@ -334,149 +362,6 @@ class AlwaysOnMicManager(
         }
     }
 
-    // RecognitionListener: every ending restarts the recognizer.
-    // Declared after all state above; uses only that state.
-    private val recognitionListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            listeningActive = true
-            consecutiveErrorCount = 0
-            // 1.4.5: session progress clears the terminal retry
-            // budget too — the path is alive again.
-            terminalRetryCount = 0
-            listener.onListeningStateChanged(true)
-        }
-
-        override fun onBeginningOfSpeech() {
-            turnDetector.onSpeechStarted(System.currentTimeMillis())
-        }
-
-        override fun onRmsChanged(rmsdB: Float) {
-            // A-M3: FREEZE RMS while speaking — recognizer RMS
-            // during TTS is playback-dominated and must never feed
-            // the barge-in loud gate. Baseline is tracked only
-            // while NOT speaking, as before.
-            if (isSpeaking) return
-            lastRmsDb = rmsdB
-            rmsBaselineDb = if (rmsBaselineDb == null) {
-                rmsdB
-            } else {
-                rmsBaselineDb!! * 0.9f + rmsdB * 0.1f
-            }
-        }
-
-        override fun onBufferReceived(buffer: ByteArray?) {
-            // Raw audio is not needed; partials carry the transcript.
-        }
-
-        override fun onEndOfSpeech() {
-            // NOT a turn signal. Just marks the session ended; the
-            // restart below (via onResults/onError, or here as a
-            // safety net) keeps the loop alive.
-            listeningActive = false
-            if (enabled) scheduleRestart(RESTART_DELAY_MS)
-        }
-
-        override fun onError(error: Int) {
-            listeningActive = false
-            // 1.4.2: keep the raw code — the old code passed only a
-            // string onward, so the banner/diagnostics could never
-            // name ERROR_NETWORK vs ERROR_SERVER vs permission.
-            lastRecognizerErrorCode = error
-            listener.onListeningStateChanged(false)
-            if (!enabled) return
-            // A-H4: terminal errors stop the loop and surface
-            // onMicError — they are never silently retried.
-            // 1.4.5 cascade fix: "never silently retried" does NOT
-            // mean "die on the first transient blip". Before the
-            // terminal stop, two bounded escapes run (in order):
-            // (a) reverse fallback to Deepgram when it is
-            // configured (the pre-1.4.5 code only fell
-            // Deepgram -> system, never system -> Deepgram, so a
-            // system NETWORK death killed listening even with a
-            // working Deepgram key saved); (b) bounded retry of
-            // transient NETWORK/SERVER errors (3 x 30 s) when no
-            // Deepgram path exists. Both are diagnosed; if both
-            // are exhausted, the loop stops with onMicError and
-            // the banner/Retry exactly as before.
-            if (error in TERMINAL_RECOGNIZER_ERRORS) {
-                if (tryReverseFallbackToDeepgram()) return
-                if ((error == SpeechRecognizer.ERROR_NETWORK ||
-                        error == SpeechRecognizer.ERROR_SERVER) &&
-                    terminalRetryCount < TERMINAL_RETRY_MAX
-                ) {
-                    terminalRetryCount++
-                    JarvisStateRepository.addDiagnostic(
-                        "stt", "TERMINAL_RETRY",
-                        "System recognizer terminal error $error — " +
-                            "retry $terminalRetryCount/$TERMINAL_RETRY_MAX in " +
-                            "${TERMINAL_RETRY_DELAY_MS / 1000}s (transient backend)."
-                    )
-                    scheduleTerminalRetry()
-                    return
-                }
-                stopWithError("Recognizer error $error (terminal) — mic loop stopped.")
-                return
-            }
-            // A-H4: RECORD_AUDIO may have been revoked mid-loop;
-            // every restart path re-checks it (see
-            // [startRecognizerSession]), and a revoked grant stops
-            // here too instead of spinning.
-            if (!isRecordAudioGranted()) {
-                stopWithError("RECORD_AUDIO revoked — mic loop stopped.")
-                return
-            }
-            // A-M6: locale flip ONLY after a session that DID
-            // transcribe something then failed — an empty session
-            // (heard nothing) is not a locale failure and must
-            // not flip. Any successful transcript resets the
-            // locale (see [handleTranscript]).
-            if (turnDetector.currentText().isNotBlank() &&
-                (error == SpeechRecognizer.ERROR_NO_MATCH ||
-                    error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) &&
-                !emptySessionFallbackUsed
-            ) {
-                currentLanguage = LANGUAGE_FALLBACK_EN_IN
-                emptySessionFallbackUsed = true
-            }
-            // Transient silence endings (NO_MATCH / SPEECH_TIMEOUT)
-            // restart immediately and never count toward escalation;
-            // every other error (incl. RECOGNIZER_BUSY, A-H5) goes
-            // through the same counted, escalating backoff.
-            if (error == SpeechRecognizer.ERROR_NO_MATCH ||
-                error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-            ) {
-                scheduleRestart(RESTART_DELAY_MS)
-            } else {
-                scheduleRestart(countedBackoffDelay())
-            }
-        }
-
-        override fun onResults(results: Bundle?) {
-            listeningActive = false
-            consecutiveErrorCount = 0
-            // 1.4.5: a real transcript clears the terminal retry
-            // budget too — the path is alive again.
-            terminalRetryCount = 0
-            listener.onListeningStateChanged(false)
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val finalText = matches?.firstOrNull()?.trim() ?: ""
-            handleTranscript(finalText, isFinal = true)
-            if (enabled) scheduleRestart(RESTART_DELAY_MS)
-        }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val partial = matches?.firstOrNull()?.trim() ?: ""
-            if (partial.isNotEmpty()) {
-                handleTranscript(partial, isFinal = false)
-            }
-        }
-
-        override fun onEvent(eventType: Int, params: Bundle?) {
-            // No-op.
-        }
-    }
-
     // ---- Public API ----
 
     /** True while the loop is enabled (between [start] and [stop]). */
@@ -499,76 +384,67 @@ class AlwaysOnMicManager(
     }
 
     /**
-     * Starts the always-on loop. 1.4.3 path decision (in order):
-     * Deepgram PRIMARY when key present + network available +
-     * WS connects; otherwise the SYSTEM loop (unchanged) with a
-     * VISIBLE switch notice (chat line via onSttPathChanged +
-     * Diagnostics) naming the path and the reason. Safe to call
-     * twice. The system availability check now lives in
-     * [startSystem] so a missing system recognizer never blocks
-     * a Deepgram start.
+     * Starts the always-on loop — Deepgram ONLY (1.4.5 FINAL
+     * policy; no system path exists any more). Safe to call
+     * twice (returns true when already enabled — the service's
+     * health-restart logic decides when a re-tap forces a real
+     * restart via stop() + start()). A blank Deepgram key is a
+     * PERMANENT failure (banner via onMicError, never a silent
+     * loop): without a key there is nothing to listen with. No
+     * network at start enters RECONNECTING (visible banner +
+     * backoff) instead of dying — the network may return.
      */
     fun start(): Boolean {
         if (enabled) return true
-        lastRecognizerErrorCode = -1
         if (!isRecordAudioGranted()) {
             listener.onMicError("RECORD_AUDIO not granted; mic loop not started.")
             return false
         }
+        val key = deepgramKey()
+        if (key.isBlank()) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "NO_DEEPGRAM_KEY",
+                "Mic start refused: no Deepgram key saved — AI Brain me key daal kar Save dabao, phir mic on karo."
+            )
+            listener.onMicError(
+                "Deepgram key nahi hai — AI Brain me key daal kar Save dabao, phir mic on karo."
+            )
+            return false
+        }
         enabled = true
-        consecutiveErrorCount = 0
-        lastStartMs = 0L
+        reconnecting = false
+        reconnectAttempt = 0
         quarantinedWhileSpeaking.clear()
         turnDetector.reset()
         resetLanguageToPrimary()
         deepgramFallbackTried = false
-        // 1.4.5: fresh start() resets the cascade guards — a new
-        // start gets one reverse fallback and a fresh retry budget.
-        systemToDeepgramTried = false
-        terminalRetryCount = 0
-        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-        terminalRetryRunnable = null
-        val key = deepgramKey()
-        if (key.isNotBlank() && hasNetwork()) {
-            sttPath = "deepgram"
-            sttPathReason = "Deepgram key present + network OK"
-            JarvisStateRepository.setSttPath("deepgram", sttPathReason)
-            startDeepgram(key)
+        sttPath = "deepgram"
+        sttPathReason = if (hasNetwork()) {
+            "Deepgram key present + network OK"
         } else {
-            sttPath = "system"
-            sttPathReason = if (key.isBlank()) {
-                "No Deepgram key — listening via system mic"
-            } else {
-                "No network — listening via system mic"
-            }
-            JarvisStateRepository.setSttPath("system", sttPathReason)
-            JarvisStateRepository.addDiagnostic(
-                "stt", "PATH_SYSTEM", sttPathReason
-            )
-            listener.onSttPathChanged("system", sttPathReason)
-            startSystem()
+            "No network at start — reconnecting when network returns"
+        }
+        JarvisStateRepository.setSttPath("deepgram", sttPathReason)
+        JarvisStateRepository.addDiagnostic("stt", "PATH_DEEPGRAM", sttPathReason)
+        listener.onSttPathChanged("deepgram", sttPathReason)
+        if (!hasNetwork()) {
+            enterReconnecting("No network — mic reconnects when network returns.")
+        } else {
+            startDeepgram(key)
         }
         return true
     }
 
-    /** The pre-1.4.3 system loop, untouched except for the
-     *  availability check moving here from [start]. */
-    private fun startSystem() {
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
-            enabled = false
-            listener.onMicError("SpeechRecognizer not available on this device.")
-            return
-        }
-        mainHandler.post {
-            startRecognizerSession()
-            mainHandler.postDelayed(turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS)
-        }
-    }
-
-    /** Deepgram-primary start: stops any VAD runLoop first (its
-     *  AudioRecord would steal the mic from the pump), then
-     *  connects async — onOpen starts the pump, onError/onClosed
-     *  fall back to [startSystem] via [fallbackToSystem]. */
+    /**
+     * Deepgram start: stops any VAD runLoop first (its AudioRecord
+     * would steal the mic from the pump), then connects async —
+     * onOpen starts the pump, onError/onClosed enter reconnecting.
+     * Plus the 15 s HUNG-CONNECT timeout: a hung TCP connect used
+     * to leave deepgramConnecting=true forever (no timeout
+     * existed). Now a posted runnable closes the client and
+     * enters reconnecting with CONNECT_TIMEOUT if still
+     * connecting; it is cancelled on open/error/closed.
+     */
     private fun startDeepgram(key: String) {
         stopVadLoopOnly()
         deepgramConnecting = true
@@ -576,47 +452,158 @@ class AlwaysOnMicManager(
         val client = DeepgramSttClient(key)
         deepgramClient = client
         client.connect(deepgramListener)
+        scheduleConnectTimeout()
         mainHandler.postDelayed(turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS)
     }
 
-    /** Stops the VAD runLoop job WITHOUT releasing the Vad — the
-     *  Deepgram pump reuses the same monitor in tap mode. */
-    private fun stopVadLoopOnly() {
-        vadJob?.cancel()
-        vadJob = null
+    private fun scheduleConnectTimeout() {
+        cancelConnectTimeout()
+        val runnable = Runnable {
+            connectTimeoutRunnable = null
+            if (!enabled) return@Runnable
+            if (deepgramConnecting && !deepgramActive) {
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "CONNECT_TIMEOUT",
+                    "Deepgram connect hung >15s — closing client, entering reconnect."
+                )
+                runCatching { deepgramClient?.close() }
+                deepgramClient = null
+                deepgramConnecting = false
+                enterReconnecting("Deepgram connect timeout (15s) — reconnecting.")
+            }
+        }
+        connectTimeoutRunnable = runnable
+        mainHandler.postDelayed(runnable, CONNECT_TIMEOUT_MS)
+    }
+
+    private fun cancelConnectTimeout() {
+        connectTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectTimeoutRunnable = null
     }
 
     /**
-     * Deepgram -> system fallback (main thread). Tears Deepgram
-     * down, records path + reason, notifies the coordinator
-     * (visible chat line), then starts the system loop. If the
-     * system loop is itself unavailable, [startSystem] surfaces
-     * onMicError (banner/Retry) instead of silent death.
+     * Enter RECONNECTING (main thread by convention; pump and WS
+     * callbacks post here). Visible (banner via onMicReconnecting
+     * + Diagnostics), auto-reviving (capped exponential backoff
+     * 5s -> 30s, forever until the user turns the mic off), and
+     * NEVER a silent permanent stop. The loop stays enabled, so
+     * a later start() tap is a no-op — revival comes from the
+     * backoff, from the UI Retry (service stops then starts),
+     * or from the overlay mic tap (resumeDeepgram when suspended).
      */
-    private fun fallbackToSystem(reason: String) {
-        if (!enabled) return
-        // 1.4.5 ping-pong guard: if the system path already
-        // failed terminally this start (reverse fallback already
-        // ran), restarting it now would only die again — stop
-        // with both paths named instead of looping forever.
-        if (systemToDeepgramTried) {
-            stopWithError(
-                "Both STT paths exhausted (Deepgram failed, system " +
-                    "already failed terminally) — mic loop stopped."
+    private fun enterReconnecting(reason: String) {
+        if (!enabled || reconnecting) return
+        reconnecting = true
+        listeningActive = false
+        listener.onListeningStateChanged(false)
+        listener.onMicReconnecting(reason)
+        JarvisStateRepository.addDiagnostic(
+            "stt", "RECONNECT_SCHEDULED",
+            "Mic reconnecting (attempt ${reconnectAttempt + 1}): $reason"
+        )
+        scheduleReconnect()
+    }
+
+    private fun scheduleReconnect() {
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        val delayMs = (RECONNECT_BASE_MS * (1L shl reconnectAttempt.coerceAtMost(3)))
+            .coerceAtMost(RECONNECT_MAX_MS)
+        val runnable = Runnable {
+            reconnectRunnable = null
+            if (!enabled) return@Runnable
+            reconnectAttempt++
+            if (!isRecordAudioGranted()) {
+                stopPermanently("RECORD_AUDIO revoked — mic loop stopped.")
+                return@Runnable
+            }
+            val key = deepgramKey()
+            if (key.isBlank()) {
+                stopPermanently(
+                    "Deepgram key nahi hai — AI Brain me key daal kar Save dabao, phir mic on karo."
+                )
+                return@Runnable
+            }
+            if (!hasNetwork()) {
+                // Still offline: stay reconnecting, back off again.
+                reconnecting = true
+                scheduleReconnect()
+                return@Runnable
+            }
+            startDeepgram(key)
+        }
+        reconnectRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
+    }
+
+    /**
+     * PERMANENT stop (only for failures retrying cannot fix:
+     * permission revoked, key missing). Everything else goes
+     * through enterReconnecting. Tears the loop down and surfaces
+     * onMicError (banner) — the user, not the loop, restarts it.
+     */
+    private fun stopPermanently(reason: String) {
+        enabled = false
+        reconnecting = false
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        cancelConnectTimeout()
+        mainHandler.removeCallbacks(turnCheckRunnable)
+        stopDeepgramStream()
+        listeningActive = false
+        listener.onListeningStateChanged(false)
+        stopVadMonitor()
+        turnDetector.reset()
+        listener.onMicError(reason)
+    }
+
+    /**
+     * Health for the service's re-tap restart: enabled AND any
+     * sign of a live loop (active stream, connecting, backing
+     * off, or a live pump). Suspended-with-live-pump counts as
+     * HEALTHY (resume paths exist); suspended-with-dead-pump is
+     * UNHEALTHY (only a stop + start revives it).
+     */
+    fun isLoopHealthy(): Boolean {
+        if (!enabled) return false
+        return deepgramActive || deepgramConnecting || reconnecting ||
+            (deepgramPumpThread?.isAlive == true)
+    }
+
+    /** True when the stream is idle-suspended (pump alive, WS closed). */
+    fun isDeepgramSuspended(): Boolean = deepgramSuspended
+
+    /**
+     * VAD-independent resume (item 4): called from the pump's
+     * RMS-spike path and from the overlay mic tap. No-op unless
+     * enabled + suspended. Reconnects with the saved key and
+     * logs IDLE_RESUME with the reason.
+     */
+    fun resumeDeepgram(reason: String = "manual") {
+        if (!enabled || !deepgramSuspended) return
+        deepgramSuspended = false
+        val key = deepgramKey()
+        if (key.isBlank()) {
+            stopPermanently(
+                "Deepgram key nahi hai — AI Brain me key daal kar Save dabao, phir mic on karo."
             )
             return
         }
-        stopDeepgramStream()
-        sttPath = "system"
-        sttPathReason = "Deepgram unavailable ($reason) — listening via system mic"
-        JarvisStateRepository.setSttPath("system", sttPathReason)
-        JarvisStateRepository.addDiagnostic("stt", "FALLBACK", sttPathReason)
-        listener.onSttPathChanged("system", sttPathReason)
-        startSystem()
+        JarvisStateRepository.addDiagnostic(
+            "stt", "IDLE_RESUME",
+            "Deepgram stream resuming (reason=$reason)."
+        )
+        runCatching { deepgramClient?.close() }
+        deepgramClient = null
+        deepgramConnecting = true
+        val client = DeepgramSttClient(key)
+        deepgramClient = client
+        client.connect(deepgramListener)
+        scheduleConnectTimeout()
     }
 
     /** Closes the Deepgram stream + pump mic (idempotent). */
     private fun stopDeepgramStream() {
+        cancelConnectTimeout()
         deepgramConnecting = false
         deepgramActive = false
         deepgramSuspended = false
@@ -643,7 +630,13 @@ class AlwaysOnMicManager(
         )
         if (minBuf <= 0) {
             mainHandler.post {
-                fallbackToSystem("Mic buffer unavailable for Deepgram pump.")
+                if (enabled) {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "PUMP_ERROR",
+                        "Mic buffer unavailable for Deepgram pump — entering reconnect."
+                    )
+                    enterReconnecting("Mic buffer unavailable — reconnecting.")
+                }
             }
             return
         }
@@ -657,7 +650,13 @@ class AlwaysOnMicManager(
         if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
             runCatching { record?.release() }
             mainHandler.post {
-                fallbackToSystem("Mic unavailable for Deepgram pump.")
+                if (enabled) {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "PUMP_ERROR",
+                        "Mic unavailable for Deepgram pump — entering reconnect."
+                    )
+                    enterReconnecting("Mic unavailable — reconnecting.")
+                }
             }
             return
         }
@@ -666,7 +665,13 @@ class AlwaysOnMicManager(
             runCatching { record.stop() }
             runCatching { record.release() }
             mainHandler.post {
-                fallbackToSystem("Mic busy — Deepgram pump could not start.")
+                if (enabled) {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "PUMP_ERROR",
+                        "Mic busy — Deepgram pump could not start — entering reconnect."
+                    )
+                    enterReconnecting("Mic busy — reconnecting.")
+                }
             }
             return
         }
@@ -685,23 +690,34 @@ class AlwaysOnMicManager(
                         continue
                     }
                     updateRmsFromPcm(shorts, read)
+                    // 1.4.5 (item 4): VAD-INDEPENDENT resume. The old
+                    // code resumed ONLY inside the `if (monitor !=
+                    // null)` VAD-tap block — with vadMonitor == null
+                    // a suspended stream NEVER resumed (silent death;
+                    // first post-idle utterance lost). Now an RMS
+                    // spike (>10 dB over the frozen baseline) also
+                    // resumes, via the same shared helper (reason
+                    // rms_spike). Baseline stays frozen while
+                    // speaking, so this also fires for interruptions
+                    // during speech.
+                    if (deepgramSuspended) {
+                        val base = rmsBaselineDb
+                        val cur = lastRmsDb
+                        if (base != null && cur != null && cur >= base + 10f) {
+                            mainHandler.post { resumeDeepgram("rms_spike") }
+                        }
+                    }
                     // VAD tap on the shared buffer (tap mode).
                     val monitor = vadMonitor
                     if (monitor != null) {
                         val segments = monitor.feedSamples(shorts, read)
                         if (segments.isNotEmpty()) {
                             if (deepgramSuspended) {
-                                // Resume: speech returned — reconnect.
-                                deepgramSuspended = false
-                                val key = deepgramKey()
-                                if (key.isNotBlank()) {
-                                    runCatching { deepgramClient?.close() }
-                                    deepgramClient = null
-                                    deepgramConnecting = true
-                                    val client = DeepgramSttClient(key)
-                                    deepgramClient = client
-                                    client.connect(deepgramListener)
-                                }
+                                // Resume via the shared helper (logs
+                                // IDLE_RESUME vad_segment). Pump thread
+                                // -> main, because resume touches
+                                // client state the WS callbacks use.
+                                mainHandler.post { resumeDeepgram("vad_segment") }
                             }
                             val cb = vadSegmentCallback
                             if (cb != null) {
@@ -711,15 +727,23 @@ class AlwaysOnMicManager(
                             }
                         }
                     }
-                    if (deepgramActive && !deepgramSuspended && !isSpeaking) {
+                    // 1.4.5 (item 4): BARGE-IN ALIVE. The old branch
+                    // streamed ONLY when !isSpeaking, so mic audio
+                    // read during TTS speech was discarded and a
+                    // user interrupting during speech could never
+                    // be transcribed. Now audio streams during
+                    // speech too; echo is handled by (a) RMS still
+                    // tracked during speech (baseline frozen, so
+                    // the loud gate can see interruptions) and (b)
+                    // the quarantine echo filter on flush (see
+                    // setSpeaking) + BargeInDetector echo guards.
+                    if (deepgramActive && !deepgramSuspended) {
                         for (i in 0 until read) {
                             val v = shorts[i].toInt()
                             bytes[i * 2] = (v and 0xFF).toByte()
                             bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
                         }
                         deepgramClient?.sendPcm(bytes, read * 2)
-                    } else if (deepgramActive && !deepgramSuspended) {
-                        deepgramClient?.sendKeepAliveIfIdle()
                     }
                     // Idle-suspend (cost): 2 min without any
                     // transcript — WS closes, pump + VAD stay.
@@ -739,7 +763,11 @@ class AlwaysOnMicManager(
                 // Pump death must not kill the loop silently.
                 mainHandler.post {
                     if (enabled) {
-                        fallbackToSystem("Deepgram pump failed: ${e.message}")
+                        JarvisStateRepository.addDiagnostic(
+                            "stt", "PUMP_ERROR",
+                            "Deepgram pump failed: ${e.message} — entering reconnect."
+                        )
+                        enterReconnecting("Deepgram pump failed — reconnecting.")
                     }
                 }
             } finally {
@@ -752,11 +780,18 @@ class AlwaysOnMicManager(
         thread.start()
     }
 
-    /** PCM-energy RMS for the barge-in loud gate (the recognizer
-     *  no longer supplies RMS in Deepgram mode). Tracked only
-     *  while NOT speaking — same freeze rule as onRmsChanged. */
+    /**
+     * PCM-energy RMS for the barge-in loud gate. 1.4.5 (item 4):
+     * lastRmsDb is ALWAYS updated (even while speaking) so the
+     * loud gate can see an interruption during speech — the old
+     * code froze RMS during speech, so the gate compared STALE
+     * pre-speech RMS and barge-in could never fire on level. The
+     * BASELINE stays frozen while speaking (Jarvis's own playback
+     * must never raise it) — that freeze is what makes the gate
+     * meaningful during speech.
+     */
     private fun updateRmsFromPcm(samples: ShortArray, count: Int) {
-        if (isSpeaking || count <= 0) return
+        if (count <= 0) return
         var sumSquares = 0.0
         for (i in 0 until count) {
             val v = samples[i].toDouble()
@@ -765,10 +800,12 @@ class AlwaysOnMicManager(
         val rms = kotlin.math.sqrt(sumSquares / count) / 32768.0
         val rmsDb = (20 * kotlin.math.log10(rms + 1e-9)).toFloat()
         lastRmsDb = rmsDb
-        rmsBaselineDb = if (rmsBaselineDb == null) {
-            rmsDb
-        } else {
-            rmsBaselineDb!! * 0.9f + rmsDb * 0.1f
+        if (!isSpeaking) {
+            rmsBaselineDb = if (rmsBaselineDb == null) {
+                rmsDb
+            } else {
+                rmsBaselineDb!! * 0.9f + rmsDb * 0.1f
+            }
         }
     }
 
@@ -799,66 +836,31 @@ class AlwaysOnMicManager(
      * foreground service itself (coordinator-owned).
      */
     fun stop() {
-        if (!enabled) return
+        if (!enabled && !reconnecting) return
         enabled = false
-        // A-H6: cancel the held restart handle — a posted restart
-        // must never fire after stop().
-        restartPending = false
-        restartRunnable?.let { mainHandler.removeCallbacks(it) }
-        restartRunnable = null
-        // 1.4.5: a pending terminal retry must never revive a
-        // stopped loop either.
-        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-        terminalRetryRunnable = null
-        terminalRetryCount = 0
-        consecutiveErrorCount = 0
+        reconnecting = false
+        // A cancelled reconnect must never revive a stopped loop.
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        cancelConnectTimeout()
         quarantinedWhileSpeaking.clear()
         speakingDepth = 0
         isSpeaking = false
         currentSpokenText = ""
         mainHandler.removeCallbacks(turnCheckRunnable)
-        // 1.4.3: Deepgram stream + pump mic die with the loop.
         stopDeepgramStream()
         sttPathReason = "stopped"
-        mainHandler.post {
-            runCatching { speechRecognizer?.cancel() }
-            runCatching { speechRecognizer?.destroy() }
-            speechRecognizer = null
-            listeningActive = false
-            listener.onListeningStateChanged(false)
-        }
-        stopVadMonitor()
-        turnDetector.reset()
-    }
-
-    /**
-     * A-H4: terminal stop — tears the loop down and surfaces
-     * [AlwaysOnMicListener.onMicError] instead of silently
-     * restarting. Called from the main thread (onError path).
-     */
-    private fun stopWithError(reason: String) {
-        enabled = false
-        restartPending = false
-        restartRunnable?.let { mainHandler.removeCallbacks(it) }
-        restartRunnable = null
-        // 1.4.5: terminal stop also cancels any pending terminal
-        // retry (it must not restart a loop that just stopped).
-        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-        terminalRetryRunnable = null
-        mainHandler.removeCallbacks(turnCheckRunnable)
-        runCatching { speechRecognizer?.cancel() }
-        runCatching { speechRecognizer?.destroy() }
-        speechRecognizer = null
         listeningActive = false
         listener.onListeningStateChanged(false)
         stopVadMonitor()
         turnDetector.reset()
-        listener.onMicError(reason)
     }
 
     /** Releases everything; call from the owning service's onDestroy. */
     fun shutdown() {
         stop()
+        stopWakeListening()
+        cancelListenOnce()
         vadScope.cancel()
     }
 
@@ -888,17 +890,30 @@ class AlwaysOnMicManager(
         } else {
             if (speakingDepth > 0) speakingDepth--
             if (speakingDepth > 0) return
+            val currentSpokenTextBeforeClear = currentSpokenText
             isSpeaking = false
             currentSpokenText = ""
             vadMonitor?.resumeAfterSpeech()
             // B-C3: flush quarantined transcripts now, stamped
             // with post-TTS time, so they form a turn only after
             // post-TTS silence — never mid-speech.
+            // 1.4.5 (item 4): ECHO FILTER on flush. Because the pump
+            // now streams during speech (barge-in alive), Jarvis's
+            // own voice can arrive as a quarantined transcript;
+            // flushing it verbatim would make Jarvis answer its own
+            // echo. Drop held items whose normalised text is
+            // contained in the spoken text or is a token-subsequence
+            // of it — the same echo logic as BargeInDetector.
+            // Genuine user speech during TTS (non-keyword) still
+            // flushes as a turn; keyword barge-in already fired
+            // promptly via handleTranscript.
             if (enabled && quarantinedWhileSpeaking.isNotEmpty()) {
+                val spoken = currentSpokenTextBeforeClear
                 val held = quarantinedWhileSpeaking.toList()
                 quarantinedWhileSpeaking.clear()
                 val nowMs = System.currentTimeMillis()
                 for (item in held) {
+                    if (spoken.isNotBlank() && isEchoOfSpoken(item.text, spoken)) continue
                     if (item.isFinal) {
                         turnDetector.onFinal(item.text, nowMs, true)
                     } else {
@@ -984,13 +999,10 @@ class AlwaysOnMicManager(
                 rmsBaselineDb = rmsBaselineDb
             )
         ) {
-            // 1.4.3: the abort cause is recorded HERE (the
-            // callback itself carries no reason) so Diagnostics
-            // can tell a barge-in cut from a tap cut or a crash.
-            JarvisStateRepository.addDiagnostic(
-                "tts", "SPEAK_ABORT",
-                "Barge-in stop keyword at TTS: transcript starts with a stop word."
-            )
+            // 1.4.5 (item 5): NO log here any more — the callback
+            // (VoiceManager.stopSpeaking("barge-in keyword")) logs
+            // the single SPEAK_ABORT entry. Logging here too made
+            // ONE barge-in produce TWO abort entries in Diagnostics.
             stopSpeakingCallback?.stopSpeaking()
             setSpeaking(false)
             val remainder = BargeInDetector.remainderAfterKeyword(text)
@@ -1028,123 +1040,220 @@ class AlwaysOnMicManager(
         listener.onPartialTranscript(turnDetector.currentText())
     }
 
-    private fun startRecognizerSession() {
-        if (!enabled) return
-        // A-H4: RECORD_AUDIO is re-checked on EVERY restart — a
-        // revoked grant stops the loop instead of spinning.
-        if (!isRecordAudioGranted()) {
-            stopWithError("RECORD_AUDIO revoked — mic loop stopped.")
-            return
-        }
-        // A-H6: never double-start — a live session, or a start
-        // less than ~150ms ago, means a restart already fired.
-        val nowMs = System.currentTimeMillis()
-        if (listeningActive) return
-        if (nowMs - lastStartMs < RESTART_GUARD_MS) return
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
-            stopWithError("SpeechRecognizer became unavailable; mic loop stopping.")
-            return
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLanguage)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
-        }
-        // A-H7: creation + listener + startListening in ONE
-        // guarded block — a creation/start failure degrades to
-        // onMicError, never a main-thread crash.
-        try {
-            if (speechRecognizer == null) {
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(appContext)
-            }
-            speechRecognizer?.setRecognitionListener(recognitionListener)
-            currentSessionId++
-            speechRecognizer?.startListening(intent)
-            lastStartMs = System.currentTimeMillis()
-        } catch (e: Exception) {
-            runCatching { speechRecognizer?.destroy() }
-            speechRecognizer = null
-            listeningActive = false
-            stopWithError("Recognizer start failed (${e.message}) — mic loop stopped.")
-        }
-    }
-
-    // A-H6: ONE held restart runnable — stop() removes it, so a
-    // restart can never fire after the loop stopped.
-    private fun scheduleRestart(delayMs: Long) {
-        if (!enabled || restartPending) return
-        restartPending = true
-        val runnable = Runnable {
-            restartPending = false
-            restartRunnable = null
-            if (enabled) startRecognizerSession()
-        }
-        restartRunnable = runnable
-        mainHandler.postDelayed(runnable, delayMs)
-    }
-
     /**
-     * 1.4.5 reverse fallback: system -> Deepgram, once per
-     * start(). Returns true when the switch happened (caller
-     * must NOT stop the loop). Only when the loop is on the
-     * system path, Deepgram has never been tried this start, a
-     * key is saved, and network is present. The Deepgram side
-     * keeps its own failure path (fallbackToSystem), which
-     * refuses to restart a terminally-failed system path (see
-     * its both-paths-exhausted guard) — so no ping-pong.
+     * Echo test for the quarantine flush (1.4.5 item 4): true when
+     * the held transcript is (a) contained as a string in the
+     * spoken text, or (b) a contiguous token-subsequence of the
+     * spoken tokens — mirroring BargeInDetector's echo guards.
+     * Normalisation: lowercase, trim, collapse whitespace.
      */
-    private fun tryReverseFallbackToDeepgram(): Boolean {
-        if (sttPath != "system" || systemToDeepgramTried) return false
+    private fun isEchoOfSpoken(held: String, spoken: String): Boolean {
+        fun norm(t: String) = t.lowercase().trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val heldNorm = norm(held)
+        val spokenNorm = norm(spoken)
+        if (heldNorm.isEmpty() || spokenNorm.isEmpty()) return false
+        if (spoken.lowercase().contains(held.lowercase().trim())) return true
+        if (heldNorm.size > spokenNorm.size) return false
+        for (start in 0..(spokenNorm.size - heldNorm.size)) {
+            if (spokenNorm.subList(start, start + heldNorm.size) == heldNorm) return true
+        }
+        return false
+    }
+
+    // ---- Wake-word session (Deepgram-only, loop OFF only) ----
+    /**
+     * Start continuous Deepgram wake-word listening (1.4.5 FINAL
+     * policy: the system recognizer wake path is deleted with the
+     * system loop). A-H3 gate: returns false when the always-on
+     * loop is enabled (two mic owners must never fight), when
+     * RECORD_AUDIO is missing, or when no Deepgram key is saved
+     * (+ diagnostic). Finals are delivered on the main thread to
+     * [callback]; the caller (VoiceManager) applies matchWakeTrigger
+     * and the session KEEPS running on non-matches. Pump death
+     * restarts in 5 s; WS error/close restarts with 5 s -> 30 s
+     * capped backoff — EXCEPT auth failure (401/Unauthorized),
+     * which stops the session with WAKE_AUTH_FAILED (retrying a
+     * bad key forever helps nobody; the key must be fixed).
+     */
+    fun startWakeListening(callback: (String) -> Unit): Boolean {
+        if (enabled) return false
+        if (!isRecordAudioGranted()) return false
         val key = deepgramKey()
-        if (key.isBlank() || !hasNetwork()) return false
-        systemToDeepgramTried = true
-        sttPath = "deepgram"
-        sttPathReason = "System recognizer failed terminally — listening via Deepgram"
-        JarvisStateRepository.setSttPath("deepgram", sttPathReason)
-        JarvisStateRepository.addDiagnostic("stt", "REVERSE_FALLBACK", sttPathReason)
-        listener.onSttPathChanged("deepgram", sttPathReason)
-        startDeepgram(key)
+        if (key.isBlank()) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "WAKE_NO_KEY",
+                "Wake-word session refused: no Deepgram key saved."
+            )
+            return false
+        }
+        if (wakeActive) {
+            wakeCallback = callback
+            return true
+        }
+        wakeActive = true
+        wakeCallback = callback
+        wakeBackoffMs = WAKE_RESTART_BASE_MS
+        startWakeSessionInternal(key)
         return true
     }
 
-    /**
-     * 1.4.5 bounded terminal retry: one held 30 s runnable.
-     * Cancelled by stop()/stopWithError() and by any later
-     * session progress (onReady/onResults) — a retry can never
-     * revive a loop the user stopped.
-     */
-    private fun scheduleTerminalRetry() {
-        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = Runnable {
-            terminalRetryRunnable = null
-            if (enabled) startRecognizerSession()
+    private fun startWakeSessionInternal(key: String) {
+        if (!wakeActive) return
+        val minBuf = AudioRecord.getMinBufferSize(
+            16_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            scheduleWakeRestart()
+            return
         }
-        terminalRetryRunnable = runnable
-        mainHandler.postDelayed(runnable, TERMINAL_RETRY_DELAY_MS)
+        val record = runCatching {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                16_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 2
+            )
+        }.getOrNull()
+        if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+            runCatching { record?.release() }
+            scheduleWakeRestart()
+            return
+        }
+        wakeRecord = record
+        val client = DeepgramSttClient(key)
+        wakeClient = client
+        val listener = object : DeepgramSttClient.Listener {
+            override fun onOpen() {}
+            override fun onInterim(text: String) {}
+            override fun onFinal(text: String, speechFinal: Boolean) {
+                if (!wakeActive) return
+                if (text.isBlank()) return
+                val cb = wakeCallback ?: return
+                mainHandler.post { if (wakeActive) cb(text) }
+            }
+            override fun onError(code: String, message: String) {
+                if (!wakeActive) return
+                if (message.contains("401", ignoreCase = true) ||
+                    message.contains("Unauthorized", ignoreCase = true)
+                ) {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "WAKE_AUTH_FAILED",
+                        "Wake session stopped: Deepgram auth failed (key check needed) — no restart."
+                    )
+                    stopWakeListening()
+                    return
+                }
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "WAKE_ERROR",
+                    "Wake session error $code — restarting in ${wakeBackoffMs / 1000}s."
+                )
+                scheduleWakeRestart()
+            }
+            override fun onClosed() {
+                if (!wakeActive) return
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "WAKE_CLOSED",
+                    "Wake session closed — restarting in ${wakeBackoffMs / 1000}s."
+                )
+                scheduleWakeRestart()
+            }
+        }
+        client.connect(listener)
+        val thread = Thread {
+            val buf = ByteArray(3200)
+            try {
+                record.startRecording()
+                while (wakeActive && wakeRecord == record) {
+                    val read = runCatching { record.read(buf, 0, buf.size) }.getOrDefault(-1)
+                    if (read < 0) break
+                    if (read > 0) client.sendPcm(buf, read)
+                }
+            } catch (e: Exception) {
+                // Pump death: restart path below.
+            } finally {
+                runCatching { record.stop() }
+                runCatching { record.release() }
+                if (wakeRecord == record) wakeRecord = null
+            }
+            if (wakeActive) {
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "WAKE_PUMP_DIED",
+                    "Wake pump died — restarting in 5s."
+                )
+                mainHandler.post { scheduleWakeRestart() }
+            }
+        }
+        wakePumpThread = thread
+        thread.start()
     }
 
-    /**
-     * A-H4/A-H5: escalating backoff for counted (non-transient)
-     * errors, RECOGNIZER_BUSY included — no fixed-delay bypass.
-     * Delay doubles per consecutive error (150ms, 300ms, 600ms…
-     * capped at ~4.8s) and, past [MAX_CONSECUTIVE_ERRORS], the
-     * loop STOPS with onMicError instead of looping silently
-     * forever. The count resets ONLY on recognizer progress
-     * (onReady / onResults) — never on a wall-clock window, so a
-     * flapping recognizer cannot defeat escalation by waiting
-     * out a window.
-     */
-    private fun countedBackoffDelay(): Long {
-        consecutiveErrorCount++
-        if (consecutiveErrorCount > MAX_CONSECUTIVE_ERRORS) {
-            stopWithError(
-                "Recognizer failed $consecutiveErrorCount times in a row — mic loop stopped."
-            )
-            return RESTART_DELAY_MS
+    private fun scheduleWakeRestart() {
+        if (!wakeActive) return
+        wakeRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        val delayMs = wakeBackoffMs
+        wakeBackoffMs = (wakeBackoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
+        val runnable = Runnable {
+            wakeRestartRunnable = null
+            if (!wakeActive || enabled) return@Runnable
+            val key = deepgramKey()
+            if (key.isBlank()) {
+                stopWakeListening()
+                return@Runnable
+            }
+            runCatching { wakeClient?.close() }
+            wakeClient = null
+            startWakeSessionInternal(key)
         }
-        val shift = (consecutiveErrorCount - 1).coerceAtMost(5)
-        return RESTART_DELAY_MS * (1L shl shift)
+        wakeRestartRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
+    }
+
+    fun stopWakeListening() {
+        wakeActive = false
+        wakeRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        wakeRestartRunnable = null
+        runCatching { wakeClient?.close() }
+        wakeClient = null
+        val record = wakeRecord
+        wakeRecord = null
+        runCatching { record?.stop() }
+        runCatching { record?.release() }
+        wakePumpThread = null
+        wakeCallback = null
+    }
+
+    // ---- One-shot session (Deepgram-only, loop OFF only) ----
+    /**
+     * Loop-OFF single reply via Deepgram listenOnce (1.4.5 FINAL
+     * policy: the system single-shot path is deleted). A-H3 gate:
+     * when the loop is enabled the callback gets null immediately
+     * (the service answers from the loop's next turn instead).
+     * Blank key -> null + ONE_SHOT_NO_KEY diagnostic (no mic
+     * opened). The running job is kept so cancelListenOnce()
+     * frees the mic.
+     */
+    fun listenOnceAsync(timeoutMs: Long, callback: (String?) -> Unit) {
+        if (enabled) {
+            callback(null)
+            return
+        }
+        val key = deepgramKey()
+        if (key.isBlank()) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "ONE_SHOT_NO_KEY",
+                "One-shot refused: no Deepgram key saved."
+            )
+            callback(null)
+            return
+        }
+        oneShotJob?.cancel()
+        oneShotJob = vadScope.launch {
+            val text = DeepgramSttClient(key).listenOnce(timeoutMs)
+            mainHandler.post { callback(text) }
+        }
+    }
+
+    fun cancelListenOnce() {
+        oneShotJob?.cancel()
+        oneShotJob = null
     }
 
     private fun resetLanguageToPrimary() {
@@ -1163,28 +1272,24 @@ class AlwaysOnMicManager(
         const val LANGUAGE_PRIMARY_HI_IN: String = "hi-IN"
         const val LANGUAGE_FALLBACK_EN_IN: String = "en-IN"
 
-        /** Normal restart gap: effectively immediate, not a spin. */
-        const val RESTART_DELAY_MS: Long = 150L
-        /** A-H6 double-start guard window. */
-        const val RESTART_GUARD_MS: Long = 150L
-        /** A-H4/A-H5: counted errors before the loop stops itself. */
-        const val MAX_CONSECUTIVE_ERRORS: Int = 10
-        /** 1.4.5: bounded terminal retries (NETWORK/SERVER only). */
-        const val TERMINAL_RETRY_MAX: Int = 3
-        const val TERMINAL_RETRY_DELAY_MS: Long = 30_000L
+        /** 1.4.5: hung Deepgram connect timeout (no overall
+         *  timeout existed before — a hung TCP connect left the
+         *  loop "connecting" forever). */
+        const val CONNECT_TIMEOUT_MS: Long = 15_000L
+        /** 1.4.5: reconnect backoff base + cap (5s, doubling to
+         *  30s) — auto-revive runs forever until the user turns
+         *  the mic off; only permission/key failures stop it. */
+        const val RECONNECT_BASE_MS: Long = 5_000L
+        const val RECONNECT_MAX_MS: Long = 30_000L
+        /** 1.4.5: wake-session restart backoff base (5s, doubling
+         *  to 30s); auth failures never restart. */
+        const val WAKE_RESTART_BASE_MS: Long = 5_000L
         /** B-C3: cap on transcripts held while speaking. */
         const val MAX_QUARANTINED: Int = 20
         /** 1.4.3: silence after which the Deepgram WS suspends
          *  (cost) while the pump + VAD tap keep running. */
         const val IDLE_SUSPEND_MS: Long = 120_000L
 
-        /** A-H4: terminal recognizer errors — stop, never retry. */
-        val TERMINAL_RECOGNIZER_ERRORS: Set<Int> = setOf(            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
-            SpeechRecognizer.ERROR_CLIENT,
-            SpeechRecognizer.ERROR_NETWORK,
-            SpeechRecognizer.ERROR_SERVER,
-            SpeechRecognizer.ERROR_AUDIO
-        )
     }
 }
 
@@ -1215,8 +1320,21 @@ interface AlwaysOnMicListener {
     /** Recognizer session live / not live, for the listening indicator. */
     fun onListeningStateChanged(listening: Boolean)
 
-    /** Fatal mic problem (permission, no recognizer). The loop is not running. */
+    /** Fatal mic problem (permission, no Deepgram key). The loop is not running. */
     fun onMicError(reason: String)
+
+    /**
+     * 1.4.5: the user-enabled loop lost its Deepgram stream and is
+     * auto-reconnecting (visible banner, NOT a stop). Default
+     * no-op; the service overrides it to show the banner.
+     */
+    fun onMicReconnecting(reason: String) {}
+
+    /**
+     * 1.4.5: a reconnecting loop recovered (stream open again).
+     * Default no-op; the service overrides it for a chat line.
+     */
+    fun onMicRecovered() {}
 
     /**
      * 1.4.3: STT path switch (deepgram|system) + reason. Default

@@ -38,7 +38,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -123,6 +125,7 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.PreviousBounce
 import com.jarvis.autonomous.data.buildBounceReportText
+import com.jarvis.autonomous.data.clearStaleBounceReport
 import com.jarvis.autonomous.data.detectPreviousBounce
 import com.jarvis.autonomous.data.writeBounceReportFile
 import com.jarvis.autonomous.service.JarvisAccessibilityService
@@ -160,6 +163,16 @@ class MainActivity : ComponentActivity() {
         // 1.4.4 per-launch guard window: reset HOME/BACK blocking
         // for THIS launch (see LaunchSession.onActivityLaunch).
         LaunchSession.onActivityLaunch()
+        // 1.4.5 (item 6): seed the Kokoro-OFF card's single source
+        // (repository flow) from prefs at launch, and load the
+        // PERSISTED diagnostics into the in-memory mirror on a
+        // background thread — a fresh post-bounce launch previously
+        // showed an empty Diagnostics section (mirror starts empty)
+        // until NEW entries arrived, looking evidence-free.
+        JarvisStateRepository.setKokoroEnabled(JarvisPreferences(this).kokoroEnabled)
+        Thread {
+            runCatching { JarvisStateRepository.loadPersistedDiagnostics() }
+        }.start()
         // 1.4.4 out-of-app report: detection + file write ALSO run
         // here on a background thread — NOT only from the Command
         // tab card. If the app bounces before any UI is composed,
@@ -174,15 +187,25 @@ class MainActivity : ComponentActivity() {
         // any failure is swallowed, launch continues normally.
         Thread {
             runCatching {
-                if (!LaunchSession.bounceChecked) {
+                // 1.4.5 (item 6): ATOMIC claim — exactly one of the
+                // three detection threads (Activity, service,
+                // Command-tab card) detects + publishes; losers read
+                // repository flows. Null detection deletes stale
+                // report copies (clean launch leaves no old report).
+                if (LaunchSession.claimBounceCheck()) {
                     val found = detectPreviousBounce()
-                    LaunchSession.bounce = found
                     if (found != null) {
-                        LaunchSession.bounceFilePath = writeBounceReportFile(
+                        val path = writeBounceReportFile(
                             this, buildBounceReportText(found)
                         )
+                        LaunchSession.bounce = found
+                        LaunchSession.bounceFilePath = path
+                        JarvisStateRepository.setBounceReport(found, path)
+                    } else {
+                        LaunchSession.bounce = null
+                        JarvisStateRepository.setBounceReport(null, "")
+                        clearStaleBounceReport(this)
                     }
-                    LaunchSession.bounceChecked = true
                 }
             }
         }.start()
@@ -313,21 +336,22 @@ fun JarvisMainApp(
     var kokoroError by remember { mutableStateOf<String?>(null) }
     var kokoroDismissed by remember { mutableStateOf(false) }
     var kokoroChecking by remember { mutableStateOf(!KokoroTtsClient.isDownloaded(context)) }
+    // 1.4.5 (item 1a): launch copy goes through :tts (single
+    // writer) — a main-process copy used to collide with the :tts
+    // copy on the same *.tmp files (per-process copyMutex).
+    // Read-only isDownloaded checks stay main-process (safe).
     LaunchedEffect(Unit) {
+        // Seed the Kokoro-OFF card flow from prefs at launch.
+        JarvisStateRepository.setKokoroEnabled(prefs.kokoroEnabled)
         if (!KokoroTtsClient.isDownloaded(context)) {
             kokoroChecking = true
-            val result = KokoroTtsClient.ensureAssetsReady(context) { stage, copied, total ->
+            val ok = TtsProcessClient.ensure(context) { stage, copied, total ->
                 kokoroStage = stage
                 kokoroCopiedMb = copied
                 kokoroTotalMb = total
             }
             kokoroChecking = false
-            if (result.isFailure) {
-                kokoroError = result.exceptionOrNull()?.message
-                    ?: "Kokoro setup fail ho gaya — dobara try karo."
-            } else {
-                kokoroError = null
-            }
+            kokoroError = if (ok) null else "Kokoro setup fail ho gaya — dobara try karo."
         }
     }
     val showKokoroOverlay = !kokoroDismissed &&
@@ -379,25 +403,35 @@ fun JarvisMainApp(
             // tabs with their FULL labels at readable size and a
             // clear selected pill — no tab or function removed.
             Surface(color = Color(0xFFFFFFFF)) {
-                Row(
+                // 1.4.5 (item 6): LazyRow + scroll-to-selected. The
+                // old Row + horizontalScroll never scrolled to the
+                // selected tab, so a selected tab could sit
+                // off-screen with no visible indicator. Now the bar
+                // animates to the selected item, keeps the pill, and
+                // adds a 2 dp underline under the selected tab.
+                val tabs = listOf(
+                    Triple(0, Icons.Default.Home, "Command"),
+                    Triple(1, Icons.Default.Security, "Permissions"),
+                    Triple(2, Icons.Default.Settings, "AI Brain"),
+                    Triple(3, Icons.Default.List, "Memory & Logs"),
+                    Triple(4, Icons.Default.Build, "Projects"),
+                    Triple(5, Icons.Default.Send, "Browser"),
+                    Triple(6, Icons.Default.Security, "Licence"),
+                    Triple(7, Icons.Default.Edit, "Whiteboard")
+                )
+                val tabListState = rememberLazyListState()
+                LaunchedEffect(selectedTab) {
+                    runCatching { tabListState.animateScrollToItem(selectedTab) }
+                }
+                LazyRow(
+                    state = tabListState,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 4.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val tabs = listOf(
-                        Triple(0, Icons.Default.Home, "Command"),
-                        Triple(1, Icons.Default.Security, "Permissions"),
-                        Triple(2, Icons.Default.Settings, "AI Brain"),
-                        Triple(3, Icons.Default.List, "Memory & Logs"),
-                        Triple(4, Icons.Default.Build, "Projects"),
-                        Triple(5, Icons.Default.Send, "Browser"),
-                        Triple(6, Icons.Default.Security, "Licence"),
-                        Triple(7, Icons.Default.Edit, "Whiteboard")
-                    )
-                    tabs.forEach { (index, icon, label) ->
+                    items(tabs) { (index, icon, label) ->
                         val selected = selectedTab == index
                         Column(
                             modifier = Modifier
@@ -427,6 +461,15 @@ fun JarvisMainApp(
                                 maxLines = 1,
                                 softWrap = false
                             )
+                            Box(
+                                modifier = Modifier
+                                    .height(2.dp)
+                                    .width(24.dp)
+                                    .background(
+                                        if (selected) Color(0xFFB85C38)
+                                        else Color.Transparent
+                                    )
+                            )
                         }
                     }
                 }
@@ -442,7 +485,13 @@ fun JarvisMainApp(
             // returns false silently when the toggle is off, and
             // the engine's chat-only fallback made "bolti hi nahi"
             // look like a bug. Now the OFF state is visible.
-            if (!prefs.kokoroEnabled) {
+            // 1.4.5 (item 6): reads the repository flow, NOT prefs
+            // directly — prefs is a plain SharedPreferences delegate
+            // (not Compose state), so an AI Brain Save never
+            // recomposed this parent header and the card stayed
+            // stale until a tab switch forced recomposition.
+            val kokoroEnabledFlow by JarvisStateRepository.kokoroEnabled.collectAsState()
+            if (!kokoroEnabledFlow) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -640,6 +689,10 @@ fun CommandCenterScreen(
     // 1.4.2: terminal mic death banner state (service-written).
     val micFatal by JarvisStateRepository.micFatal.collectAsState()
     val micLoopEnabled by JarvisStateRepository.micLoopEnabled.collectAsState()
+    // 1.4.5 (item 4): reconnecting banner state (service-written
+    // while the user-enabled loop auto-revives; null = connected
+    // or loop off).
+    val micReconnecting by JarvisStateRepository.micReconnecting.collectAsState()
 
     var textInput by remember { mutableStateOf("") }
     val whiteboardContext = LocalContext.current
@@ -676,24 +729,34 @@ fun CommandCenterScreen(
         // per process; the same report is ALSO written to a file
         // the user can copy from a file manager without the app
         // staying open at all (see writeBounceReportFile).
-        var bounceInfo by remember { mutableStateOf<PreviousBounce?>(LaunchSession.bounce) }
-        var bounceFilePath by remember { mutableStateOf(LaunchSession.bounceFilePath) }
+        // 1.4.5 (item 6): the card COLLECTS repository flows
+        // (no snapshot-at-composition + no third racer). The
+        // claimer — whichever thread wins claimBounceCheck()
+        // (Activity, service, or this card) — detects + publishes
+        // via setBounceReport, and this card recomposes when it
+        // lands. Non-claimers skip detection entirely.
+        val bounceInfo by JarvisStateRepository.bounceReport.collectAsState()
+        val bounceFilePath by JarvisStateRepository.bounceFilePath.collectAsState()
         var bounceDismissed by remember { mutableStateOf(LaunchSession.bounceDismissed) }
         var bounceCopiedNote by remember { mutableStateOf("") }
         LaunchedEffect(Unit) {
-            if (!LaunchSession.bounceChecked) {
+            if (LaunchSession.claimBounceCheck()) {
                 val found = withContext(Dispatchers.IO) { detectPreviousBounce() }
-                LaunchSession.bounce = found
                 if (found != null) {
                     val text = buildBounceReportText(found)
                     val path = withContext(Dispatchers.IO) {
                         writeBounceReportFile(whiteboardContext, text)
                     }
+                    LaunchSession.bounce = found
                     LaunchSession.bounceFilePath = path
-                    bounceFilePath = path
+                    JarvisStateRepository.setBounceReport(found, path)
+                } else {
+                    LaunchSession.bounce = null
+                    JarvisStateRepository.setBounceReport(null, "")
+                    withContext(Dispatchers.IO) {
+                        clearStaleBounceReport(whiteboardContext)
+                    }
                 }
-                LaunchSession.bounceChecked = true
-                bounceInfo = found
             }
         }
         // 1.4.5 CIRCUIT BREAKER card (WhopClip-style catcher:
@@ -853,7 +916,8 @@ fun CommandCenterScreen(
                         fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF7A5A00)
                     )
                     Text(
-                        "Floating pill ke liye 'Draw over apps' chahiye. Grant dabakar system screen me Jarvis ke liye toggle ON karo. (Nahi chahiye to AI Brain me Floating HUD OFF kar do.)",
+                        "Floating pill ke liye 'Draw over apps' chahiye. Grant dabakar system screen me Jarvis ke liye toggle ON karo. (Nahi chahiye to AI Brain me Floating HUD OFF kar do.) " +
+                            "Agar app khulte hi band ho raha ho to in-app Grant nahi milega — tab manual route use karo: Android Settings > Apps > Jarvis > Display over other apps > Allow. Bounce fix ke baad granted-addView path phone par verify hoga.",
                         fontSize = 12.sp, color = Color(0xFF3B2F2A)
                     )
                     Button(
@@ -944,11 +1008,55 @@ fun CommandCenterScreen(
                         fontSize = 12.sp,
                         color = Color(0xFF3B2F2A)
                     )
+                    // 1.4.5 (item 4/6): Deepgram-only errors carry
+                    // code -1 (no system recognizer codes exist any
+                    // more) — showing "-1" would be noise, so the
+                    // line is hidden when code < 0.
+                    if (micFatal!!.code >= 0) {
+                        Text(
+                            text = "Recognizer error code: ${micFatal!!.code}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF8A7A70)
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onRetryMic,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                        ) {
+                            Text("Retry mic", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = onStopMic,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Mic off", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        } else if (micReconnecting != null) {
+            // 1.4.5 (item 4): reconnecting banner — the loop is
+            // ENABLED and auto-reviving (NOT stopped). Shows the
+            // reason + Retry (forces a fresh stop + start) + Mic
+            // off (the only true off switch besides voice stop).
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3D6))
+            ) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Recognizer error code: ${micFatal!!.code}",
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = Color(0xFF8A7A70)
+                        text = "Mic dobara connect ho raha hai…",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = Color(0xFF7A5A00)
+                    )
+                    Text(
+                        text = micReconnecting ?: "",
+                        fontSize = 12.sp,
+                        color = Color(0xFF3B2F2A)
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
@@ -1534,8 +1642,10 @@ fun AiBrainSettingsScreen(
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
     // 1.4.3: Deepgram STT key (listening only — speaking stays
-    // Kokoro). Saved by the same SAVE button; empty = system
-    // fallback. Never displayed, never logged.
+    // Kokoro). Saved by the same SAVE button.
+    // 1.4.5 FINAL policy: empty = CANNOT LISTEN (system fallback
+    // REMOVED entirely — no fallback exists any more). Never
+    // displayed, never logged.
     var deepgramKey by remember { mutableStateOf(prefs.deepgramApiKey) }
     var showDeepgramKey by remember { mutableStateOf(false) }
     var modelName by remember { mutableStateOf(prefs.modelName) }
@@ -1553,6 +1663,9 @@ fun AiBrainSettingsScreen(
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
     var stepDelay by remember { mutableFloatStateOf(prefs.stepDelayMs.toFloat()) }
     var saveBanner by remember { mutableStateOf("") }
+    // Captured at composition level for use inside onClick handlers
+    // (CompositionLocals cannot be read inside a non-composable lambda).
+    val aiBrainContext = LocalContext.current
 
     Column(
         modifier = Modifier
@@ -1721,7 +1834,10 @@ fun AiBrainSettingsScreen(
                                 kokoroWorking = true
                                 kokoroProgress = "Checking space…"
                                 kokoroScope.launch {
-                                    val result = KokoroTtsClient.ensureAssetsReady(kokoroContext) { stage, copied, total ->
+                                    // 1.4.5 (item 1a): setup copy goes
+                                    // through :tts (single writer) —
+                                    // never a main-process copy.
+                                    val ok = TtsProcessClient.ensure(kokoroContext) { stage, copied, total ->
                                         kokoroScope.launch {
                                             kokoroProgress = when (stage) {
                                                 "checking_space" -> "Storage check ho raha hai…"
@@ -1731,13 +1847,13 @@ fun AiBrainSettingsScreen(
                                         }
                                     }
                                     kokoroWorking = false
-                                    if (result.isSuccess) {
+                                    if (ok) {
                                         kokoroReady = true
                                         kokoroProgress = "Kokoro ready ✅ — ab Jarvis Kokoro awaaz me bolega."
                                         kokoroOn = true
+                                        JarvisStateRepository.setKokoroEnabled(true)
                                     } else {
-                                        kokoroProgress = result.exceptionOrNull()?.message
-                                            ?: "Kokoro setup fail ho gaya."
+                                        kokoroProgress = "Kokoro setup fail ho gaya."
                                     }
                                 }
                             }
@@ -1772,6 +1888,7 @@ fun AiBrainSettingsScreen(
                                     kokoroReady = true
                                     kokoroProgress = "Kokoro reset complete ✅ — fresh copy taiyaar."
                                     kokoroOn = true
+                                    JarvisStateRepository.setKokoroEnabled(true)
                                 } else {
                                     kokoroReady = false
                                     kokoroProgress = "Kokoro reset fail ho gaya."
@@ -1809,13 +1926,14 @@ fun AiBrainSettingsScreen(
         )
 
         // 1.4.3: Deepgram STT key — SUNNE ke liye (transcription),
-        // bolne ke liye NAHI (bolna hamesha Kokoro). Key khaali
-        // ho to mic system recognizer se chalega (fallback).
+        // bolne ke liye NAHI (bolna hamesha Kokoro).
+        // 1.4.5 FINAL policy: key khaali ho to mic bilkul nahi
+        // chalega (system fallback REMOVED — koi fallback nahi).
         OutlinedTextField(
             value = deepgramKey,
             onValueChange = { deepgramKey = it },
             label = { Text("Deepgram API Key (sunne ke liye, STT only)") },
-            placeholder = { Text("Paste Deepgram key here — bina iske system mic chalega") },
+            placeholder = { Text("Paste Deepgram key here — bina iske mic nahi chalega (koi fallback nahi)") },
             visualTransformation = if (showDeepgramKey) VisualTransformation.None else PasswordVisualTransformation(),
             trailingIcon = {
                 Text(
@@ -1949,6 +2067,13 @@ fun AiBrainSettingsScreen(
 
         Button(
             onClick = {
+                // 1.4.5 (item 4): capture the OLD Deepgram key
+                // BEFORE writing — a key change while the loop runs
+                // must restart the loop with the new key (the old
+                // code only sent ACTION_REFRESH_OVERLAY, which
+                // refreshes the overlay, NOT the loop — so the new
+                // key had no effect until a restart).
+                val oldDeepgramKey = prefs.deepgramApiKey
                 prefs.provider = selectedProvider
                 prefs.hfToken = hfToken
                 prefs.apiKey = apiKey
@@ -1966,6 +2091,34 @@ fun AiBrainSettingsScreen(
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 onSettingsUpdated()
+                // 1.4.5 (item 6): the OFF card reads this flow —
+                // Save must publish it, or the card stays stale.
+                JarvisStateRepository.setKokoroEnabled(kokoroOn)
+                // 1.4.5 (item 4): key-change restart — only when the
+                // key actually changed AND the loop is live (the
+                // repository flag is the live-loop signal). RETRY
+                // always stops first, then starts, so it restarts
+                // with the new key even when enabled. Loop not live
+                // -> nothing (next start uses the new key). Blank
+                // new key while live -> RETRY restarts into the
+                // no-key fatal banner path (visible, not silent).
+                if (deepgramKey.trim() != oldDeepgramKey.trim() &&
+                    JarvisStateRepository.micLoopEnabled.value
+                ) {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "KEY_CHANGED_RESTART",
+                        "Deepgram key changed while loop live — restarting loop with the new key."
+                    )
+                    val retryIntent = Intent(
+                        aiBrainContext,
+                        JarvisForegroundService::class.java
+                    ).apply { action = JarvisForegroundService.ACTION_RETRY_MIC }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        aiBrainContext.startForegroundService(retryIntent)
+                    } else {
+                        aiBrainContext.startService(retryIntent)
+                    }
+                }
                 saveBanner = "Settings Saved & Applied Successfully ✅"
             },
             modifier = Modifier.fillMaxWidth(),
@@ -2175,7 +2328,7 @@ fun MemoryRoutinesLogsScreen(
                     )
                     Text(
                         text = "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
-                            "last error code=${micFatalState?.code?.toString() ?: "none"}",
+                            "last error code=${if (micFatalState == null || micFatalState.code < 0) "none" else micFatalState.code.toString()}",
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace
                     )
@@ -2408,7 +2561,7 @@ private fun buildDiagnosticsReport(
     )
     sb.appendLine(
         "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
-            "last recognizer error code=${micFatal?.code?.toString() ?: "none"} · " +
+            "last error code=${if (micFatal == null || micFatal.code < 0) "none" else micFatal.code.toString()} · " +
             "last reason=${micFatal?.reason ?: "none"}"
     )
     val overlayNow = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||

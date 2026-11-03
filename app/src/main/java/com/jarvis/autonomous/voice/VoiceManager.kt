@@ -2,18 +2,13 @@ package com.jarvis.autonomous.voice
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -33,8 +28,14 @@ import kotlin.coroutines.resume
  *  - Deepgram TTS (cloud, user key) — REMOVED.
  *  - Gemini TTS Sulafat (cloud, user key, tiny free quota) — REMOVED.
  *  - Android system TextToSpeech (incl. its init, language setup and
- *    female-voice selection) — REMOVED as a voice. System STT below
- *    (SpeechRecognizer) is a different API and is UNTOUCHED.
+ *    female-voice selection) — REMOVED as a voice.
+ * 1.4.5 FINAL MIC POLICY (user order 2026-11-03 ~19:36 IST):
+ * system SpeechRecognizer is REMOVED ENTIRELY — loop, one-shot,
+ * wake-word, everywhere. Listening is Deepgram ONLY, via the
+ * AlwaysOnMicManager session lambdas wired by the service
+ * ([startWakeSession]/[stopWakeSession]/[listenOnceSession]/
+ * [cancelListenOnceSession]). The old "System STT below is
+ * UNTOUCHED" note is DEAD: there is no system STT left here.
  *
  * If Kokoro is unavailable, [speakAndWait] returns false and logs a
  * clear message. It NEVER silently falls back to another voice, and
@@ -75,12 +76,20 @@ class VoiceManager(
      * this class checks it first: the wake-word recognizer NEVER
      * runs alongside the mic-loop recognizer.
      */
-    private val isMicLoopEnabled: () -> Boolean = { false }
+    private val isMicLoopEnabled: () -> Boolean = { false },
+    /**
+     * 1.4.5 FINAL policy wiring (service -> AlwaysOnMicManager):
+     * Deepgram-only wake/one-shot sessions. Defaults are no-ops
+     * so unit callers without a service keep compiling; the
+     * service MUST wire all four, or listening never starts.
+     */
+    private val startWakeSession: (((String) -> Unit) -> Unit) = { },
+    private val stopWakeSession: (() -> Unit) = { },
+    private val listenOnceSession: (((String?) -> Unit) -> Unit) = { },
+    private val cancelListenOnceSession: (() -> Unit) = { }
 ) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var isListeningActive = false
     private var pendingSingleReplyCallback: ((String?) -> Unit)? = null
     /** B-M13: ALL speaks serialise through this mutex. */
     private val speakMutex = Mutex()
@@ -92,10 +101,11 @@ class VoiceManager(
      */
     @Volatile
     private var speakInProgress: Boolean = false
-    /** A-H6: the single cancellable wake-word restart handle. */
-    private var restartRunnable: Runnable? = null
-    /** A-H6: last recognizer start, for the 150ms double-start guard. */
-    private var lastStartMs: Long = 0L
+    // 1.4.5 (item 5): same-reason SPEAK_ABORT dedupe window — the
+    // STOP itself always fires (idempotent); only the duplicate
+    // log line is suppressed within 3 s of the same reason.
+    private var lastAbortReason: String? = null
+    private var lastAbortMs: Long = 0L
 
     /**
      * Speaks [text] with Kokoro only. Returns true if the full text
@@ -170,9 +180,18 @@ class VoiceManager(
         // B-M13: stops only the utterance currently playing.
         // Queued speaks (waiting on speakMutex) are untouched —
         // Stop never cancels the whole queue.
-        JarvisStateRepository.addDiagnostic(
-            "tts", "SPEAK_ABORT", "Speech stopped: $reason"
-        )
+        // 1.4.5 (item 5): dedupe — one barge-in used to log TWO
+        // SPEAK_ABORT entries (handleTranscript + this call).
+        // The STOP still fires every time; only the repeat log
+        // within 3 s of the same reason is skipped.
+        val nowMs = System.currentTimeMillis()
+        if (!(reason == lastAbortReason && nowMs - lastAbortMs < 3_000L)) {
+            lastAbortReason = reason
+            lastAbortMs = nowMs
+            JarvisStateRepository.addDiagnostic(
+                "tts", "SPEAK_ABORT", "Speech stopped: $reason"
+            )
+        }
         // 1.4.5: playback lives in the :tts process — stop it
         // there. (The old main-process stopPlayback() call is
         // gone: no AudioTrack exists in this process any more.)
@@ -256,15 +275,22 @@ class VoiceManager(
             }
             suspendCancellableCoroutine { cont ->
             mainHandler.post {
+                // Deepgram-only single shot (1.4.5): stop any wake
+                // session first (one mic owner), then listen once.
+                stopWakeSession()
                 pendingSingleReplyCallback = { recognizedText ->
                     if (cont.isActive) cont.resume(recognizedText)
                 }
-                startRecognizerInternal(isSingleShot = true)
+                listenOnceSession { text ->
+                    val cb = pendingSingleReplyCallback
+                    pendingSingleReplyCallback = null
+                    cb?.invoke(text)
+                }
             }
             cont.invokeOnCancellation {
                 mainHandler.post {
                     pendingSingleReplyCallback = null
-                    stopListeningInternal()
+                    cancelListenOnceSession()
                 }
             }
             }
@@ -296,6 +322,9 @@ class VoiceManager(
                     AgentRunState.LISTENING,
                     "Listening... बोलो भाई क्या करना है?"
                 )
+                // Deepgram-only single shot (1.4.5): wake session
+                // stops first — one mic owner at a time.
+                stopWakeSession()
                 pendingSingleReplyCallback = { text ->
                     if (!text.isNullOrBlank()) {
                         onWakeCommandDetected(text)
@@ -307,16 +336,28 @@ class VoiceManager(
                         if (prefs.wakeWordEnabled) startWakeWordListening()
                     }
                 }
-                startRecognizerInternal(isSingleShot = true)
+                listenOnceSession { text ->
+                    val cb = pendingSingleReplyCallback
+                    pendingSingleReplyCallback = null
+                    cb?.invoke(text)
+                }
             }
         }
         mainHandler.post(startTapListening)
     }
 
+    /**
+     * Deepgram-only wake-word listening (1.4.5 FINAL policy).
+     * Pref + RECORD_AUDIO + loop-off gate, then the manager's
+     * continuous Deepgram session. Finals arrive via the session
+     * callback; [matchWakeTrigger] decides (start/bare only);
+     * non-matches are ignored and the session KEEPS running.
+     * On a match the session stops first (one mic owner), then
+     * the remainder goes to the engine or a bare trigger opens
+     * the manual command listener.
+     */
     fun startWakeWordListening() {
         if (!prefs.wakeWordEnabled) return
-        // C-B13: without RECORD_AUDIO, starting would only error
-        // and (before this fix) hot-restart — refuse up front.
         if (ContextCompat.checkSelfPermission(
                 context, Manifest.permission.RECORD_AUDIO
             ) != PackageManager.PERMISSION_GRANTED
@@ -327,138 +368,24 @@ class VoiceManager(
             return
         }
         mainHandler.post {
-            // A-H3 single-owner gate + A-H9: wake-word restarts
-            // whenever wake-word mode is on and the loop is off,
-            // regardless of agent state — but never next to the loop.
+            // A-H3 single-owner gate: never next to the loop, and
+            // never while a single reply is pending.
             if (isMicLoopEnabled()) return@post
-            if (isListeningActive || pendingSingleReplyCallback != null) return@post
-            startRecognizerInternal(isSingleShot = false)
-        }
-    }
-
-    /** A-H6: schedule a cancellable wake-word restart. */
-    private fun scheduleWakeWordRestart(delayMs: Long) {
-        restartRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = Runnable {
-            restartRunnable = null
-            startWakeWordListening()
-        }
-        restartRunnable = runnable
-        mainHandler.postDelayed(runnable, delayMs)
-    }
-
-    private fun startRecognizerInternal(isSingleShot: Boolean) {
-        // A-H3: never start next to the mic loop. (Single-shot
-        // callers already gate before posting; this is the last
-        // line of defence for wake-word restarts.)
-        if (!isSingleShot && isMicLoopEnabled()) return
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            JarvisStateRepository.addLog("SpeechRecognizer not available on this device.")
-            return
-        }
-        // A-H6: no double start within ~150ms of a live start.
-        val nowMs = System.currentTimeMillis()
-        if (isListeningActive && nowMs - lastStartMs < 150L) return
-
-        val recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, !isSingleShot)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
-        }
-
-        // A-H7: creation + listener + startListening in ONE
-        // guarded block — a failure logs and ends this attempt,
-        // never a main-thread crash.
-        try {
-            if (speechRecognizer == null) {
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            if (pendingSingleReplyCallback != null) return@post
+            startWakeSession { text ->
+                if (!prefs.wakeWordEnabled || isMicLoopEnabled()) return@startWakeSession
+                val matched = matchWakeTrigger(text) ?: return@startWakeSession
+                val (trigger, remainder) = matched
+                stopWakeSession()
+                if (remainder.isNotEmpty()) {
+                    onWakeCommandDetected(remainder)
+                } else {
+                    // Bare "Hey Jarvis" -> open the active command
+                    // listener (which itself stops the wake session
+                    // first — already stopped here, idempotent).
+                    triggerManualVoiceCommand()
+                }
             }
-            speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    isListeningActive = true
-                }
-
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-
-                override fun onEndOfSpeech() {
-                    isListeningActive = false
-                }
-
-                override fun onError(error: Int) {
-                    isListeningActive = false
-                    val cb = pendingSingleReplyCallback
-                    if (cb != null) {
-                        pendingSingleReplyCallback = null
-                        cb.invoke(null)
-                    } else if (prefs.wakeWordEnabled && !isMicLoopEnabled()) {
-                        // C-B13: a permission error BREAKS the
-                        // restart loop — no hot restart on
-                        // ERROR_INSUFFICIENT_PERMISSIONS. A-H9:
-                        // other errors restart regardless of
-                        // agent state (no IDLE gate any more).
-                        if (error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                            scheduleWakeWordRestart(600L)
-                        } else {
-                            JarvisStateRepository.addLog(
-                                "Wake-word stopped: RECORD_AUDIO permission error — no restart."
-                            )
-                        }
-                    }
-                }
-
-                override fun onResults(results: Bundle?) {
-                    isListeningActive = false
-                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val bestText = matches?.firstOrNull()?.trim() ?: ""
-
-                    val cb = pendingSingleReplyCallback
-                    if (cb != null) {
-                        pendingSingleReplyCallback = null
-                        cb.invoke(bestText.ifEmpty { null })
-                        return
-                    }
-
-                    // A-M4 wake-word check (see [matchWakeTrigger]):
-                    // trigger at the START or as a standalone
-                    // address only — never a substring anywhere.
-                    if (bestText.isNotEmpty()) {
-                        val matched = matchWakeTrigger(bestText)
-                        if (matched != null) {
-                            val (trigger, remainder) = matched
-                            if (remainder.isNotEmpty()) {
-                                onWakeCommandDetected(remainder)
-                            } else {
-                                // Bare "Hey Jarvis" -> open the
-                                // active command listener.
-                                triggerManualVoiceCommand()
-                            }
-                            return
-                        }
-                    }
-
-                    // A-H9: restart regardless of agent state
-                    // (subject to the A-H3 loop gate inside
-                    // startWakeWordListening).
-                    if (prefs.wakeWordEnabled) {
-                        scheduleWakeWordRestart(400L)
-                    }
-                }
-
-                override fun onPartialResults(partialResults: Bundle?) {}
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-            speechRecognizer?.startListening(recognizerIntent)
-            lastStartMs = System.currentTimeMillis()
-        } catch (e: Exception) {
-            isListeningActive = false
-            runCatching { speechRecognizer?.destroy() }
-            speechRecognizer = null
-            JarvisStateRepository.addLog(
-                "Wake-word recognizer start failed (${e.message}) — no restart loop."
-            )
         }
     }
 
@@ -492,31 +419,25 @@ class VoiceManager(
 
     fun stopListeningInternal() {
         mainHandler.post {
-            // A-H6/A-H8: cancel any held restart and complete any
-            // pending single reply as cancelled — a stale reply
-            // must never swallow the next command.
-            restartRunnable?.let { mainHandler.removeCallbacks(it) }
-            restartRunnable = null
+            // Deepgram-only teardown (1.4.5): stop the wake session
+            // and cancel any one-shot; complete any pending single
+            // reply as cancelled so a stale reply never swallows
+            // the next command.
+            stopWakeSession()
+            cancelListenOnceSession()
             val cb = pendingSingleReplyCallback
             pendingSingleReplyCallback = null
             cb?.invoke(null)
-            isListeningActive = false
-            runCatching { speechRecognizer?.cancel() }
         }
     }
 
     fun shutdown() {
         mainHandler.post {
-            restartRunnable?.let { mainHandler.removeCallbacks(it) }
-            restartRunnable = null
+            stopWakeSession()
+            cancelListenOnceSession()
             val cb = pendingSingleReplyCallback
             pendingSingleReplyCallback = null
             cb?.invoke(null)
-            isListeningActive = false
-            runCatching {
-                speechRecognizer?.destroy()
-                speechRecognizer = null
-            }
         }
     }
 

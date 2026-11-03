@@ -18,6 +18,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -84,6 +85,49 @@ object KokoroTtsClient {
     private const val COPY_RESUME_MARGIN_BYTES = 10L * 1024L * 1024L
     private const val FALLBACK_BUNDLED_BYTES = 190_000_000L
 
+    /**
+     * 1.4.5 part 3 (item 2a): PINNED asset sizes + SHA-256 hashes.
+     * Computed from the verified 1.4.5-part-2 APK's shipped assets
+     * (public Sherpa-ONNX model files, safe to commit). The old
+     * CI gate was only ">50 MB" for the model while the model is
+     * ~109 MB expected, and the runtime copy manifest was built
+     * from bundled bytes — self-consistent, so a truncated voice
+     * file passed CI and died natively at Sherpa load. Now a
+     * mismatch is a HARD FAIL (diagnostic HASH_MISMATCH, no
+     * engine load) at copy time, at manifest-compare time, and
+     * at engine-load time. espeak-ng-data files are NOT pinned
+     * (many files); existence + non-empty + engine-load success
+     * remain their check, and init failure fails fast with
+     * ENGINE_INIT_FAIL. NOTE: pins are taken from the part-2
+     * APK's bundled assets (known-good as shipped), not
+     * independently hash-verified against upstream — stated
+     * honestly in the 1.4.5 report.
+     */
+    const val PIN_MODEL_SIZE = 114_202_993L
+    const val PIN_MODEL_SHA = "75635ea3b85a32d00094dcdd61a258aba87c160f7c264c304a7b3ae9d734195e"
+    const val PIN_VOICES_SIZE = 28_200_960L
+    const val PIN_VOICES_SHA = "1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29"
+    const val PIN_TOKENS_SIZE = 687L
+    const val PIN_TOKENS_SHA = "6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425"
+    const val PIN_VAD_SIZE = 643_854L
+    const val PIN_VAD_SHA = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+
+    /** Streaming SHA-256 of a file (never loads the 114 MB model into memory). */
+    fun sha256Of(file: File): String? {
+        return runCatching {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    digest.update(buf, 0, n)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+    }
+
     private val engineLock = Mutex()
     /** B-M1: ONE mutex guarding ensureAssetsReady across launch
      * overlay, Settings retry and speak-triggered copy — concurrent
@@ -92,6 +136,7 @@ object KokoroTtsClient {
     private var engine: OfflineTts? = null
     private var engineDir: File? = null
     private var speakerCheckLogged: Boolean = false
+    private var firstGenerateLogged: Boolean = false
 
     @Volatile
     private var currentTrack: AudioTrack? = null
@@ -113,29 +158,35 @@ object KokoroTtsClient {
      * such a dir deletes it and forces a fresh copy (see [speak]),
      * so a corrupt legacy dir can never return false forever.
      */
+    /**
+     * 1.4.5 part 3 (item 2a): download-complete now means SIZES
+     * match pins AND HASHES match pins. The hash manifest
+     * (kokoro-hashes.txt) is compared by cheap string equality —
+     * no rehash per speak. A dir whose files are the right size
+     * but whose hash manifest is missing/stale returns FALSE, so
+     * [ensureAssetsReady] runs its one-time hash verification
+     * (hash the file: match -> record + skip, mismatch -> recopy
+     * that file only). A legacy 1.3.0 dir with neither manifest
+     * therefore gets verified once, not trusted forever.
+     * The old ">50MB" legacy fallback is DEAD under this rule:
+     * without a hash manifest, size alone never proves the file.
+     */
     fun isDownloaded(context: Context): Boolean {
         val dir = modelDir(context)
         val model = File(dir, MODEL_FILE)
         val voices = File(dir, VOICES_FILE)
         val tokens = File(dir, TOKENS_FILE)
         val espeak = File(dir, "espeak-ng-data")
-        if (!model.exists()) return false
-        val manifestSizes = readSizesManifest(dir)
-        if (manifestSizes != null) {
-            val expected = manifestSizes[MODEL_FILE] ?: return false
-            if (model.length() != expected) return false
-        } else {
-            val bundledSize = bundledFileBytes(context, MODEL_FILE)
-            if (bundledSize > 0) {
-                if (model.length() != bundledSize) return false
-            } else if (model.length() <= 50_000_000L) {
-                return false
-            }
-        }
-        if (!voices.exists() || voices.length() == 0L) return false
-        if (!tokens.exists() || tokens.length() == 0L) return false
+        if (!model.exists() || model.length() != PIN_MODEL_SIZE) return false
+        if (!voices.exists() || voices.length() != PIN_VOICES_SIZE) return false
+        if (!tokens.exists() || tokens.length() != PIN_TOKENS_SIZE) return false
         if (!espeak.isDirectory) return false
-        return espeak.walkTopDown().any { it.isFile }
+        if (!espeak.walkTopDown().any { it.isFile }) return false
+        val hashes = readHashesManifest(dir) ?: return false
+        if (hashes[MODEL_FILE] != PIN_MODEL_SHA) return false
+        if (hashes[VOICES_FILE] != PIN_VOICES_SHA) return false
+        if (hashes[TOKENS_FILE] != PIN_TOKENS_SHA) return false
+        return true
     }
 
     /** Sizes manifest written by [ensureAssetsReady] (rel=size lines). */
@@ -151,6 +202,29 @@ object KokoroTtsClient {
                     if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1).toLong()
                 }.toMap().takeIf { it.isNotEmpty() }
         }.getOrNull()
+    }
+
+    /** Hashes manifest written by [ensureAssetsReady] (rel=sha256 lines). */
+    private const val HASHES_MANIFEST_FILE = "kokoro-hashes.txt"
+
+    private fun readHashesManifest(dir: File): Map<String, String>? {
+        val manifest = File(dir, HASHES_MANIFEST_FILE)
+        if (!manifest.exists()) return null
+        return runCatching {
+            manifest.readLines()
+                .mapNotNull { line ->
+                    val idx = line.lastIndexOf('=')
+                    if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1)
+                }.toMap().takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    private fun writeHashesManifest(dir: File, hashes: Map<String, String>) {
+        runCatching {
+            File(dir, HASHES_MANIFEST_FILE).writeText(
+                hashes.entries.joinToString("\n") { "${it.key}=${it.value}" }
+            )
+        }
     }
 
     private fun writeSizesManifest(dir: File, sizes: Map<String, Long>) {
@@ -273,18 +347,91 @@ object KokoroTtsClient {
      * "Kokoro setup needs ~XXX MB free space — only YYY MB
      * available. Please free space and relaunch Jarvis."
      */
+    /**
+     * 1.4.5 part 3 (item 1a): ALL copies go through :tts (single
+     * writer). Main-process callers use TtsProcessClient.ensure()
+     * (MSG_ENSURE) — never call this directly from main, or the
+     * per-process copyMutex cannot protect the shared *.tmp files
+     * against a concurrent :tts copy. [ensureAssetsReady] takes
+     * the lock; [ensureAssetsReadyInner] assumes it (used by
+     * [resetAndCopy] so delete + re-copy are atomic in :tts).
+     */
     suspend fun ensureAssetsReady(
         context: Context,
         onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit = { _, _, _ -> }
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        // B-M1: serialised — launch overlay, Settings retry and
-        // speak-triggered copies queue here, never interleave.
-        copyMutex.withLock {
+        copyMutex.withLock { ensureAssetsReadyInner(context, onProgress) }
+    }
+
+    private suspend fun ensureAssetsReadyInner(
+        context: Context,
+        onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit
+    ): Result<Unit> = withContext(Dispatchers.IO) {
             runCatching {
                 if (isDownloaded(context)) {
                     val totalMB = bundledModelBytes(context) / 1_000_000L
                     onProgress("ready", totalMB, totalMB)
                     return@runCatching
+                }
+                // 1.4.5 (item 2a): one-time HASH verification for a
+                // dir whose files are the right SIZE but whose hash
+                // manifest is missing/stale (legacy dirs, or a copy
+                // made before hashes existed). Hash each pinned
+                // file: all match -> record manifests + ready (no
+                // copy); any mismatch -> delete ONLY that file so
+                // the copy path below recopies it (the copy loop
+                // skips size-matching files, so a bad file must
+                // not survive to the loop). Size alone never
+                // proves a file after this point.
+                run {
+                    val vdir = modelDir(context)
+                    val pinned = mapOf(
+                        MODEL_FILE to PIN_MODEL_SHA,
+                        VOICES_FILE to PIN_VOICES_SHA,
+                        TOKENS_FILE to PIN_TOKENS_SHA
+                    )
+                    val allSized = pinned.keys.all { rel ->
+                        val f = File(vdir, rel)
+                        f.exists() && f.length() == when (rel) {
+                            MODEL_FILE -> PIN_MODEL_SIZE
+                            VOICES_FILE -> PIN_VOICES_SIZE
+                            else -> PIN_TOKENS_SIZE
+                        }
+                    }
+                    if (allSized) {
+                        val hashes = mutableMapOf<String, String>()
+                        var bad: String? = null
+                        for ((rel, pin) in pinned) {
+                            val actual = sha256Of(File(vdir, rel))
+                            if (actual == pin) {
+                                hashes[rel] = pin
+                            } else {
+                                bad = rel
+                                JarvisStateRepository.addDiagnosticSync(
+                                    "tts", "HASH_MISMATCH",
+                                    "Pinned asset $rel failed hash verification — deleting for recopy (no engine load)."
+                                )
+                                runCatching { File(vdir, rel).delete() }
+                            }
+                        }
+                        if (bad == null) {
+                            val espeakOk = File(vdir, "espeak-ng-data").walkTopDown().any { it.isFile }
+                            if (espeakOk) {
+                                writeHashesManifest(vdir, hashes)
+                                writeSizesManifest(
+                                    vdir,
+                                    mapOf(
+                                        MODEL_FILE to PIN_MODEL_SIZE,
+                                        VOICES_FILE to PIN_VOICES_SIZE,
+                                        TOKENS_FILE to PIN_TOKENS_SIZE
+                                    )
+                                )
+                                val totalMB = bundledModelBytes(context) / 1_000_000L
+                                onProgress("ready", totalMB, totalMB)
+                                return@runCatching
+                            }
+                        }
+                    }
                 }
                 if (!hasBundledAssets(context)) {
                     throw IllegalStateException(
@@ -377,6 +524,36 @@ object KokoroTtsClient {
                 // B-C1: record exact copied sizes so later
                 // isDownloaded() checks verify exact sizes.
                 writeSizesManifest(dir, sizes.filterValues { it > 0 })
+                // 1.4.5 (item 2a): HARD FAIL on hash mismatch of a
+                // FRESH copy — a truncated/corrupt bundled file must
+                // never reach a native engine load. Bad file is
+                // deleted; the failure names the file, not a vague
+                // "copy failed". No engine load happens on this path.
+                run {
+                    val freshPins = mapOf(
+                        MODEL_FILE to PIN_MODEL_SHA,
+                        VOICES_FILE to PIN_VOICES_SHA,
+                        TOKENS_FILE to PIN_TOKENS_SHA
+                    )
+                    val freshHashes = mutableMapOf<String, String>()
+                    for ((rel, pin) in freshPins) {
+                        val f = File(dir, rel)
+                        val actual = sha256Of(f)
+                        if (actual != pin) {
+                            JarvisStateRepository.addDiagnosticSync(
+                                "tts", "HASH_MISMATCH",
+                                "Fresh copy of $rel failed hash verification (expected pin, got ${actual ?: "unreadable"}) — deleted, engine NOT loaded."
+                            )
+                            runCatching { f.delete() }
+                            throw IllegalStateException(
+                                "Kokoro asset $rel failed hash verification — " +
+                                    "relaunch Jarvis to recopy it."
+                            )
+                        }
+                        freshHashes[rel] = pin
+                    }
+                    writeHashesManifest(dir, freshHashes)
+                }
                 if (!isDownloaded(context)) {
                     throw IllegalStateException(
                         "Kokoro copy finished but the model is still incomplete — " +
@@ -389,7 +566,6 @@ object KokoroTtsClient {
                         "copied from APK assets — no download needed)."
                 )
             }
-        }
     }
 
     /**
@@ -414,13 +590,46 @@ object KokoroTtsClient {
             runCatching { engine?.release() }
             engine = null
             engineDir = null
+            firstGenerateLogged = false
         }
         stopPlayback()
-        withContext(Dispatchers.IO) {
-            runCatching { modelDir(context).deleteRecursively() }
+        // 1.4.5 (item 1a): the old code deleted the dir OUTSIDE
+        // copyMutex while ensureAssetsReady took it — a concurrent
+        // ensure could copy into a dir being deleted (or read a
+        // half-deleted file). Now delete + inner ensure hold the
+        // same lock, so every copy/delete path in :tts is serial.
+        return withContext(Dispatchers.IO) {
+            copyMutex.withLock {
+                runCatching { modelDir(context).deleteRecursively() }
+                JarvisStateRepository.addLog("Kokoro model reset — fresh bundled copy starting.")
+                ensureAssetsReadyInner(context, onProgress)
+            }
         }
-        JarvisStateRepository.addLog("Kokoro model reset — fresh bundled copy starting.")
-        return ensureAssetsReady(context, onProgress)
+    }
+
+    /**
+     * 1.4.5 (item 2c): release the native engine WITHOUT suspending.
+     * Returns false (engine kept) when engine creation is in flight
+     * — releasing under a running generate/load would be a native
+     * use-after-release. Callers that get false set a pending flag
+     * and retry after the speak completes (see KokoroTtsService).
+     * The next speak reloads (FIRST_ENGINE_LOAD appears again).
+     */
+    fun tryReleaseEngine(reason: String): Boolean {
+        if (!engineLock.tryLock()) return false
+        try {
+            runCatching { engine?.release() }
+            engine = null
+            engineDir = null
+            firstGenerateLogged = false
+            JarvisStateRepository.addDiagnostic(
+                "tts", "ENGINE_RELEASED",
+                "Kokoro engine released (reason=$reason) — next speak reloads."
+            )
+            return true
+        } finally {
+            engineLock.unlock()
+        }
     }
 
     fun stopPlayback() {
@@ -467,7 +676,7 @@ object KokoroTtsClient {
         // These run in the :tts process and land in the SHARED
         // diagnostics.jsonl file, so they survive a :tts death
         // and name the stage that killed it. Never the text.
-        JarvisStateRepository.addDiagnostic(
+        JarvisStateRepository.addDiagnosticSync(
             "tts", "SPK_ENGINE_START",
             "Kokoro engine load started (native model load)."
         )
@@ -488,7 +697,7 @@ object KokoroTtsClient {
         val tts = try {
             getEngine(context)
         } catch (e: Exception) {
-            JarvisStateRepository.addDiagnostic(
+            JarvisStateRepository.addDiagnosticSync(
                 "tts", "ENGINE_INIT_FAIL",
                 "Kokoro engine init failed: ${e.javaClass.simpleName}: ${e.message ?: ""}."
             )
@@ -507,7 +716,7 @@ object KokoroTtsClient {
                         "Kokoro still unavailable after recopy — no " +
                             "fallback voice in the Kokoro-only build."
                     )
-                    JarvisStateRepository.addDiagnostic(
+                    JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_ENGINE_END",
                         "Kokoro engine unavailable after recopy."
                     )
@@ -520,14 +729,14 @@ object KokoroTtsClient {
                         "deleting the model dir (cause is not corruption; " +
                         "use Settings reset if the bundle itself is bad)."
                 )
-                JarvisStateRepository.addDiagnostic(
+                JarvisStateRepository.addDiagnosticSync(
                     "tts", "SPK_ENGINE_END",
                     "Kokoro engine init failed with verified sizes — failing fast, dir untouched."
                 )
                 return false
             }
         }
-        JarvisStateRepository.addDiagnostic(
+        JarvisStateRepository.addDiagnosticSync(
             "tts", "SPK_ENGINE_END",
             "Kokoro engine ready (cached or freshly loaded)."
         )
@@ -536,22 +745,29 @@ object KokoroTtsClient {
                 val chunks = splitChunks(text, 600)
                 for ((index, chunk) in chunks.withIndex()) {
                     if (stopped.get()) return@withContext false
-                    JarvisStateRepository.addDiagnostic(
+                    JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_GENERATE_START",
                         "Generate chunk ${index + 1}/${chunks.size} (chars=${chunk.length})."
                     )
+                    if (!firstGenerateLogged) {
+                        firstGenerateLogged = true
+                        JarvisStateRepository.addDiagnosticSync(
+                            "tts", "FIRST_GENERATE",
+                            "First generate in this process (chunk ${index + 1}/${chunks.size})."
+                        )
+                    }
                     val audio = tts.generate(chunk, HF_ALPHA_SID, 1.0f)
-                    JarvisStateRepository.addDiagnostic(
+                    JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_GENERATE_END",
                         "Generate chunk ${index + 1} done (samples=${audio.samples.size})."
                     )
                     if (stopped.get()) return@withContext false
-                    JarvisStateRepository.addDiagnostic(
+                    JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_PLAY_START",
                         "Playback chunk ${index + 1}/${chunks.size}."
                     )
                     val played = playAudio(audio)
-                    JarvisStateRepository.addDiagnostic(
+                    JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_PLAY_END",
                         "Playback chunk ${index + 1} ok=$played."
                     )
@@ -598,6 +814,33 @@ object KokoroTtsClient {
             debug = false,
             provider = "cpu"
         )
+        // 1.4.5 (item 2a/2b): pre-load HASH check — a bad file
+        // must NEVER reach a native OfflineTts load (the load is
+        // the first native failure point). Mismatch fails fast
+        // with HASH_MISMATCH, dir untouched, no native load.
+        JarvisStateRepository.addDiagnosticSync(
+            "tts", "FIRST_ENGINE_LOAD",
+            "First engine creation in this process — hashing pinned files before native load."
+        )
+        run {
+            val prePins = mapOf(
+                MODEL_FILE to PIN_MODEL_SHA,
+                VOICES_FILE to PIN_VOICES_SHA,
+                TOKENS_FILE to PIN_TOKENS_SHA
+            )
+            for ((rel, pin) in prePins) {
+                val actual = sha256Of(File(dir, rel))
+                if (actual != pin) {
+                    JarvisStateRepository.addDiagnosticSync(
+                        "tts", "HASH_MISMATCH",
+                        "Engine load refused: $rel failed hash verification — run Settings Kokoro reset (recopy via :tts)."
+                    )
+                    throw IllegalStateException(
+                        "Kokoro asset $rel failed hash verification before engine load."
+                    )
+                }
+            }
+        }
         val config = OfflineTtsConfig(model = modelConfig)
         // null AssetManager = file-based model: Sherpa reads the
         // files-dir copies, never the APK assets directly. The

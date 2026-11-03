@@ -17,6 +17,39 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 1.4.5 (item 7): PR builds get a DISTINCT artifact name so a
+      # PR debug build can never be mistaken for a release build.
+      # Push/workflow_dispatch keep the exact name Jarvis2026-APK
+      # (the download script depends on it).
+      - name: Set artifact suffix (PR builds only)
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "ARTIFACT_SUFFIX=-pr-${{ github.event.number }}" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_SUFFIX=" >> "$GITHUB_ENV"
+          fi
+          echo "Artifact suffix: '${{ env.ARTIFACT_SUFFIX }}'"
+
+      # 1.4.5 (item 7): versionCode MUST exceed the previous
+      # delivered versionCode, or the build fails. Floor is the
+      # last delivered vc (12 = 1.4.4-PRO) — BUMP THIS FLOOR ON
+      # EVERY RELEASE (it is not read from any API: releases are
+      # artifacts, not GitHub Releases, so no releases-API check
+      # is available). A same-or-lower vc would install as "not
+      # an upgrade" / fail to install over the previous release.
+      - name: Assert versionCode greater than previous release
+        run: |
+          set -e
+          VC=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle.kts | head -1)
+          echo "versionCode in tree: $VC (floor PREV_VC=12, previous delivered 1.4.4-PRO)"
+          test -n "$VC"
+          # NOTE: bump PREV_VC below on every release.
+          PREV_VC=12
+          if [ "$VC" -le "$PREV_VC" ]; then
+            echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
+            exit 1
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -101,9 +134,23 @@ jobs:
           echo "Kokoro model dir in tarball: $MODEL_DIR"
           cp -r "$MODEL_DIR"/. app/src/main/assets/kokoro/
           test -f app/src/main/assets/kokoro/model.int8.onnx
+          # 1.4.5 (item 7): PINNED sizes + SHA-256 (same pins as
+          # KokoroTtsClient). The old gate was only ">50 MB" while
+          # the model is ~109 MB expected — a truncated/corrupt
+          # voice file passed CI and died natively at Sherpa load.
+          # Any mismatch fails the build here, before Gradle runs.
           MODEL_BYTES=$(stat -c%s app/src/main/assets/kokoro/model.int8.onnx)
-          echo "Bundled model.int8.onnx bytes: $MODEL_BYTES (must be > 50000000)"
-          test "$MODEL_BYTES" -gt 50000000
+          echo "Bundled model.int8.onnx bytes: $MODEL_BYTES (expected 114202993)"
+          test "$MODEL_BYTES" -eq 114202993
+          test "$(sha256sum app/src/main/assets/kokoro/model.int8.onnx | cut -d' ' -f1)" = "75635ea3b85a32d00094dcdd61a258aba87c160f7c264c304a7b3ae9d734195e"
+          VOICES_BYTES=$(stat -c%s app/src/main/assets/kokoro/voices.bin)
+          echo "Bundled voices.bin bytes: $VOICES_BYTES (expected 28200960)"
+          test "$VOICES_BYTES" -eq 28200960
+          test "$(sha256sum app/src/main/assets/kokoro/voices.bin | cut -d' ' -f1)" = "1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29"
+          TOKENS_BYTES=$(stat -c%s app/src/main/assets/kokoro/tokens.txt)
+          echo "Bundled tokens.txt bytes: $TOKENS_BYTES (expected 687)"
+          test "$TOKENS_BYTES" -eq 687
+          test "$(sha256sum app/src/main/assets/kokoro/tokens.txt | cut -d' ' -f1)" = "6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425"
           test -f app/src/main/assets/kokoro/voices.bin
           test -f app/src/main/assets/kokoro/tokens.txt
           test -d app/src/main/assets/kokoro/espeak-ng-data
@@ -127,6 +174,8 @@ jobs:
           VAD_BYTES=$(stat -c%s app/src/main/assets/silero_vad.onnx)
           echo "Silero VAD bytes: $VAD_BYTES (expected 643854)"
           test "$VAD_BYTES" -eq 643854
+          # 1.4.5 (item 7): VAD hash pin (same pin as KokoroTtsClient).
+          test "$(sha256sum app/src/main/assets/silero_vad.onnx | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 
       - name: Build Debug & Release APK
         # Owner's HF token (read-only Gemma-download token) goes into
@@ -145,14 +194,55 @@ jobs:
           echo "aapt2: $AAPT2"
           "$AAPT2" dump badging app/build/outputs/apk/release/*.apk | head -5
           "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/*.apk | head -20
-          if [ -f keystore.properties ]; then echo "SIGNING=production-keystore"; else echo "SIGNING=debug-fallback"; fi
+          # 1.4.5 (item 7): SIGNING PIN + debug-fallback FAIL (not
+          # just a label any more). On push/workflow_dispatch a
+          # missing keystore.properties FAILS the build (a release
+          # must never silently ship debug-signed). On
+          # pull_request, fork PRs have no secrets by GitHub
+          # design, so a missing keystore only warns — and the PR
+          # artifact name (see suffix step) marks it as a PR build.
+          # Whenever keystore.properties EXISTS, the cert MUST be
+          # the pinned release cert (DN + SHA-256 are public
+          # fingerprints, safe to commit), else exit 1.
+          if [ -f keystore.properties ]; then
+            echo "SIGNING=production-keystore"
+            CERTS=$("$APKSIGNER" verify --print-certs app/build/outputs/apk/release/*.apk)
+            echo "$CERTS" | grep -F "CN=Jarvis2026" || (echo "FAIL: cert DN does not contain CN=Jarvis2026"; exit 1)
+            echo "$CERTS" | grep -F "4157240d19a33c4752ac72b5ffcd5bfd0a9c1812c61a36179582a262a7c66026" || (echo "FAIL: cert SHA-256 does not match the pinned release cert"; exit 1)
+          else
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "SIGNING=debug-fallback (pull_request: secrets unavailable by design — PR artifact only)"
+            else
+              echo "SIGNING=debug-fallback — FAILING (production keystore required on push/workflow_dispatch)"
+              exit 1
+            fi
+          fi
           # 1.4.0 gate: the release APK MUST carry the bundled Kokoro model.
+          # 1.4.5 (item 7): IN-APK hash check — defense in depth
+          # (bundle source vs shipped bytes): extract the APK's
+          # assets and verify exact sizes + SHA-256 of what
+          # actually SHIPS, against the same pins.
           for APK in app/build/outputs/apk/release/*.apk; do
             echo "Checking bundled Kokoro assets in $APK"
             unzip -l "$APK" | grep -E "assets/kokoro/model\.int8\.onnx" || (echo "MISSING bundled Kokoro model in $APK"; exit 1)
             unzip -l "$APK" | grep -E "assets/kokoro/voices\.bin" || (echo "MISSING bundled Kokoro voices in $APK"; exit 1)
             # 1.4.0 gate: the release APK MUST carry the bundled Silero VAD model.
             unzip -l "$APK" | grep -E "assets/silero_vad\.onnx" || (echo "MISSING bundled Silero VAD model in $APK"; exit 1)
+            APK_TMP=$(mktemp -d)
+            unzip -p "$APK" "assets/kokoro/model.int8.onnx" > "$APK_TMP/model.int8.onnx"
+            unzip -p "$APK" "assets/kokoro/voices.bin" > "$APK_TMP/voices.bin"
+            unzip -p "$APK" "assets/kokoro/tokens.txt" > "$APK_TMP/tokens.txt"
+            unzip -p "$APK" "assets/silero_vad.onnx" > "$APK_TMP/silero_vad.onnx"
+            test "$(stat -c%s "$APK_TMP/model.int8.onnx")" -eq 114202993
+            test "$(sha256sum "$APK_TMP/model.int8.onnx" | cut -d' ' -f1)" = "75635ea3b85a32d00094dcdd61a258aba87c160f7c264c304a7b3ae9d734195e"
+            test "$(stat -c%s "$APK_TMP/voices.bin")" -eq 28200960
+            test "$(sha256sum "$APK_TMP/voices.bin" | cut -d' ' -f1)" = "1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29"
+            test "$(stat -c%s "$APK_TMP/tokens.txt")" -eq 687
+            test "$(sha256sum "$APK_TMP/tokens.txt" | cut -d' ' -f1)" = "6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425"
+            test "$(stat -c%s "$APK_TMP/silero_vad.onnx")" -eq 643854
+            test "$(sha256sum "$APK_TMP/silero_vad.onnx" | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+            echo "In-APK asset sizes + hashes verified for $APK"
+            rm -rf "$APK_TMP"
           done
 
       - name: Rename release APK to Jarvis2026.apk
@@ -164,13 +254,13 @@ jobs:
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Autonomous-Debug-APK
+          name: Jarvis-Autonomous-Debug-APK${{ env.ARTIFACT_SUFFIX }}
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis2026-APK
+          name: Jarvis2026-APK${{ env.ARTIFACT_SUFFIX }}
           path: Jarvis2026.apk
           retention-days: 30

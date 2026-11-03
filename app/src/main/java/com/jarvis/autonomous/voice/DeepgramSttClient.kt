@@ -2,6 +2,9 @@ package com.jarvis.autonomous.voice
 
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.os.Handler
+import android.os.Looper
+import com.jarvis.autonomous.data.JarvisStateRepository
 import android.media.MediaRecorder
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -223,11 +226,23 @@ class DeepgramSttClient(private val apiKey: String) {
     /**
      * One-shot listening for the loop-OFF single-reply path.
      * Owns a short-lived AudioRecord (the loop is off, so no mic
-     * conflict). Returns the first speech_final transcript, or
-     * null on timeout/failure. 12s budget, kept from the old
-     * single-shot path.
+     * conflict). 12s budget, kept from the old single-shot path.
+     *
+     * 1.4.5 (item 4): ENDPOINTING PROOF. The old code resumed
+     * ONLY on speech_final=true — if Deepgram never sends
+     * speech_final, the attempt burned the full 12 s and returned
+     * null even though a complete final transcript had arrived.
+     * Now it resumes on EITHER speech_final (immediate, reason
+     * speech_final) OR a non-blank final followed by a 1,500 ms
+     * quiet window (reason final_quiet). EVERY exit logs
+     * ONE_SHOT_END with reason (speech_final / final_quiet /
+     * timeout / error / closed) + duration, so the endpointing
+     * behaviour is provable from Diagnostics, not guessed.
      */
     suspend fun listenOnce(timeoutMs: Long = 12_000L): String? {
+        val startMs = System.currentTimeMillis()
+        var endReason = "timeout"
+        var endText: String? = null
         var recordRef: AudioRecord? = null
         val result = withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { cont ->
@@ -264,6 +279,21 @@ class DeepgramSttClient(private val apiKey: String) {
                         // Pump death ends the attempt via timeout/close.
                     }
                 }
+                val quietHandler = Handler(Looper.getMainLooper())
+                var lastFinal: String? = null
+                var finished = false
+                fun finish(text: String?, reason: String) {
+                    if (finished) return
+                    finished = true
+                    endReason = reason
+                    endText = text
+                    quietHandler.removeCallbacksAndMessages(null)
+                    if (cont.isActive) cont.resume(text)
+                }
+                val quietRunnable = Runnable {
+                    val t = lastFinal
+                    if (t != null && t.isNotBlank()) finish(t, "final_quiet")
+                }
                 val listener = object : Listener {
                     override fun onOpen() {
                         pump.start()
@@ -271,17 +301,24 @@ class DeepgramSttClient(private val apiKey: String) {
 
                     override fun onInterim(text: String) {}
                     override fun onFinal(text: String, speechFinal: Boolean) {
-                        if (speechFinal && text.isNotBlank() && cont.isActive) {
-                            cont.resume(text)
+                        if (text.isBlank()) return
+                        lastFinal = text
+                        if (speechFinal) {
+                            finish(text, "speech_final")
+                        } else {
+                            // Non-final transcript + quiet window
+                            // = utterance done (endpointing proof).
+                            quietHandler.removeCallbacks(quietRunnable)
+                            quietHandler.postDelayed(quietRunnable, 1500L)
                         }
                     }
 
                     override fun onError(code: String, message: String) {
-                        if (cont.isActive) cont.resume(null)
+                        finish(null, "error")
                     }
 
                     override fun onClosed() {
-                        if (cont.isActive) cont.resume(null)
+                        finish(null, "closed")
                     }
                 }
                 connect(listener)
@@ -292,11 +329,17 @@ class DeepgramSttClient(private val apiKey: String) {
                 }
             }
         }
-        // Every exit path (speech_final, timeout, failure) frees
-        // the one-shot mic and the stream — no mic leak.
+        // Every exit path frees the one-shot mic and the stream
+        // — no mic leak. Endpointing proof on EVERY exit.
         runCatching { recordRef?.stop() }
         runCatching { recordRef?.release() }
         close()
+        if (result != null) endReason = endReason.takeIf { it != "timeout" } ?: "speech_final"
+        JarvisStateRepository.addDiagnostic(
+            "stt", "ONE_SHOT_END",
+            "One-shot ended reason=$endReason durationMs=${System.currentTimeMillis() - startMs} " +
+                "textPresent=${result != null}."
+        )
         return result
     }
 }

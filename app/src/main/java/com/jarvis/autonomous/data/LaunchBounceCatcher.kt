@@ -110,8 +110,30 @@ object LaunchSession {
     @Volatile
     var uiStable: Boolean = false
 
+    /**
+     * 1.4.5 part 3 — ATOMIC detection claim (research:
+     * three threads raced on one flag). MainActivity's thread,
+     * the service thread, AND the Command-tab card all ran
+     * previous-bounce detection behind a plain Boolean
+     * check-then-set — two threads could detect + write the
+     * report file concurrently and race the bounce/bounceFilePath
+     * assignments. Now exactly ONE thread wins the claim via
+     * compareAndSet; losers skip detection entirely and read
+     * the result from JarvisStateRepository's bounce flows
+     * (which the claimer sets), so the card recomposes when
+     * detection lands instead of snapshotting an empty mirror.
+     */
+    private val bounceClaim = java.util.concurrent.atomic.AtomicBoolean(false)
+
     @Volatile
     var bounceChecked: Boolean = false
+
+    /** Returns true only for the single thread that won the claim. */
+    fun claimBounceCheck(): Boolean {
+        val won = bounceClaim.compareAndSet(false, true)
+        if (won) bounceChecked = true
+        return won
+    }
 
     @Volatile
     var bounce: PreviousBounce? = null
@@ -186,9 +208,20 @@ private fun tsOf(line: String): String {
 fun wasLastDeathDuringGreetingSpeak(): Boolean {
     val lines = JarvisDiagnosticsFile.readLast(300)
     if (lines.isEmpty()) return false
+    // 1.4.5 part 3: :tts-process LAUNCH_START lines must NEVER
+    // count as session boundaries (research regression: the
+    // :tts process runs JarvisApplication.onCreate too, and its
+    // identical LAUNCH_START used to slice sessions mid-greeting).
+    // Defence in depth: :tts no longer writes LAUNCH_START at
+    // all (it writes TTS_PROCESS_START instead), AND this filter
+    // excludes any process=:tts-tagged line, so even a part-2
+    // diagnostics file cannot corrupt slicing. Legacy untagged
+    // lines (1.4.4 and earlier, which never ran :tts) still
+    // count as main-process boundaries.
     val appStarts = lines.indices.filter { i ->
         lines[i].contains("\"code\":\"LAUNCH_START\"") &&
-            lines[i].contains("App process started")
+            lines[i].contains("App process started") &&
+            !lines[i].contains("process=:tts")
     }
     if (appStarts.size < 2) return false
     val prevStart = appStarts[appStarts.size - 2]
@@ -387,9 +420,61 @@ fun writeBounceReportFile(context: Context, text: String): String {
     }
 }
 
-/** External-files copy for the notification Share action, if present. */
+/**
+ * External-files copy for the notification Share action, if present.
+ * 1.4.5 (item 6): STALE EXPIRY — a report older than 7 days is
+ * deleted and returns null, so the notification Share can never
+ * serve an ancient report for a new bounce. Dismiss ("Band karo")
+ * does NOT delete the file (the user may still want to copy after
+ * dismissing); expiry + clean-detection cleanup are the removal
+ * paths.
+ */
 fun bounceShareFile(context: Context): File? {
     val dir = context.getExternalFilesDir(null) ?: return null
     val f = File(dir, "JarvisDiagnostics/last-bounce-report.txt")
-    return if (f.exists()) f else null
+    if (!f.exists()) return null
+    val ageMs = System.currentTimeMillis() - f.lastModified()
+    if (ageMs > 7L * 24L * 60L * 60L * 1000L) {
+        runCatching { f.delete() }
+        return null
+    }
+    return f
+}
+
+/**
+ * 1.4.5 (item 6): delete BOTH bounce-report copies (external-files
+ * + Documents via MediaStore resolver.delete on the queried URI).
+ * Callers invoke this when detection returns null (a clean launch)
+ * so a stale report can never survive into the next session.
+ * A null detection is a normal close — the old report is then
+ * provably not the current session's, so deleting it is safe.
+ */
+fun clearStaleBounceReport(context: Context) {
+    runCatching {
+        val dir = context.getExternalFilesDir(null) ?: context.filesDir
+        File(dir, "JarvisDiagnostics/last-bounce-report.txt").delete()
+    }
+    runCatching {
+        val resolver = context.contentResolver
+        val uri = android.provider.MediaStore.Files.getContentUri("external")
+        val cursor = resolver.query(
+            uri,
+            arrayOf(android.provider.MediaStore.MediaColumns._ID),
+            "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH}=?",
+            arrayOf("last-bounce-report.txt", "Documents/JarvisDiagnostics/"),
+            null
+        )
+        cursor?.use {
+            while (it.moveToNext()) {
+                val id = it.getLong(0)
+                runCatching {
+                    resolver.delete(
+                        android.content.ContentUris.withAppendedId(uri, id),
+                        null, null
+                    )
+                }
+            }
+        }
+    }
 }

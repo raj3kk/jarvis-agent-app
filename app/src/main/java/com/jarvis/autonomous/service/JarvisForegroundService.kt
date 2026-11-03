@@ -14,7 +14,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -23,6 +22,7 @@ import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
+import com.jarvis.autonomous.data.clearStaleBounceReport
 import com.jarvis.autonomous.data.bounceShareFile
 import com.jarvis.autonomous.data.buildBounceReportText
 import com.jarvis.autonomous.data.detectPreviousBounce
@@ -116,6 +116,11 @@ class JarvisForegroundService : Service() {
     @Volatile
     private var greetingSpeakInProgress: Boolean = false
     private var pendingVadStart: Boolean = false
+    // 1.4.5 (item 3): fallback for a deferred VAD start whose
+    // greeting never arrives (service start with no UI greeting):
+    // after 5 s VAD starts anyway, so the restore path can never
+    // leave VAD permanently deferred. Cancelled by drainPendingVad.
+    private var vadFallbackRunnable: Runnable? = null
     // 1.4.4: true once the persistent notification has been
     // re-issued WITH the "Share bounce report" action, so later
     // service starts don't re-issue it pointlessly.
@@ -224,6 +229,9 @@ class JarvisForegroundService : Service() {
                 "Pichhli baar greeting bolte waqt app band hua, " +
                     "isliye is baar greeting skip ki gayi taaki app khula rahe."
             )
+            // 1.4.5 (item 3): no greeting speak will happen on this
+            // launch, so a deferred VAD start must NOT wait for it.
+            drainPendingVad()
             return
         }
         // 1.4.5 GREET_START: the greeting-specific start marker.
@@ -239,13 +247,11 @@ class JarvisForegroundService : Service() {
         serviceScope.launch {
             val ok = runCatching { speakWrapped(full) }.getOrDefault(false)
             greetingSpeakInProgress = false
-            // Deferred VAD init (see startVadMonitor): run it now
-            // that greeting native work is done, so the two native
-            // loads never spike together at launch.
-            if (pendingVadStart) {
-                pendingVadStart = false
-                startVadMonitor()
-            }
+            // Deferred VAD init (see startVadMonitor /
+            // deferVadUntilGreeting): run it now that greeting
+            // native work is done, so the two native loads never
+            // spike together at launch.
+            drainPendingVad()
             if (!ok) {
                 JarvisStateRepository.addDiagnostic(
                     "tts", "GREET_FAIL",
@@ -266,24 +272,32 @@ class JarvisForegroundService : Service() {
     }
 
     /**
-     * 1.4.2: name the recognizer failure in plain language. The old
-     * code spoke nothing and showed nothing, so ERROR_NETWORK (no
-     * Google voice service) looked identical to a permission loss.
-     * Raw codes: SpeechRecognizer.ERROR_NETWORK=2, ERROR_AUDIO=3,
-     * ERROR_SERVER=4, ERROR_CLIENT=5, ERROR_INSUFFICIENT_PERMISSIONS=9.
+     * 1.4.5 (FINAL policy): reason-based mic-error speech. The old
+     * code mapped system SpeechRecognizer codes (ERROR_NETWORK=2,
+     * etc.) — those codes no longer exist in the app (system
+     * recognizer removed). The mapping now reads the reason
+     * string: Deepgram auth (401/Unauthorized) -> key check;
+     * network/DNS -> internet; permission -> Permissions tab;
+     * otherwise the reason itself, truncated.
      */
-    private fun micErrorSpeech(code: Int, reason: String): String {
-        return when (code) {
-            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_SERVER ->
-                "Mic band ho gaya — Google voice service nahi mil rahi. " +
-                    "Internet ya Google app check karo, phir Retry dabao."
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+    private fun micErrorSpeech(reason: String): String {
+        val lower = reason.lowercase()
+        return when {
+            lower.contains("401") || lower.contains("unauthorized") ->
+                "Mic band ho gaya — Deepgram key galat lag rahi hai. " +
+                    "AI Brain me key check karo, phir Retry dabao."
+            lower.contains("network") || lower.contains("unable to resolve") ||
+                lower.contains("internet") || lower.contains("no network") ->
+                "Mic band ho gaya — internet nahi mil raha. " +
+                    "Network aate hi mic dobara connect hoga, ya Retry dabao."
+            lower.contains("permission") || lower.contains("record_audio") ||
+                lower.contains("not granted") ->
                 "Mic band ho gaya — microphone permission nahi mili. " +
                     "Permissions tab se mic permission do, phir Retry dabao."
-            SpeechRecognizer.ERROR_AUDIO, SpeechRecognizer.ERROR_CLIENT ->
-                "Mic band ho gaya — mic kisi aur app ke paas hai ya " +
-                    "recognizer fail ho gaya. Retry dabao."
-            else -> "Mic band ho gaya — $reason Retry dabao."
+            lower.contains("key") ->
+                "Mic band ho gaya — Deepgram key nahi hai. " +
+                    "AI Brain me key daal kar Save dabao, phir mic on karo."
+            else -> "Mic band ho gaya — ${reason.take(120)} Retry dabao."
         }
     }
 
@@ -308,6 +322,53 @@ class JarvisForegroundService : Service() {
     private fun setMicLoopPersisted(value: Boolean) {
         getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_MIC_LOOP_PERSISTED, value).apply()
+    }
+
+    /**
+     * 1.4.5 (item 3): drain a deferred VAD start — called from
+     * speakGreeting completion AND from the circuit-breaker skip
+     * path (no greeting speak will happen there, so VAD must
+     * start immediately, not wait for a greeting that never comes).
+     */
+    private fun drainPendingVad() {
+        if (!pendingVadStart) return
+        pendingVadStart = false
+        vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+        vadFallbackRunnable = null
+        startVadMonitor()
+    }
+
+    /**
+     * 1.4.5 (item 3): RESTORE DEFERRAL — the onCreate persisted-mic
+     * restore path. DECISION (explicit, in code): restore + greeting
+     * speak must NOT overlap — greeting wins, VAD waits. The old
+     * part-2 deferral only covered startVadMonitor() calls made
+     * WHILE greetingSpeakInProgress was already true; at restore
+     * time that flag is still false (greeting comes later via
+     * ACTION_GREET/pendingGreet), so restore VAD init overlapped
+     * greeting speak. Now the restore path calls this instead of
+     * startVadMonitor() when greeting has not yet run: VAD waits
+     * (VAD_DEFERRED, reason restore-before-greeting) and starts on
+     * greeting completion (drainPendingVad) or after the 5 s
+     * fallback when no greeting arrives. If greeting already ran,
+     * VAD starts immediately.
+     */
+    private fun deferVadUntilGreeting() {
+        pendingVadStart = true
+        JarvisStateRepository.addDiagnostic(
+            "tts", "VAD_DEFERRED",
+            "Sherpa VAD init deferred (restore-before-greeting: greeting wins, VAD waits; 5s fallback if no greeting arrives)."
+        )
+        vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            vadFallbackRunnable = null
+            if (pendingVadStart) {
+                pendingVadStart = false
+                startVadMonitor()
+            }
+        }
+        vadFallbackRunnable = runnable
+        wakeLockHandler.postDelayed(runnable, 5_000L)
     }
 
     /**
@@ -424,6 +485,10 @@ class JarvisForegroundService : Service() {
             prefs = prefs,
             onSpeakAndAwait = { text -> speakWrapped(text) },
             onRequestUserVoiceReply = { awaitMicReply() },
+            // 1.4.5 (item 5): voice "stop" commands actually stop
+            // speech now (the engine branch previously only
+            // cancelled the task — speech kept playing).
+            onStopSpeaking = { voiceManager.stopSpeaking("voice stop command") },
             onShowBrowserPage = { url -> JarvisBrowserHost.current?.showLoadedPage(url) },
             // B-M3: engine background-browse guard reads live tab
             // visibility via the shared browser host (null-safe:
@@ -443,6 +508,27 @@ class JarvisForegroundService : Service() {
             // below), so the construction order here is safe.
             isMicLoopEnabled = {
                 if (::micManager.isInitialized) micManager.isEnabled() else false
+            },
+            // 1.4.5 FINAL policy: Deepgram-only sessions, wired to
+            // the manager (service constructs VoiceManager before
+            // micManager, but these lambdas run later, so the
+            // construction order is safe — same pattern as the
+            // isMicLoopEnabled gate above).
+            startWakeSession = { cb ->
+                if (::micManager.isInitialized) micManager.startWakeListening(cb) else false
+            },
+            stopWakeSession = {
+                if (::micManager.isInitialized) micManager.stopWakeListening()
+            },
+            listenOnceSession = { cb ->
+                if (::micManager.isInitialized) {
+                    micManager.listenOnceAsync(12_000L, cb)
+                } else {
+                    cb(null)
+                }
+            },
+            cancelListenOnceSession = {
+                if (::micManager.isInitialized) micManager.cancelListenOnce()
             }
         )
 
@@ -498,36 +584,50 @@ class JarvisForegroundService : Service() {
             }
 
             override fun onSttPathChanged(path: String, reason: String) {
-                // 1.4.3 VISIBLE fallback switch: the manager
-                // already logs the Diagnostic; the chat line makes
-                // the switch visible to the user in the Command tab.
+                // Deepgram-only path line (1.4.5: no system branch
+                // exists any more — the old "system mic se" line
+                // is deleted with the system path).
                 JarvisStateRepository.setSttPath(path, reason)
                 JarvisStateRepository.addChatMessage(
                     "Jarvis",
-                    if (path == "deepgram") {
-                        "Sun raha hoon — Deepgram se. $reason"
-                    } else {
-                        "Deepgram se sun nahi pa raha — system mic se sun raha hoon. $reason"
-                    }
+                    "Sun raha hoon — Deepgram se. $reason"
+                )
+            }
+
+            override fun onMicReconnecting(reason: String) {
+                // 1.4.5 (item 4): the loop stays ENABLED while
+                // reconnecting (banner, not a stop) — so the
+                // repository loop flag stays true; only the
+                // reconnecting reason is published for the banner.
+                JarvisStateRepository.setMicReconnecting(reason)
+                JarvisStateRepository.addLog("Mic reconnecting: $reason")
+            }
+
+            override fun onMicRecovered() {
+                // 1.4.5 (item 4): recovery chat line on the FIRST
+                // reconnect only (the manager fires this once per
+                // reconnect episode, not per attempt — no spam).
+                JarvisStateRepository.setMicReconnecting(null)
+                JarvisStateRepository.addChatMessage(
+                    "Jarvis",
+                    "Deepgram se phir sun raha hoon."
                 )
             }
 
             override fun onMicError(reason: String) {
-                // 1.4.2: terminal mic death used to end in this
-                // log line ONLY — no banner, no speech, no retry —
-                // which is exactly the reported on/off/on flapping
-                // with silence. Now it is VISIBLE on three channels:
-                // (1) persisted diagnostics entry with the raw
-                // recognizer code, (2) a command-tab banner with a
-                // Retry button, (3) a spoken reason.
-                val code = if (::micManager.isInitialized) {
-                    micManager.lastRecognizerErrorCode
-                } else -1
-                val spoken = micErrorSpeech(code, reason)
+                // 1.4.5 FINAL policy: onMicError now means PERMANENT
+                // only (permission revoked / key missing) — transient
+                // Deepgram failures go through onMicReconnecting
+                // instead and never reach this banner. Visible on
+                // three channels: (1) diagnostics entry, (2) a
+                // command-tab banner with Retry, (3) a spoken reason.
+                // Code is -1 (no system recognizer codes exist any
+                // more); the banner hides the code line when < 0.
+                val spoken = micErrorSpeech(reason)
                 JarvisStateRepository.addLog("Mic error: $reason")
-                JarvisStateRepository.addDiagnostic("mic", "REC_$code", reason)
+                JarvisStateRepository.addDiagnostic("mic", "MIC_ERROR", reason)
                 JarvisStateRepository.setMicFatal(
-                    com.jarvis.autonomous.data.MicFatalState(spoken, code)
+                    com.jarvis.autonomous.data.MicFatalState(spoken, -1)
                 )
                 JarvisStateRepository.setMicLoopEnabled(false)
                 JarvisStateRepository.setMicListening(false)
@@ -540,8 +640,23 @@ class JarvisForegroundService : Service() {
 
         floatingOverlay = FloatingJarvisOverlay(
             context = this,
-            onMicTap = { voiceManager.triggerManualVoiceCommand() },
-            onStopTap = { agentEngine.cancelActiveTask("Stopped from Floating HUD.") }
+            // 1.4.5 (item 4): a suspended stream resumes on tap
+            // instead of opening a second listener; otherwise the
+            // tap opens the manual voice command as before.
+            onMicTap = {
+                if (::micManager.isInitialized && micManager.isDeepgramSuspended()) {
+                    micManager.resumeDeepgram("overlay-tap")
+                } else {
+                    voiceManager.triggerManualVoiceCommand()
+                }
+            },
+            // 1.4.5 (item 5): HUD stop actually stops SPEECH too —
+            // the old path only cancelled the task, so speech kept
+            // playing after the user hit stop.
+            onStopTap = {
+                voiceManager.stopSpeaking("HUD stop")
+                agentEngine.cancelActiveTask("Stopped from Floating HUD.")
+            }
         )
 
         if (prefs.floatingOverlayEnabled) {
@@ -549,6 +664,14 @@ class JarvisForegroundService : Service() {
         }
 
         if (prefs.wakeWordEnabled) {
+            // 1.4.5 (item 3): recogniser-start marker — the service
+            // order has wake-word BEFORE greeting dispatch, but no
+            // marker existed for it, so a launch trace could not
+            // show whether wake listening started at all.
+            JarvisStateRepository.addDiagnostic(
+                "mic", "WAKE_START",
+                "Wake-word listening starting (service onCreate, before greeting dispatch)."
+            )
             voiceManager.startWakeWordListening()
         }
 
@@ -568,8 +691,21 @@ class JarvisForegroundService : Service() {
                 )
             } else {
                 voiceManager.stopListeningInternal()
+                // 1.4.5 (item 3): MIC_RESTORE marker + restore
+                // deferral — greeting has NOT run yet at this point
+                // (it comes via ACTION_GREET/pendingGreet below), so
+                // restore VAD init must wait for it (greeting wins,
+                // VAD waits), NOT start immediately and overlap.
+                JarvisStateRepository.addDiagnostic(
+                    "mic", "MIC_RESTORE",
+                    "Persisted mic loop restoring (service onCreate) — VAD deferred until greeting."
+                )
                 if (micManager.start()) {
-                    startVadMonitor()
+                    if (greetingDone) {
+                        startVadMonitor()
+                    } else {
+                        deferVadUntilGreeting()
+                    }
                     JarvisStateRepository.addLog("Mic loop restored after service recreation.")
                 }
             }
@@ -611,18 +747,31 @@ class JarvisForegroundService : Service() {
         // Kokoro TTS runs in :tts (see KokoroTtsService). So
         // LaunchSession flags are shared with the Activity (same
         // process), and the :tts process never touches them.
+        // 1.4.5 (item 6): ATOMIC bounce detection — the old
+        // plain-Boolean check-then-set raced across three threads
+        // (Activity onCreate, this service thread, Command-tab
+        // card). claimBounceCheck() lets exactly ONE thread detect
+        // + publish; losers read the result from repository flows
+        // (so the card recomposes when detection lands). A null
+        // detection (clean launch) deletes stale report copies so
+        // an old report can never be served for a new session.
         Thread {
             runCatching {
-                if (!LaunchSession.bounceChecked) {
+                if (LaunchSession.claimBounceCheck()) {
                     val found = detectPreviousBounce()
-                    LaunchSession.bounce = found
                     if (found != null) {
-                        LaunchSession.bounceFilePath = writeBounceReportFile(
+                        val path = writeBounceReportFile(
                             this, buildBounceReportText(found)
                         )
+                        LaunchSession.bounce = found
+                        LaunchSession.bounceFilePath = path
+                        JarvisStateRepository.setBounceReport(found, path)
                         refreshBounceNotification()
+                    } else {
+                        LaunchSession.bounce = null
+                        JarvisStateRepository.setBounceReport(null, "")
+                        clearStaleBounceReport(this)
                     }
-                    LaunchSession.bounceChecked = true
                 } else if (LaunchSession.bounce != null && !bounceShareActionAdded) {
                     // File was written by the Activity thread, but
                     // this notification was built before it existed.
@@ -654,6 +803,16 @@ class JarvisForegroundService : Service() {
                         }
                     }
                     voiceManager.stopListeningInternal()
+                    // 1.4.5 (item 4): DEAD-WHILE-ENABLED revival.
+                    // The old handler called micManager.start(),
+                    // which is a no-op when already enabled — so a
+                    // dead-while-enabled loop (hung connect,
+                    // suspended-forever, dead pump) could never be
+                    // revived from the UI. Now an unhealthy enabled
+                    // loop is stopped first, then started fresh.
+                    if (micManager.isEnabled() && !micManager.isLoopHealthy()) {
+                        micManager.stop()
+                    }
                     if (micManager.start()) {
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
@@ -684,11 +843,16 @@ class JarvisForegroundService : Service() {
             }
 
             ACTION_RETRY_MIC -> {
-                // 1.4.2: Retry after a terminal death. start() is a
-                // fresh begin here because stopWithError already
-                // cleared `enabled` — it is not the no-op path.
+                // 1.4.5 (item 4): Retry ALWAYS stops first, then
+                // starts — a fresh begin is guaranteed. The old
+                // comment claimed Retry was fresh "because
+                // stopWithError cleared enabled"; under the new
+                // no-permanent-stop design that claim is false
+                // (reconnecting loops stay enabled), so RETRY must
+                // force the stop itself.
                 if (::micManager.isInitialized) {
                     voiceManager.stopListeningInternal()
+                    micManager.stop()
                     if (micManager.start()) {
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)

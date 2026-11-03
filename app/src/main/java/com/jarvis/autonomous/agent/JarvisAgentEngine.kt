@@ -52,7 +52,13 @@ class JarvisAgentEngine(
     // which case background browse proceeds as before (see
     // executeBrowserLoad) — the coordinator must wire this for the
     // full no-hijack guarantee.
-    private val isBrowserTabVisible: (() -> Boolean)? = null
+    private val isBrowserTabVisible: (() -> Boolean)? = null,
+    /**
+     * 1.4.5 (item 5): voice "stop" commands actually stop speech.
+     * Optional (default null) so existing callers keep compiling;
+     * the service wires it to VoiceManager.stopSpeaking.
+     */
+    private val onStopSpeaking: (() -> Unit)? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val llmClient = LlmClient(context, prefs)
@@ -564,6 +570,16 @@ class JarvisAgentEngine(
         // display + LLM paths below — never the transliteration.
         val lower = TurnDetector.transliterateDevanagariKeywords(trimmed.lowercase())
         if (lower in listOf("stop", "ruk ja", "ruko", "cancel", "jarvis stop", "bas kar")) {
+            // 1.4.5 (item 5): stop SPEECH first, then cancel the
+            // task, then confirm. The old branch cancelled the
+            // task but never called stopSpeaking, so speech kept
+            // playing after a voice "stop". Barge-in keywords are
+            // handled separately (mid-speech path); this branch
+            // covers the command-turn case and the barge-in-missed
+            // case. No double-fire: a barge-in with a bare keyword
+            // seeds nothing, and with a remainder it seeds the
+            // remainder, never "stop".
+            onStopSpeaking?.invoke()
             cancelActiveTask("Stopped on voice command.")
             scope.launch { speak("Theek hai bhai, ruk gaya.") }
             return
@@ -859,6 +875,28 @@ class JarvisAgentEngine(
                         conn.errorStream?.bufferedReader()?.readText()?.take(300) ?: ""
                     }.getOrDefault("")
                 }
+                // 1.4.5 (item 10): upload failures are no longer
+                // silent-or-identical. 400 = server validation
+                // rejected the template; 409 = same template_hash
+                // with different steps already exists (never
+                // overwritten — that is the server's guard, not a
+                // retryable error); other codes = transport/server.
+                // A background upload must not spam chat on every
+                // failure, so the distinction lands in Diagnostics
+                // (user-visible via the bug-report section) + log.
+                if (code !in 200..299) {
+                    val upCode = when (code) {
+                        400 -> "UPLOAD_400"
+                        409 -> "UPLOAD_409"
+                        else -> "UPLOAD_FAIL"
+                    }
+                    val upMsg = when (code) {
+                        400 -> "Upload rejected (400 validation): $detail — template not saved."
+                        409 -> "Upload conflict (409 same-hash-different-steps): template already exists with different steps — not overwritten."
+                        else -> "Upload failed (HTTP $code): $detail"
+                    }
+                    JarvisStateRepository.addDiagnostic("patterns", upCode, upMsg)
+                }
                 JarvisStateRepository.addLog("Global-learning upload: HTTP $code $detail (generic template only)")
                 conn.disconnect()
             } catch (e: Exception) {
@@ -891,29 +929,74 @@ class JarvisAgentEngine(
      * no step runs, the user must ask for a pattern by name for
      * anything to happen. Best-effort; failures are logged only.
      */
+    /**
+     * PATTERNS FETCH: fetches owner-APPROVED patterns (GET
+     * /api/patterns — the server returns approved=true rows only)
+     * and surfaces them as CHAT SUGGESTIONS. They are NEVER
+     * auto-applied and NEVER auto-executed: no routine is stored,
+     * no step runs, the user must ask for a pattern by name for
+     * anything to happen. Best-effort; failures are logged only.
+     *
+     * 1.4.5 (item 10) fixes, both low-risk and user-visible:
+     * (a) PAGINATION: the old code fetched ?limit=20 once and
+     * ignored next_cursor, so only the first page ever showed.
+     * Now it follows next_cursor (cap 5 pages / same-cursor
+     * break, so a misbehaving server cannot loop forever).
+     * (b) APPROVED-ONLY CLIENT VERIFY: the old code trusted the
+     * server's approved-only claim without checking — now every
+     * template with an explicit approved=false is dropped
+     * client-side too (absent field = trusted, server default).
+     */
     fun fetchPatternSuggestions() {
         scope.launch(Dispatchers.IO) {
             try {
-                val conn = URL("$LICENCE_SERVER_URL/api/patterns?limit=20")
-                    .openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 15000
-                conn.readTimeout = 15000
-                val code = conn.responseCode
-                val text = if (code in 200..299) {
-                    conn.inputStream.bufferedReader().readText()
-                } else {
-                    runCatching {
-                        conn.errorStream?.bufferedReader()?.readText()?.take(200) ?: ""
-                    }.getOrDefault("")
+                val allTemplates = mutableListOf<JSONObject>()
+                var cursor: String? = null
+                var pages = 0
+                var fetchError: String? = null
+                while (pages < 5) {
+                    pages++
+                    val url = buildString {
+                        append("$LICENCE_SERVER_URL/api/patterns?limit=20")
+                        if (!cursor.isNullOrBlank()) append("&cursor=$cursor")
+                    }
+                    val conn = URL(url).openConnection() as HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 15000
+                    val code = conn.responseCode
+                    val text = if (code in 200..299) {
+                        conn.inputStream.bufferedReader().readText()
+                    } else {
+                        runCatching {
+                            conn.errorStream?.bufferedReader()?.readText()?.take(200) ?: ""
+                        }.getOrDefault("")
+                    }
+                    conn.disconnect()
+                    if (code !in 200..299) {
+                        fetchError = "HTTP $code $text"
+                        break
+                    }
+                    val root = JSONObject(text)
+                    val templates = root.optJSONArray("templates")
+                    if (templates != null) {
+                        for (i in 0 until templates.length()) {
+                            val t = templates.optJSONObject(i) ?: continue
+                            // Approved-only client verify: drop any
+                            // template that explicitly says approved=false.
+                            if (t.has("approved") && !t.optBoolean("approved", true)) continue
+                            allTemplates.add(t)
+                        }
+                    }
+                    val next = root.optString("next_cursor", "")
+                    if (next.isBlank() || next == cursor) break
+                    cursor = next
                 }
-                conn.disconnect()
-                if (code !in 200..299) {
-                    JarvisStateRepository.addLog("Pattern suggestions fetch failed: HTTP $code $text")
+                if (fetchError != null) {
+                    JarvisStateRepository.addLog("Pattern suggestions fetch failed: $fetchError")
                     return@launch
                 }
-                val templates = JSONObject(text).optJSONArray("templates")
-                if (templates == null || templates.length() == 0) {
+                if (allTemplates.isEmpty()) {
                     JarvisStateRepository.addChatMessage(
                         "Jarvis",
                         "Approved patterns: abhi koi approved pattern nahi mila (sirf sujhav dikhata hoon, auto-apply kabhi nahi)."
@@ -923,8 +1006,7 @@ class JarvisAgentEngine(
                 val lines = StringBuilder(
                     "Approved patterns — sirf sujhav, auto-apply NAHI (kisi ko chalana ho to naam se bolo):"
                 )
-                for (i in 0 until templates.length()) {
-                    val t = templates.optJSONObject(i) ?: continue
+                for (t in allTemplates) {
                     val steps = t.optJSONObject("template")?.optJSONArray("steps")
                     val seq = StringBuilder()
                     if (steps != null) {

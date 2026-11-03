@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -34,6 +35,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -184,6 +186,12 @@ fun LicenceScreen() {
         mutableStateOf(prefs.getString(LicencePrefs.KEY_LICENCE, "") ?: "")
     }
     var sessionToken by remember { mutableStateOf("") }
+    // 1.4.5 (item 8): licence-key field masked by default (the
+    // session-token field was already masked in 1.4.1; the key
+    // field itself was NOT — a shoulder-surfer could read the
+    // full key off the screen). SHOW/HIDE toggle, same pattern
+    // as the AI Brain key fields.
+    var showLicenceKey by remember { mutableStateOf(false) }
     var activated by remember {
         mutableStateOf(prefs.getBoolean(LicencePrefs.KEY_ACTIVATED, false))
     }
@@ -352,7 +360,18 @@ fun LicenceScreen() {
                     onValueChange = { licenceKey = it },
                     label = { Text("Licence key (JARVIS-XXXX-XXXX-XXXX-XXXX)") },
                     modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+                    singleLine = true,
+                    visualTransformation = if (showLicenceKey) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        Text(
+                            text = if (showLicenceKey) "HIDE" else "SHOW",
+                            fontSize = 11.sp,
+                            color = Color(0xFFB85C38),
+                            modifier = Modifier
+                                .padding(end = 10.dp)
+                                .clickable { showLicenceKey = !showLicenceKey }
+                        )
+                    }
                 )
                 Button(
                     enabled = !busy,
@@ -418,6 +437,76 @@ fun LicenceScreen() {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(if (busy) "Please wait…" else "Activate")
+                }
+                // 1.4.5 (item 8): RE-VERIFY — never trust the local
+                // activated flag alone. This re-checks the saved
+                // key + this device against the server (same verify
+                // endpoint as Activate, no new binding created when
+                // already bound to this device) and CORRECTS the
+                // local flag from the live answer: 200 -> activated,
+                // 409 -> bound to another device (flag cleared),
+                // 404 -> invalid/revoked (flag cleared), network
+                // failure -> flag UNCHANGED (offline proves nothing).
+                OutlinedButton(
+                    enabled = !busy,
+                    onClick = {
+                        val key = licenceKey.trim()
+                        if (key.isBlank()) {
+                            status = "Re-verify ke liye licence key chahiye."
+                            return@OutlinedButton
+                        }
+                        val id = deviceId(context)
+                        if (id.isBlank()) {
+                            status = "Device id (ANDROID_ID) nahi mila — dobara try karo."
+                            return@OutlinedButton
+                        }
+                        busy = true
+                        status = "Licence status dobara check ho raha hai…"
+                        scope.launch {
+                            val json = JSONObject().apply {
+                                put("key", key)
+                                put("device_id", id)
+                            }
+                            val (code, bodyText) = postLicence(
+                                "/api/licence/verify",
+                                json
+                            )
+                            busy = false
+                            if (code == 200) {
+                                val saved = withContext(Dispatchers.IO) {
+                                    val ok = prefs.edit()
+                                        .putBoolean(LicencePrefs.KEY_ACTIVATED, true)
+                                        .commit()
+                                    ok && prefs.getBoolean(LicencePrefs.KEY_ACTIVATED, false)
+                                }
+                                activated = saved
+                                status = if (saved) {
+                                    "Licence valid ✅ — is device se bound hai (server se verify hua)."
+                                } else {
+                                    "Server ne valid bataya, par flag save nahi hua — dobara dabao."
+                                }
+                            } else if (code == 409) {
+                                withContext(Dispatchers.IO) {
+                                    prefs.edit().putBoolean(LicencePrefs.KEY_ACTIVATED, false).commit()
+                                }
+                                activated = false
+                                status = "Ye licence kisi aur device se bound hai — local flag clear kar diya gaya hai."
+                            } else if (code == 404) {
+                                withContext(Dispatchers.IO) {
+                                    prefs.edit().putBoolean(LicencePrefs.KEY_ACTIVATED, false).commit()
+                                }
+                                activated = false
+                                status = "Licence invalid/revoked hai — local flag clear kar diya gaya hai."
+                            } else if (code == -1) {
+                                status = "Network error: $bodyText — local status nahi badla (offline kuch prove nahi karta)."
+                            } else {
+                                status = "Re-verify fail (HTTP $code): $bodyText — local status nahi badla."
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Licence status dobara check karo (server se)")
                 }
             }
         }
