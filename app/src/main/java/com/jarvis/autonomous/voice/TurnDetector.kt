@@ -413,10 +413,18 @@ class TurnDetector {
             "khol", "batao", "bata", "lagao", "laga", "band",
             "roko", "ruk", "dekho", "dekh", "likho", "banao",
             "dhoondho", "khelo", "uthao", "bhejdo", "chalu",
+            // 1.4.7 (A3): imperative / request predicates that the
+            // old list missed, so complete commands like "volume
+            // badhao" were misjudged as fragments and paid the
+            // ~9s "aur bolo" + 5s-window penalty before acting.
+            "badhao", "ghatao", "badao", "kam", "zyada", "chahiye",
             // English verbs
             "play", "send", "open", "call", "set", "turn",
             "show", "tell", "start", "stop", "search", "find",
-            "do", "make", "write", "create", "give", "bring"
+            "do", "make", "write", "create", "give", "bring",
+            // 1.4.7 (A3): same false-fragment fix for English
+            // ("volume up", "brightness increase" are complete).
+            "increase", "decrease", "raise", "lower", "up", "down"
         )
 
         private val QUESTION_TOKENS: Set<String> = setOf(

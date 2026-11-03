@@ -201,6 +201,25 @@ class AlwaysOnMicManager(
     @Volatile
     private var deepgramSuspended: Boolean = false
     private var deepgramFallbackTried: Boolean = false
+    // 1.4.7 (A1): Deepgram SEGMENT assembly. Deepgram restarts its
+    // cumulative transcript at every utterance segment, but the
+    // turn is the WHOLE multi-segment utterance: without assembly,
+    // a later segment's interim REPLACED the buffer and the first
+    // segment's words were lost ("adha baat"). The manager now
+    // assembles completed segments' finals + the current segment's
+    // cumulative text, and feeds TurnDetector that cumulative turn
+    // text (replace is then correct).
+    private var completedSegmentsText: String = ""
+    private var lastSegmentFinalText: String? = null
+    private var segmentFinalSeen: Boolean = false
+    // 1.4.7 (A2): audio captured while the stream was NOT ready
+    // (idle-suspended, connecting, or reconnect-backing-off) is
+    // buffered, not discarded — the utterance that triggers a
+    // resume used to be lost ("kabhi nahi catch"). Capped at 80
+    // x 100ms chunks (8s, oldest dropped); flushed in order by
+    // the pump before live audio once the stream opens.
+    private val suspendAudioLock = Any()
+    private val suspendAudioChunks: ArrayDeque<ByteArray> = ArrayDeque()
     // 1.4.5 (FINAL policy): NO terminal-stop design any more.
     // A Deepgram failure while the user-enabled loop runs enters
     // RECONNECTING (visible banner + capped exponential backoff
@@ -343,6 +362,7 @@ class AlwaysOnMicManager(
                 is TurnOutcome.Complete -> {
                     val text = outcome.text
                     turnDetector.reset()
+                    resetTurnAssembly()
                     resetLanguageToPrimary()
                     if (TurnDetector.isMicStopCommand(text)) {
                         // TurnDetector.check already fast-tracks
@@ -415,6 +435,7 @@ class AlwaysOnMicManager(
         reconnectAttempt = 0
         quarantinedWhileSpeaking.clear()
         turnDetector.reset()
+        resetTurnAssembly()
         resetLanguageToPrimary()
         deepgramFallbackTried = false
         sttPath = "deepgram"
@@ -552,6 +573,7 @@ class AlwaysOnMicManager(
         listener.onListeningStateChanged(false)
         stopVadMonitor()
         turnDetector.reset()
+        resetTurnAssembly()
         listener.onMicError(reason)
     }
 
@@ -606,6 +628,7 @@ class AlwaysOnMicManager(
         deepgramConnecting = false
         deepgramActive = false
         deepgramSuspended = false
+        synchronized(suspendAudioLock) { suspendAudioChunks.clear() }
         runCatching { deepgramClient?.close() }
         deepgramClient = null
         val record = deepgramRecord
@@ -613,6 +636,76 @@ class AlwaysOnMicManager(
         runCatching { record?.stop() }
         runCatching { record?.release() }
         deepgramPumpThread = null
+    }
+
+    /**
+     * 1.4.7 (A2): sends buffered not-ready audio (oldest first)
+     * to the live stream, in order, before live audio. Called
+     * ONLY from the pump thread when the stream is ready, so
+     * ordering against live chunks is exact. One diagnostic
+     * line proves the flush on the phone.
+     */
+    private fun drainSuspendBufferToStream() {
+        val chunks: List<ByteArray>
+        synchronized(suspendAudioLock) {
+            if (suspendAudioChunks.isEmpty()) return
+            chunks = suspendAudioChunks.toList()
+            suspendAudioChunks.clear()
+        }
+        val client = deepgramClient ?: return
+        var sent = 0
+        for (chunk in chunks) {
+            if (client.sendPcm(chunk, chunk.size)) sent++
+        }
+        if (sent > 0) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "SUSPEND_AUDIO_FLUSHED",
+                "Flushed $sent buffered chunks (~${sent * 100}ms) captured while the stream was not ready."
+            )
+        }
+    }
+
+    /** Clears the 1.4.7 segment-assembly state with the turn. */
+    private fun resetTurnAssembly() {
+        completedSegmentsText = ""
+        lastSegmentFinalText = null
+        segmentFinalSeen = false
+    }
+
+    /**
+     * 1.4.7 (A1): feeds one Deepgram transcript through the
+     * segment assembler and into TurnDetector as the cumulative
+     * TURN text. Finals append their segment to
+     * [completedSegmentsText] (duplicate re-sends of the same
+     * final, and finals already present as the tail — e.g. via
+     * the speak-quarantine flush — are skipped, never doubled);
+     * interims feed completed-segments + current-segment text.
+     * Returns false only when the transcript was a skipped
+     * duplicate (caller then posts no partial line).
+     */
+    private fun feedAssembled(text: String, isFinal: Boolean, nowMs: Long): Boolean {
+        val fedText: String? = if (isFinal) {
+            if ((segmentFinalSeen && text == lastSegmentFinalText) ||
+                completedSegmentsText == text ||
+                completedSegmentsText.endsWith(" $text")
+            ) {
+                null
+            } else {
+                completedSegmentsText = if (completedSegmentsText.isBlank()) text
+                    else "$completedSegmentsText $text"
+                lastSegmentFinalText = text
+                segmentFinalSeen = true
+                completedSegmentsText
+            }
+        } else {
+            segmentFinalSeen = false
+            if (completedSegmentsText.isBlank()) text else "$completedSegmentsText $text"
+        }
+        if (fedText == null) return false
+        if (isFinal) turnDetector.onFinal(fedText, nowMs, false)
+        else turnDetector.onPartial(fedText, nowMs, false)
+        listener.onPartialTranscript(turnDetector.currentText())
+        return true
     }
 
     /** Single shared AudioRecord 16kHz mono: WS sender + VAD tap
@@ -736,13 +829,34 @@ class AlwaysOnMicManager(
                     // the loud gate can see interruptions) and (b)
                     // the quarantine echo filter on flush (see
                     // setSpeaking) + BargeInDetector echo guards.
-                    if (deepgramActive && !deepgramSuspended) {
-                        for (i in 0 until read) {
-                            val v = shorts[i].toInt()
-                            bytes[i * 2] = (v and 0xFF).toByte()
-                            bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
-                        }
+                    // 1.4.7 (A2): stream-ready gating + suspend
+                    // buffering. Audio streams ONLY when the
+                    // stream is live AND ready (active, not
+                    // suspended, not connecting, not backing
+                    // off); otherwise it is BUFFERED (cap 8s,
+                    // oldest dropped) while the stream is merely
+                    // not ready yet, and discarded only when the
+                    // loop is not running at all. The pump flushes
+                    // the buffer in order before live audio once
+                    // ready, so the utterance that triggered a
+                    // resume is transcribed instead of lost.
+                    for (i in 0 until read) {
+                        val v = shorts[i].toInt()
+                        bytes[i * 2] = (v and 0xFF).toByte()
+                        bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                    }
+                    val streamReady = deepgramActive && !deepgramSuspended &&
+                        !deepgramConnecting && !reconnecting && deepgramClient != null
+                    if (streamReady) {
+                        drainSuspendBufferToStream()
                         deepgramClient?.sendPcm(bytes, read * 2)
+                    } else if (deepgramSuspended || deepgramConnecting || reconnecting) {
+                        synchronized(suspendAudioLock) {
+                            if (suspendAudioChunks.size >= MAX_SUSPEND_CHUNKS) {
+                                suspendAudioChunks.removeFirst()
+                            }
+                            suspendAudioChunks.addLast(bytes.copyOf(read * 2))
+                        }
                     }
                     // Idle-suspend (cost): 2 min without any
                     // transcript — WS closes, pump + VAD stay.
@@ -853,6 +967,7 @@ class AlwaysOnMicManager(
         listener.onListeningStateChanged(false)
         stopVadMonitor()
         turnDetector.reset()
+        resetTurnAssembly()
     }
 
     /** Releases everything; call from the owning service's onDestroy. */
@@ -913,13 +1028,13 @@ class AlwaysOnMicManager(
                 val nowMs = System.currentTimeMillis()
                 for (item in held) {
                     if (spoken.isNotBlank() && isEchoOfSpoken(item.text, spoken)) continue
-                    if (item.isFinal) {
-                        turnDetector.onFinal(item.text, nowMs, true)
-                    } else {
-                        turnDetector.onPartial(item.text, nowMs, true)
-                    }
+                    // 1.4.7 (A1): held items go through the same
+                    // segment assembler as live transcripts, so
+                    // the post-speech turn continues from them
+                    // instead of a later live transcript
+                    // replacing them.
+                    feedAssembled(item.text, item.isFinal, nowMs)
                 }
-                listener.onPartialTranscript(turnDetector.currentText())
             }
         }
     }
@@ -1004,11 +1119,17 @@ class AlwaysOnMicManager(
             if (remainder.isNotEmpty()) {
                 // "ruk, youtube band karo" -> the follow-up command
                 // seeds the next turn; a bare "ruk" seeds nothing.
+                // 1.4.7 (A1): the assembly seeds from the remainder
+                // too, so a following live transcript continues
+                // from it instead of replacing it.
                 turnDetector.reset()
+                resetTurnAssembly()
                 turnDetector.onPartial(remainder, System.currentTimeMillis(), isNewSession = true)
+                completedSegmentsText = remainder
                 listener.onPartialTranscript(remainder)
             } else {
                 turnDetector.reset()
+                resetTurnAssembly()
             }
             return
         }
@@ -1024,15 +1145,13 @@ class AlwaysOnMicManager(
             quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
             return
         }
-        val nowMs = System.currentTimeMillis()
-        val isNewSession = lastPartialSessionId != currentSessionId
-        if (isFinal) {
-            turnDetector.onFinal(text, nowMs, isNewSession)
-        } else {
-            turnDetector.onPartial(text, nowMs, isNewSession)
-        }
-        lastPartialSessionId = currentSessionId
-        listener.onPartialTranscript(turnDetector.currentText())
+        // 1.4.7 (A1): Deepgram segments are assembled into the
+        // cumulative turn text (see feedAssembled) — the old
+        // isNewSession flag never changed in the Deepgram loop
+        // (currentSessionId is never incremented), so a later
+        // segment's interim replaced the buffer and the first
+        // segment's words were lost.
+        feedAssembled(text, isFinal, System.currentTimeMillis())
     }
 
     /**
@@ -1313,6 +1432,9 @@ class AlwaysOnMicManager(
         /** 1.4.3: silence after which the Deepgram WS suspends
          *  (cost) while the pump + VAD tap keep running. */
         const val IDLE_SUSPEND_MS: Long = 120_000L
+        /** 1.4.7 (A2): not-ready audio buffer cap — 80 x 100ms
+         *  chunks = 8s (256KB), oldest dropped. */
+        const val MAX_SUSPEND_CHUNKS: Int = 80
 
     }
 }

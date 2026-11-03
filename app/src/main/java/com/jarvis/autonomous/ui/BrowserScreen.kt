@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -174,6 +175,34 @@ fun normalizeBrowserUrl(raw: String): String {
     val host = hostOfUrl(trimmed)
     if (host != null && isLoopbackHost(host)) return "http://$trimmed"
     return "https://$trimmed"
+}
+
+/** 1.4.7 (C): Google is the browser's search engine + home page. */
+const val GOOGLE_HOME_URL: String = "https://www.google.com"
+const val GOOGLE_SEARCH_URL: String = "https://www.google.com/search?q="
+
+/**
+ * 1.4.7 (C): maps Browser-tab input to a loadable target. A real
+ * URL/domain loads as-is (existing normalize rules); ANYTHING
+ * else — words with spaces, a single word, a phrase — is a Google
+ * search, because the old code prefixed "https://" onto search
+ * text ("https://weather today") and the WebView errored, so
+ * "kuch search nahi hota" was literally true for every query.
+ */
+fun browserTargetForInput(raw: String): String {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return ""
+    val lower = trimmed.lowercase()
+    if (lower.startsWith("http://") || lower.startsWith("https://")) return trimmed
+    if (lower.contains("://")) return ""
+    if (trimmed.any { it.isWhitespace() }) {
+        return GOOGLE_SEARCH_URL + URLEncoder.encode(trimmed, "UTF-8")
+    }
+    val host = hostOfUrl(trimmed)
+    if (host != null && (isLoopbackHost(host) || host.contains("."))) {
+        return normalizeBrowserUrl(trimmed)
+    }
+    return GOOGLE_SEARCH_URL + URLEncoder.encode(trimmed, "UTF-8")
 }
 
 /** Host of a URL with or without a scheme ("example.com:8080/x" ->
@@ -978,6 +1007,14 @@ fun JarvisWebView(
         factory = { ctx ->
             val shared = JarvisBackgroundBrowser.obtainWebView(ctx)
             (shared.parent as? ViewGroup)?.removeView(shared)
+            // 1.4.7 (C): a truly fresh tab (no target, WebView never
+            // loaded) opens on Google — the old blank tab loaded
+            // nothing at all. An already-loaded page (e.g. a
+            // Projects preview) is never clobbered: this fires only
+            // when the shared WebView has no URL yet.
+            if (targetUrl.isBlank() && shared.url.isNullOrBlank()) {
+                shared.loadUrl(GOOGLE_HOME_URL)
+            }
             holder[0] = shared
             onWebViewReady(shared)
             shared
@@ -1050,7 +1087,9 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
 
     // --- Helpers (after the state they mutate).
     fun navigateTo(raw: String) {
-        val normalized = normalizeBrowserUrl(raw)
+        // 1.4.7 (C): search text goes to Google (see
+        // browserTargetForInput); URLs/domains load as before.
+        val normalized = browserTargetForInput(raw)
         if (normalized.isEmpty()) {
             statusMessage = "Ye URL nahi khol sakta — sirf http/https pages allowed hain."
             return
@@ -1112,7 +1151,7 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
             OutlinedTextField(
                 value = urlInput,
                 onValueChange = { urlInput = it },
-                label = { Text("URL ya domain (e.g. example.com)") },
+                label = { Text("Search ya URL — Google par search hoga") },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
@@ -1233,7 +1272,7 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
         }
         if (currentUrl.isBlank()) {
             Text(
-                text = "Upar URL likh kar Go dabao — ya Jarvis se kaho ki koi page khole.",
+                text = "Upar search ya URL likh kar Go dabao — Google par khulega — ya Jarvis se kaho ki koi page khole.",
                 fontSize = 13.sp,
                 color = Color(0xFF3B2F2A)
             )

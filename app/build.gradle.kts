@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "1.4.6-PRO"
+        versionCode = 15
+        versionName = "1.4.7-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala

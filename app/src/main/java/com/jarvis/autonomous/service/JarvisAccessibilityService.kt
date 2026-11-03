@@ -832,7 +832,8 @@ class JarvisAccessibilityService : AccessibilityService() {
             Uri.parse("https://wa.me/91$digits?text=${Uri.encode(message)}")
         ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
         runCatching { startActivity(intent) }.onFailure { return false }
-        kotlinx.coroutines.delay(3000L)
+        // 1.4.7 (B): no blind 3000ms wait — the send-button poll
+        // below re-snapshots itself (3 x 1800ms).
         repeat(3) { attempt ->
             val snapshot = captureScreenSnapshot()
             val sendButton = snapshot.elements.firstOrNull { el ->

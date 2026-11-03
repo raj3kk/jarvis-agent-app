@@ -378,7 +378,10 @@ class JarvisAgentEngine(
                             speak("YouTube nahi khul paya.")
                             return@launch
                         }
-                        kotlinx.coroutines.delay(3000L)
+                        // 1.4.7 (B): no blind 3000ms wait here —
+                        // findFirstYouTubeVideo polls fresh
+                        // snapshots itself (3 x 1800ms), so the
+                        // blind wait only added 3s on every path.
                         val video = acc.findFirstYouTubeVideo()
                         if (video == null) {
                             speak("Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
@@ -1121,6 +1124,11 @@ class JarvisAgentEngine(
                     "[${it.packageName}] ${it.title}: ${it.text}"
                 }
 
+                // 1.4.7 (B): per-step LLM timing, so "task step
+                // slow hai" is measurable from the log instead of
+                // guessed (network + model latency dominates a
+                // step; snapshot + execution are local).
+                val llmStartMs = System.currentTimeMillis()
                 val decision = llmClient.decideNextStep(
                     userGoal = if (step == 1 && memoryContext.isNotBlank()) {
                         "$currentGoal\n(Pehli baat-cheet se yaad: $memoryContext)"
@@ -1136,9 +1144,10 @@ class JarvisAgentEngine(
                     isStuckWarning = isStuck,
                     screenImageBase64 = visionBase64
                 )
+                val llmMs = System.currentTimeMillis() - llmStartMs
 
                 JarvisStateRepository.addLog(
-                    "Step $step Decision: action=${decision.action}, thought=${decision.thought}, kind=${decision.decisionKind}"
+                    "Step $step Decision: action=${decision.action}, thought=${decision.thought}, kind=${decision.decisionKind}, llmMs=$llmMs"
                 )
 
                 // A-C6 / A-M1 / A-M2: error kinds NEVER complete,
@@ -1460,13 +1469,16 @@ class JarvisAgentEngine(
         return when (d.action) {
             "OPEN_APP" -> {
                 val ok = acc?.launchApp(d.appName) ?: false
-                delay(800L) // Cold start is observed on the next step anyway
+                // 1.4.7 (B): no 800ms blind wait — the next loop
+                // step re-snapshots and observes the cold start
+                // (the old comment said exactly this).
                 "OPEN_APP('${d.appName}') -> success=$ok"
             }
 
             "YOUTUBE_SEARCH" -> {
                 val ok = acc?.searchYouTube(d.text.ifBlank { d.appName }) ?: false
-                delay(900L)
+                // 1.4.7 (B): no 900ms blind wait — the next loop
+                // step re-snapshots and observes the results.
                 "YOUTUBE_SEARCH('${d.text}') -> success=$ok"
             }
 
@@ -1475,7 +1487,8 @@ class JarvisAgentEngine(
                 // confirm — the voice routine path asks first instead).
                 val query = d.text.ifBlank { d.appName }
                 val opened = acc?.searchYouTube(query) ?: false
-                delay(3000L)
+                // 1.4.7 (B): no blind 3000ms wait — the poll
+                // inside findFirstYouTubeVideo covers the load.
                 val video = acc?.findFirstYouTubeVideo()
                 val ok = if (video != null) acc.tapNode(video.id) else false
                 "YOUTUBE_PLAY('$query') -> opened=$opened, video='${video?.text?.ifBlank { video?.contentDesc }}', played=$ok"
@@ -1508,7 +1521,8 @@ class JarvisAgentEngine(
                         "OPEN_URL awaiting approval for '$url'"
                     } else {
                         val ok = acc?.openUrlOrDeepLink(url) ?: false
-                        delay(800L)
+                        // 1.4.7 (B): no 800ms blind wait — the next
+                        // loop step re-snapshots the opened page.
                         "OPEN_URL('$url') -> success=$ok ($kind)"
                     }
                 }
