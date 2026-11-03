@@ -547,6 +547,16 @@ class JarvisAgentEngine(
         val trimmed = rawCommand.trim()
         if (trimmed.isEmpty()) return
 
+        // 1.4.4 startup guard: this is the single choke point for
+        // ALL user commands (mic turn, typed text, wake word,
+        // routine button) — once one arrives, agent HOME/BACK
+        // navigation is allowed for the rest of this session.
+        // The command TEXT is never logged (privacy).
+        com.jarvis.autonomous.data.LaunchSession.markUserCommand()
+        JarvisStateRepository.addDiagnostic(
+            "cmd", "USER_CMD", "User command received (text never logged)."
+        )
+
         // Check for immediate stop command
         // 1.4.3: transliterate ONLY the matching variable so a
         // Devanagari transcript ("रुक", "दिखाओ") matches the

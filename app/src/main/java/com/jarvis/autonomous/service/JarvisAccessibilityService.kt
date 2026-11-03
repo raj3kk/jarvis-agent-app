@@ -382,7 +382,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Global system navigation actions.
+     *  Global system navigation actions.
      * 1.4.3 home-redirect hardening: (a) the action is recorded
      * to PERSISTED Diagnostics BEFORE it fires, so a "speaking
      * dikhte hi home" repro is decidable (NAV_EXEC present =
@@ -393,9 +393,40 @@ class JarvisAccessibilityService : AccessibilityService() {
      * LOCK_SCREEN/SCREENSHOT fallbacks to HOME are removed for
      * the same reason (a substitute HOME press is never what
      * the caller asked for).
+     * 1.4.4 launch-bounce guard: HOME/BACK are BLOCKED until a
+     * user command arrived this session AND first UI composed
+     * (NAV_BLOCKED_STARTUP, never NAV_EXEC) — see
+     * LaunchBounceCatcher.kt for the full launch reading guide
+     * (LAUNCH_START without LAUNCH_UI = died during startup;
+     * LAUNCH_UI then nothing = process killed; NAV_EXEC HOME
+     * before any USER_CMD = startup agent action).
      */
     fun performSystemNavigation(navAction: String): Boolean {
         val target = navAction.uppercase()
+        // 1.4.4 "back na ho" startup guard: until the user has
+        // issued a command in THIS session AND the first UI has
+        // been composed, NO agent path may press HOME or BACK —
+        // a launch bounce must never be caused (or worsened) by
+        // the agent itself. Blocked attempts write
+        // NAV_BLOCKED_STARTUP and return false; they NEVER
+        // silently succeed and NEVER write NAV_EXEC (NAV_EXEC
+        // means "actually pressed"). The hardware Back button is
+        // NOT affected — this guard covers only the agent /
+        // accessibility path. After the first user command, normal
+        // in-task navigation works exactly as before.
+        if ((target == "HOME" || target == "BACK") &&
+            !(com.jarvis.autonomous.data.LaunchSession.userCommandIssued &&
+                com.jarvis.autonomous.data.LaunchSession.uiStable)
+        ) {
+            JarvisStateRepository.addDiagnostic(
+                "nav", "NAV_BLOCKED_STARTUP",
+                "Blocked $target at startup: userCommandIssued=" +
+                    "${com.jarvis.autonomous.data.LaunchSession.userCommandIssued} " +
+                    "uiStable=${com.jarvis.autonomous.data.LaunchSession.uiStable} " +
+                    "— no user command yet this session, nothing pressed."
+            )
+            return false
+        }
         JarvisStateRepository.addDiagnostic(
             "nav", "NAV_EXEC", "System navigation requested: $target"
         )

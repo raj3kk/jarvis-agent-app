@@ -86,6 +86,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -118,6 +119,11 @@ import com.jarvis.autonomous.voice.KokoroTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.LaunchSession
+import com.jarvis.autonomous.data.PreviousBounce
+import com.jarvis.autonomous.data.buildBounceReportText
+import com.jarvis.autonomous.data.detectPreviousBounce
+import com.jarvis.autonomous.data.writeBounceReportFile
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisForegroundService
 import com.jarvis.autonomous.service.JarvisWhiteboardService
@@ -143,6 +149,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 1.4.4 launch-bounce catcher: FIRST line — a launcher tap
+        // writes this before ANY service/greeting/composition work,
+        // so a bounce that kills the process mid-startup still
+        // leaves a start marker with no LAUNCH_UI after it.
+        JarvisStateRepository.addDiagnostic(
+            "launch", "LAUNCH_START", "MainActivity created (launcher tap)."
+        )
         startJarvisBackgroundService()
         // 1.4.3: startup greeting — the service speaks it once
         // per service lifetime (ACTION_GREET is a no-op on
@@ -236,6 +249,20 @@ fun JarvisMainApp(
     val context = LocalContext.current
     val prefs = remember { JarvisPreferences(context) }
     var selectedTab by remember { mutableIntStateOf(0) }
+
+    // 1.4.4 launch-bounce catcher: first composition = first UI.
+    // Written ONCE per process (guarded by LaunchSession) — a
+    // previous session with LAUNCH_START but no LAUNCH_UI died
+    // during startup. This is composition, not a drawn frame;
+    // that distinction is documented, not hidden.
+    LaunchedEffect(Unit) {
+        if (!LaunchSession.uiStable) {
+            LaunchSession.markUiStable()
+            JarvisStateRepository.addDiagnostic(
+                "launch", "LAUNCH_UI", "First UI composition shown."
+            )
+        }
+    }
 
     // 1.4.0 wiring: ONE shared browser host for Browser + Projects tabs.
     val browserHost = remember { BrowserHostState() }
@@ -611,6 +638,83 @@ fun CommandCenterScreen(
                 .weight(1f)
                 .verticalScroll(rememberScrollState())
         ) {
+        // 1.4.4 launch-bounce catcher — FIRST card, before greeting
+        // and tasks: if the previous session bounced (died during
+        // startup, crashed, or was killed after UI), the user gets
+        // the report HERE with a Copy button immediately — even if
+        // the app bounces again seconds later. Detection runs once
+        // per process; the same report is ALSO written to a file
+        // the user can copy from a file manager without the app
+        // staying open at all (see writeBounceReportFile).
+        var bounceInfo by remember { mutableStateOf<PreviousBounce?>(LaunchSession.bounce) }
+        var bounceFilePath by remember { mutableStateOf(LaunchSession.bounceFilePath) }
+        var bounceDismissed by remember { mutableStateOf(LaunchSession.bounceDismissed) }
+        var bounceCopiedNote by remember { mutableStateOf("") }
+        LaunchedEffect(Unit) {
+            if (!LaunchSession.bounceChecked) {
+                val found = withContext(Dispatchers.IO) { detectPreviousBounce() }
+                LaunchSession.bounce = found
+                if (found != null) {
+                    val text = buildBounceReportText(found)
+                    val path = withContext(Dispatchers.IO) {
+                        writeBounceReportFile(whiteboardContext, text)
+                    }
+                    LaunchSession.bounceFilePath = path
+                    bounceFilePath = path
+                }
+                LaunchSession.bounceChecked = true
+                bounceInfo = found
+            }
+        }
+        if (bounceInfo != null && !bounceDismissed) {
+            val bounce = bounceInfo!!
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFDECEA))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Pichhli baar app khulte hi band ho gaya tha — ye report mujhe bhej do",
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFFB3261E)
+                    )
+                    Text("Wajah: ${bounce.classification}", fontSize = 12.sp, color = Color(0xFF3B2F2A))
+                    Text(bounce.detail, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = Color(0xFF8A7A70))
+                    Text(
+                        "File me bhi saved: $bounceFilePath",
+                        fontSize = 11.sp, color = Color(0xFF8A7A70)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val cm = whiteboardContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as ClipboardManager
+                                cm.setPrimaryClip(
+                                    ClipData.newPlainText(
+                                        "Jarvis bounce report", buildBounceReportText(bounce)
+                                    )
+                                )
+                                bounceCopiedNote = "Copied — ab mujhe paste kar do."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB3261E))
+                        ) {
+                            Text("Copy bounce report", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                LaunchSession.bounceDismissed = true
+                                bounceDismissed = true
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Band karo", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                    if (bounceCopiedNote.isNotBlank()) {
+                        Text(bounceCopiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                }
+            }
+        }
         // Top Header Bar
         Row(
             modifier = Modifier.fillMaxWidth(),
