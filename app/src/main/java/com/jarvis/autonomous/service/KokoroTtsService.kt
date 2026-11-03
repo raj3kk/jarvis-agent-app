@@ -255,6 +255,18 @@ class KokoroTtsService : Service() {
                     // after GENERATE_START), so the promotion
                     // must already be active when generate
                     // starts, not after it.
+                    // 1.4.11: live Test Voice stage relay — while
+                    // this speak runs, every :tts-side tts marker
+                    // is forwarded to the main process over the
+                    // existing MSG_PROGRESS channel (stage code
+                    // only, no text/keys). The main-process
+                    // tracker gates on the open test run, so
+                    // non-test speaks never touch the display.
+                    // Cleared in finally: a later ensure/reset
+                    // must never relay as speak stages.
+                    JarvisStateRepository.ttsStageListener = { code ->
+                        sendProgress(replyTo, code, 0L, 0L, reqId)
+                    }
                     promoteToForeground()
                     scope.launch {
                         try {
@@ -269,6 +281,7 @@ class KokoroTtsService : Service() {
                             // so the main process never hangs.
                             replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
                         } finally {
+                            JarvisStateRepository.ttsStageListener = null
                             speakBusy.set(false)
                             afterSpeakDone()
                         }

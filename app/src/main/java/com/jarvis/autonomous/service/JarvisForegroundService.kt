@@ -22,6 +22,7 @@ import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.TestVoiceStageTracker
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.clearStaleBounceReport
 import com.jarvis.autonomous.data.bounceShareFile
@@ -163,6 +164,14 @@ class JarvisForegroundService : Service() {
             "Speak started (origin=$origin, chars=${text.length})."
         )
         val ok = speakMutex.withLock {
+            // 1.4.11: Test Voice stage arming — POST-mutex, so
+            // a test queued behind a running speak arms only
+            // when its OWN speak actually starts. SPK_START is
+            // pre-mutex and would arm too early, letting the
+            // running speak's SPK_END terminalize the test
+            // with the wrong outcome. Additive only: no speak
+            // logic, threshold, or gate changes.
+            if (origin == "test") TestVoiceStageTracker.onSpeakStarted()
             if (::micManager.isInitialized) {
                 micManager.setSpeaking(true, text)
                 try {

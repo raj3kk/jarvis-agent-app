@@ -12,6 +12,7 @@ import android.os.Message
 import android.os.Messenger
 import android.os.RemoteException
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.TestVoiceStageTracker
 import com.jarvis.autonomous.service.KokoroTtsService
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
@@ -485,6 +486,16 @@ object TtsProcessClient {
                         pending = deferred
                         pendingReq = reqId
                         pendingKind = "SPEAK"
+                        // 1.4.11: live Test Voice stage relay —
+                        // :tts sends MSG_PROGRESS with each stage
+                        // code during this speak; forward it to
+                        // the tracker (which gates on the open
+                        // test run). Copy-progress callbacks for
+                        // ensure/reset are unaffected (separate
+                        // pending kinds, req-id matched).
+                        pendingProgress = { stage, _, _ ->
+                            TestVoiceStageTracker.onTtsStage(stage)
+                        }
                         "CLAIMED"
                     }
                     pendingKind == "ENSURE" || pendingKind == "RESET" -> "WAIT_SETUP"
@@ -551,6 +562,7 @@ object TtsProcessClient {
             synchronized(lock) {
                 if (pending == deferred) {
                     pending = null
+                    pendingProgress = null
                     pendingReq = null
                     pendingKind = null
                 }

@@ -151,6 +151,30 @@ object JarvisStateRepository {
     private val _kokoroLatched = MutableStateFlow(false)
     val kokoroLatched: StateFlow<Boolean> = _kokoroLatched.asStateFlow()
 
+    /**
+     * 1.4.11: Test Voice live stage display (AI Brain Kokoro
+     * card, Test Voice button ke neeche). StateFlow from
+     * TestVoiceStageTracker — null until the first test tap,
+     * then the live stage ("…") during a test and the frozen
+     * terminal result (stage trail + stuck point + kaaran)
+     * until the next test. Derived from existing tts markers
+     * only; Diagnostics tab content is untouched.
+     */
+    val testVoiceStage: StateFlow<TestVoiceStageDisplay?> =
+        TestVoiceStageTracker.stage
+
+    /**
+     * 1.4.11: :tts stage relay listener. Set ONLY by
+     * KokoroTtsService while a MSG_SPEAK runs (cleared in its
+     * finally) — it forwards :tts-side stage codes to the main
+     * process via the existing MSG_PROGRESS channel. Null in
+     * the main process (never set there), so the hook below is
+     * a no-op outside a :tts speak. Volatile: set on the
+     * service handler thread, read on speak IO threads.
+     */
+    @Volatile
+    var ttsStageListener: ((String) -> Unit)? = null
+
     fun setKokoroLatched(value: Boolean) {
         _kokoroLatched.value = value
     }
@@ -235,6 +259,15 @@ object JarvisStateRepository {
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val entry = DiagnosticEntry(time, area, code, clean)
         _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
+        // 1.4.11: Test Voice stage display derives from the
+        // existing tts marker stream (no new speak path, no
+        // polling). runCatching: display tracking must never
+        // break diagnostics. The relay listener is only set in
+        // the :tts process during a speak (null in main).
+        if (area == "tts") {
+            runCatching { TestVoiceStageTracker.onDiagnostic(area, code, clean) }
+            runCatching { ttsStageListener?.invoke(code) }
+        }
         runCatching { JarvisDiagnosticsFile.append(entry) }
         if (area == "llm") _lastLlmError.value = "$code: $clean"
     }
@@ -250,6 +283,13 @@ object JarvisStateRepository {
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val entry = DiagnosticEntry(time, area, code, clean)
         _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
+        // 1.4.11: same Test Voice stage hook as addDiagnostic
+        // (stage markers use the sync variant so they survive
+        // a :tts death — the relay must see them too).
+        if (area == "tts") {
+            runCatching { TestVoiceStageTracker.onDiagnostic(area, code, clean) }
+            runCatching { ttsStageListener?.invoke(code) }
+        }
         runCatching { JarvisDiagnosticsFile.appendSync(entry) }
         if (area == "llm") _lastLlmError.value = "$code: $clean"
     }

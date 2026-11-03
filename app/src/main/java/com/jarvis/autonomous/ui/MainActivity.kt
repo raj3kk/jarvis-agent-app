@@ -1753,6 +1753,13 @@ fun AiBrainSettingsScreen(
             // the bounded-recovery latch is tripped (system voice
             // is speaking instead of Kokoro). Test Voice reopens it.
             val kokoroLatched by JarvisStateRepository.kokoroLatched.collectAsState()
+            // 1.4.11: live Test Voice stage display — event-driven
+            // from TestVoiceStageTracker (existing tts markers +
+            // :tts stage relay, no polling). Null until the first
+            // test tap; then live stage ("…") during a test and
+            // the frozen terminal result (trail + stuck point +
+            // kaaran) until the next test.
+            val testVoiceStage by JarvisStateRepository.testVoiceStage.collectAsState()
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
@@ -1923,6 +1930,33 @@ fun AiBrainSettingsScreen(
                     }
                     if (!kokoroOn) {
                         Text("Test ke liye Kokoro ON karo.", fontSize = 12.sp)
+                    }
+                    // 1.4.11: live stage display, Test Voice button
+                    // ke turant neeche, card ke andar. Live test
+                    // me stage "…" ke saath dikhta hai; khatam
+                    // hone par final result (stage trail + stuck
+                    // point + awaaz na aane ka kaaran) agle test
+                    // tak ruka rehta hai — Diagnostics tab khole
+                    // bina padha ja sakta hai. Ye Diagnostics ka
+                    // replacement nahi, sirf test ka shortcut hai.
+                    // Yahan kabhi spoken text, code, ya key/token
+                    // nahi dikhta — sirf stage labels + kaaran.
+                    val stage = testVoiceStage
+                    if (stage == null) {
+                        Text(
+                            "Test dabao — Kokoro kahan atak raha hai, ye yahan dikhega.",
+                            fontSize = 12.sp
+                        )
+                    } else {
+                        Text(
+                            stage.line1,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            stage.line2,
+                            fontSize = 12.sp
+                        )
                     }
                 }
             }
