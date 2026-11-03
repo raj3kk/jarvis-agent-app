@@ -1,6 +1,8 @@
 package com.jarvis.autonomous.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -85,6 +87,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -107,9 +110,12 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.jarvis.autonomous.BuildConfig
 import com.jarvis.autonomous.R
+import com.jarvis.autonomous.agent.LlmClient
 import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentRunState
+import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.voice.KokoroTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -117,6 +123,9 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisForegroundService
 import com.jarvis.autonomous.service.JarvisWhiteboardService
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 // Creamy whitish theme (user order 2026-11-02): warm cream background,
 // white cards, dark-brown text, terracotta accent — readable in daylight
@@ -146,6 +155,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     JarvisMainApp(
                         onStartVoice = { sendServiceAction(JarvisForegroundService.ACTION_START_LISTENING) },
+                        onStopMic = { sendServiceAction(JarvisForegroundService.ACTION_STOP_LISTENING) },
+                        onRetryMic = { sendServiceAction(JarvisForegroundService.ACTION_RETRY_MIC) },
                         onStopTask = { sendServiceAction(JarvisForegroundService.ACTION_STOP_TASK) },
                         onSendTextCommand = { text ->
                             val intent = Intent(this, JarvisForegroundService::class.java).apply {
@@ -189,7 +200,9 @@ fun JarvisMainApp(
     onStartVoice: () -> Unit,
     onStopTask: () -> Unit,
     onSendTextCommand: (String) -> Unit,
-    onRefreshServiceSettings: () -> Unit
+    onRefreshServiceSettings: () -> Unit,
+    onStopMic: () -> Unit = {},
+    onRetryMic: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember { JarvisPreferences(context) }
@@ -337,7 +350,9 @@ fun JarvisMainApp(
                     onStopTask = onStopTask,
                     onSendTextCommand = onSendTextCommand,
                     onNavigatePermissions = { selectedTab = 1 },
-                    voiceDisabled = micPermissionDenied
+                    voiceDisabled = micPermissionDenied,
+                    onStopMic = onStopMic,
+                    onRetryMic = onRetryMic
                 )
 
                 1 -> PermissionsChecklistScreen()
@@ -489,13 +504,19 @@ fun CommandCenterScreen(
     onSendTextCommand: (String) -> Unit,
     onNavigatePermissions: () -> Unit,
     /** C-B13: true while RECORD_AUDIO is denied — voice UI disabled. */
-    voiceDisabled: Boolean = false
+    voiceDisabled: Boolean = false,
+    /** 1.4.2: mic-off + Retry for a dead loop (see banner below). */
+    onStopMic: () -> Unit = {},
+    onRetryMic: () -> Unit = {}
 ) {
     val agentState by JarvisStateRepository.agentState.collectAsState()
     val currentGoal by JarvisStateRepository.currentGoal.collectAsState()
     val stepInfo by JarvisStateRepository.currentStepInfo.collectAsState()
     val isAccConnected by JarvisStateRepository.isAccessibilityConnected.collectAsState()
     val chatHistory by JarvisStateRepository.chatHistory.collectAsState()
+    // 1.4.2: terminal mic death banner state (service-written).
+    val micFatal by JarvisStateRepository.micFatal.collectAsState()
+    val micLoopEnabled by JarvisStateRepository.micLoopEnabled.collectAsState()
 
     var textInput by remember { mutableStateOf("") }
     val whiteboardContext = LocalContext.current
@@ -562,6 +583,74 @@ fun CommandCenterScreen(
         }
 
         Spacer(modifier = Modifier.height(6.dp))
+
+        // 1.4.2 terminal mic death banner: the old UI showed
+        // NOTHING when the recognizer died terminally — the user
+        // saw on/off/on flapping and silence. This banner names
+        // the reason + raw code, offers Retry (fresh start, not
+        // the no-op re-tap), and a Mic Off button (previously
+        // buttons only ever sent START).
+        if (micFatal != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFCE8E6))
+            ) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Mic band ho gaya",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = Color(0xFFB3261E)
+                    )
+                    Text(
+                        text = micFatal!!.reason,
+                        fontSize = 12.sp,
+                        color = Color(0xFF3B2F2A)
+                    )
+                    Text(
+                        text = "Recognizer error code: ${micFatal!!.code}",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF8A7A70)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onRetryMic,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                        ) {
+                            Text("Retry mic", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = onStopMic,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Mic off", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        } else if (micLoopEnabled) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                Button(
+                    onClick = onStopMic,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70)),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        horizontal = 12.dp,
+                        vertical = 4.dp
+                    ),
+                    modifier = Modifier.height(30.dp)
+                ) {
+                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(14.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Mic off", fontSize = 11.sp)
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
 
         // Jarvis persona avatar (uploaded image) with a 3D-look:
         // Compact on purpose (was 190x220): on small phones the tall
@@ -1520,6 +1609,72 @@ fun AiBrainSettingsScreen(
         if (saveBanner.isNotEmpty()) {
             Text(saveBanner, color = Color(0xFF2E7D5B), fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
+
+        // 1.4.2: "Gemini lagane ke baad bhi kaam nahi karta" had
+        // three indistinguishable causes — Save never pressed
+        // (fields are remember state until Save), provider still
+        // LOCAL Gemma, or a restricted/disabled key (400/403).
+        // This card names the SAVED state (not the edited fields)
+        // and tests the saved key with one cheap call, showing the
+        // HTTP result VERBATIM. The key itself is never shown.
+        run {
+            val testContext = LocalContext.current
+            val testScope = rememberCoroutineScope()
+            var testResult by remember { mutableStateOf("") }
+            var testBusy by remember { mutableStateOf(false) }
+            val lastLlmError by JarvisStateRepository.lastLlmError.collectAsState()
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Saved AI Brain state (yehi chalta hai, edited fields nahi)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(
+                        text = "Provider: ${prefs.provider.displayName} · Model: ${prefs.modelName} · " +
+                            "Key saved: ${if (prefs.apiKey.isNotBlank()) "yes" else "NO — key khaali hai"}",
+                        fontSize = 12.sp
+                    )
+                    if (lastLlmError != null) {
+                        Text(
+                            text = "Last LLM error: $lastLlmError",
+                            fontSize = 12.sp,
+                            color = Color(0xFFB3261E)
+                        )
+                    } else {
+                        Text(
+                            text = "Last LLM error: none recorded",
+                            fontSize = 12.sp,
+                            color = Color(0xFF2E7D5B)
+                        )
+                    }
+                    Button(
+                        enabled = !testBusy,
+                        onClick = {
+                            testBusy = true
+                            testResult = "Testing…"
+                            testScope.launch(Dispatchers.IO) {
+                                val result = LlmClient(testContext, prefs).testApiKey()
+                                testResult = result
+                                testBusy = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Test key", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (testResult.isNotBlank()) {
+                        Text(testResult, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Text(
+                        text = "Note: fields upar edit karne ke baad SAVE dabana zaroori hai — " +
+                            "bina Save ke test purani saved key par chalega.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1710,7 +1865,158 @@ fun MemoryRoutinesLogsScreen(
                 }
             }
         }
+
+        // Section 4 (1.4.2): Diagnostics / Bug report — INSIDE this
+        // tab on purpose, NOT a new bottom-bar tab (8 already crowd
+        // small screens). Nothing here auto-uploads or phones home:
+        // the user copies the report manually and pastes it back.
+        run {
+            val diagContext = LocalContext.current
+            val diagnostics by JarvisStateRepository.diagnostics.collectAsState()
+            val micFatalState by JarvisStateRepository.micFatal.collectAsState()
+            val micLoopOn by JarvisStateRepository.micLoopEnabled.collectAsState()
+            val micLive by JarvisStateRepository.micListening.collectAsState()
+            var copiedNote by remember { mutableStateOf("") }
+            var lastCrash by remember {
+                mutableStateOf(JarvisDiagnosticsFile.readLastCrash())
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Diagnostics / Bug report", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFFB85C38))
+                    Text(
+                        text = "Kuch gadbad ho to COPY dabao aur report mujhe bhej do. " +
+                            "Isme kabhi key, token, poori licence key, contact, message " +
+                            "ya photo nahi aata — sirf states, codes aur last lines.",
+                        fontSize = 12.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                    Text(
+                        text = "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
+                            "last error code=${micFatalState?.code?.toString() ?: "none"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Overlay now: ${if (diagContext.let {
+                            android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M ||
+                                android.provider.Settings.canDrawOverlays(it)
+                        }) "GRANTED" else "NOT GRANTED"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Diagnostics lines: ${diagnostics.size} · Last crash: ${lastCrash?.take(160) ?: "none"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val report = buildDiagnosticsReport(
+                                    diagContext, prefs, diagnostics,
+                                    micFatalState, micLoopOn, micLive, lastCrash
+                                )
+                                val cm = diagContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as ClipboardManager
+                                cm.setPrimaryClip(
+                                    ClipData.newPlainText("Jarvis diagnostics", report)
+                                )
+                                copiedNote = "Copied — ab mujhe paste kar do."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                        ) {
+                            Text("Copy bug report", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                JarvisStateRepository.clearDiagnostics()
+                                lastCrash = null
+                                copiedNote = "Diagnostics cleared."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Clear", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                    if (copiedNote.isNotBlank()) {
+                        Text(copiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                    diagnostics.takeLast(20).reversed().forEach { entry ->
+                        Text(
+                            text = "[${entry.time}] ${entry.area}/${entry.code}: ${entry.message}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF8A7A70)
+                        )
+                    }
+                }
+            }
+        }
     }
+}
+
+/**
+ * 1.4.2 bug-report text. ALLOWED: app version/versionCode, Android
+ * SDK + device model, timestamp, mic state, live overlay state +
+ * last overlay failure, licence ACTIVE/UNBOUND only (key masked to
+ * first/last 4 chars AT MOST — blank when none saved), provider +
+ * model name, last ~50 diagnostics lines, last crash if any.
+ * FORBIDDEN and never built here: API keys, HF token, full licence
+ * key, passwords, contact names/numbers, message/notification text,
+ * URLs containing keys, screen-tree content, image data.
+ */
+private fun buildDiagnosticsReport(
+    context: Context,
+    prefs: JarvisPreferences,
+    diagnostics: List<com.jarvis.autonomous.data.DiagnosticEntry>,
+    micFatal: com.jarvis.autonomous.data.MicFatalState?,
+    micLoopOn: Boolean,
+    micLive: Boolean,
+    lastCrash: String?
+): String {
+    val sb = StringBuilder()
+    sb.appendLine("=== Jarvis bug report ===")
+    sb.appendLine("App: ${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})")
+    sb.appendLine("Android SDK: ${Build.VERSION.SDK_INT} · Model: ${Build.MODEL}")
+    sb.appendLine(
+        "Time: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+    )
+    sb.appendLine(
+        "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
+            "last recognizer error code=${micFatal?.code?.toString() ?: "none"} · " +
+            "last reason=${micFatal?.reason ?: "none"}"
+    )
+    val overlayNow = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+        android.provider.Settings.canDrawOverlays(context)
+    val lastOverlayFailure = diagnostics.lastOrNull { it.area == "overlay" }
+    sb.appendLine(
+        "Overlay: now=${if (overlayNow) "GRANTED" else "NOT GRANTED"} · " +
+            "last failure=${lastOverlayFailure?.let { "${it.code}: ${it.message}" } ?: "none"}"
+    )
+    val licencePrefs = context.getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
+    val rawKey = licencePrefs.getString("licence_key", "").orEmpty()
+    val activated = licencePrefs.getBoolean("licence_activated", false)
+    val maskedKey = when {
+        rawKey.isBlank() -> "none saved"
+        rawKey.length <= 8 -> "****"
+        else -> rawKey.take(4) + "…" + rawKey.takeLast(4)
+    }
+    sb.appendLine(
+        "Licence: activated=$activated · key=$maskedKey " +
+            "(full key NEVER included)"
+    )
+    sb.appendLine("Provider: ${prefs.provider.displayName} · Model: ${prefs.modelName} · Key saved: ${prefs.apiKey.isNotBlank()}")
+    sb.appendLine("--- last diagnostics (max 50) ---")
+    diagnostics.takeLast(50).forEach { entry ->
+        sb.appendLine("[${entry.time}] ${entry.area}/${entry.code}: ${entry.message}")
+    }
+    sb.appendLine("--- last crash ---")
+    sb.appendLine(lastCrash ?: "none")
+    sb.appendLine("=== end report (no keys, no contacts, no messages) ===")
+    return sb.toString()
 }
 
 private fun isAccessibilityServiceEnabled(context: Context): Boolean {

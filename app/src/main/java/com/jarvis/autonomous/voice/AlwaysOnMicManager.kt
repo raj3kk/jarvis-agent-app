@@ -134,6 +134,14 @@ class AlwaysOnMicManager(
 
     private var enabled: Boolean = false
     private var listeningActive: Boolean = false
+
+    /** 1.4.2: raw SpeechRecognizer error code of the most recent
+     *  onError (-1 when none). Terminal deaths previously surfaced
+     *  only a reason string, so the code was lost before any UI
+     *  could name it — the bug catcher and the Retry banner read
+     *  this, and the diagnostics store records it. */
+    var lastRecognizerErrorCode: Int = -1
+        private set
     private var currentSessionId: Int = 0
     private var lastPartialSessionId: Int = -1
     private var restartPending: Boolean = false
@@ -255,6 +263,10 @@ class AlwaysOnMicManager(
 
         override fun onError(error: Int) {
             listeningActive = false
+            // 1.4.2: keep the raw code — the old code passed only a
+            // string onward, so the banner/diagnostics could never
+            // name ERROR_NETWORK vs ERROR_SERVER vs permission.
+            lastRecognizerErrorCode = error
             listener.onListeningStateChanged(false)
             if (!enabled) return
             // A-H4: terminal errors stop the loop and surface
@@ -351,6 +363,7 @@ class AlwaysOnMicManager(
      */
     fun start(): Boolean {
         if (enabled) return true
+        lastRecognizerErrorCode = -1
         if (!isRecordAudioGranted()) {
             listener.onMicError("RECORD_AUDIO not granted; mic loop not started.")
             return false
@@ -749,10 +762,10 @@ fun interface StopSpeakingCallback {
  * getVadModelConfig(sampleRate) (top-level function in Vad.kt).
  *
  * HONEST LIMITS — read before enabling:
- * 1. MODEL NOT BUNDLED: Silero VAD needs a silero_vad.onnx model
- *    file. No such file ships in this repo (Kokoro ships its own
- *    TTS models, not a VAD model). If [modelFile] does not exist,
- *    [isAvailable] is false and this class does nothing.
+ * 1. MODEL BUNDLED (1.4.2 correction of a stale comment): CI bundles
+ *    assets/silero_vad.onnx into the APK; when [modelFile] exists,
+ *    [isAvailable] is true and the VAD monitor runs. The old text
+ *    claiming no such file ships was false from 1.4.1 on.
  * 2. MIC SHARING: Android gives the mic to one client at a time in
  *    practice. Running AudioRecord WHILE SpeechRecognizer is
  *    listening can fail (mic busy) or disturb the recognizer.

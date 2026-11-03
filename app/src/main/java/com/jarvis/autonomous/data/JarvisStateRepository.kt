@@ -23,6 +23,27 @@ data class ChatEntry(
     val timestamp: String = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
 )
 
+/** 1.4.2 bug-catcher: one structured diagnostics line. `area` is one
+ *  of mic|overlay|llm|nav|crash. `message` must NEVER contain secrets
+ *  (API keys, tokens, full licence keys, passwords, contact/message
+ *  text, URLs carrying ?key=) — [addDiagnostic] strips key query
+ *  params defensively, but callers must still pass clean values. */
+data class DiagnosticEntry(
+    val time: String,
+    val area: String,
+    val code: String,
+    val message: String
+)
+
+/** 1.4.2: a terminal mic death that the user must SEE (banner +
+ *  spoken reason + Retry), not a log line. `code` is the raw
+ *  SpeechRecognizer error code (-1 when unknown). */
+data class MicFatalState(
+    val reason: String,
+    val code: Int,
+    val timeMs: Long = System.currentTimeMillis()
+)
+
 data class NotificationItem(
     val packageName: String,
     val title: String,
@@ -58,6 +79,66 @@ object JarvisStateRepository {
 
     private val _executionLogs = MutableStateFlow<List<String>>(emptyList())
     val executionLogs: StateFlow<List<String>> = _executionLogs.asStateFlow()
+
+    // 1.4.2 diagnostics store (bug catcher). In-memory mirror of the
+    // persisted diagnostics.jsonl file (see JarvisDiagnosticsFile);
+    // the file survives a crash, this list does not — both are
+    // written on every event so a crash never loses the trail.
+    private val _diagnostics = MutableStateFlow<List<DiagnosticEntry>>(emptyList())
+    val diagnostics: StateFlow<List<DiagnosticEntry>> = _diagnostics.asStateFlow()
+
+    // 1.4.2: last LLM failure, surfaced verbatim (HTTP code + body
+    // message) in AI Brain — never the key, never the request URL.
+    private val _lastLlmError = MutableStateFlow<String?>(null)
+    val lastLlmError: StateFlow<String?> = _lastLlmError.asStateFlow()
+
+    // 1.4.2: terminal mic death + live mic state, written by the
+    // foreground service, read by the command-tab banner.
+    private val _micFatal = MutableStateFlow<MicFatalState?>(null)
+    val micFatal: StateFlow<MicFatalState?> = _micFatal.asStateFlow()
+
+    private val _micLoopEnabled = MutableStateFlow(false)
+    val micLoopEnabled: StateFlow<Boolean> = _micLoopEnabled.asStateFlow()
+
+    private val _micListening = MutableStateFlow(false)
+    val micListening: StateFlow<Boolean> = _micListening.asStateFlow()
+
+    /** Strip anything that could carry a secret: ?key= / &key= query
+     *  params and full URLs with query strings are reduced to the
+     *  path, so a request URL can never leak a key into a report. */
+    fun sanitizeDiagnosticMessage(raw: String): String {
+        var out = raw
+        out = out.replace(Regex("[?&]key=[^&\\s]*"), "")
+        out = out.replace(Regex("https?://[^\\s]*\\?[^\\s]*"), "[url-with-query-stripped]")
+        return out.take(500)
+    }
+
+    fun addDiagnostic(area: String, code: String, message: String) {
+        val clean = sanitizeDiagnosticMessage(message)
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        val entry = DiagnosticEntry(time, area, code, clean)
+        _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
+        runCatching { JarvisDiagnosticsFile.append(entry) }
+        if (area == "llm") _lastLlmError.value = "$code: $clean"
+    }
+
+    fun clearDiagnostics() {
+        _diagnostics.value = emptyList()
+        _lastLlmError.value = null
+        runCatching { JarvisDiagnosticsFile.clear() }
+    }
+
+    fun setMicFatal(state: MicFatalState?) {
+        _micFatal.value = state
+    }
+
+    fun setMicLoopEnabled(enabled: Boolean) {
+        _micLoopEnabled.value = enabled
+    }
+
+    fun setMicListening(listening: Boolean) {
+        _micListening.value = listening
+    }
 
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())
     val recentNotifications: StateFlow<List<NotificationItem>> = _recentNotifications.asStateFlow()

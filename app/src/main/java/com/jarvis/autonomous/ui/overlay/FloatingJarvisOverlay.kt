@@ -181,6 +181,9 @@ class FloatingJarvisOverlay(
      *  (a missing notification permission must not throw here). */
     private fun reportShowFailure(reason: String) {
         JarvisStateRepository.addLog("Jarvis overlay nahi khul paya: $reason")
+        // 1.4.2: the failure also lands in the diagnostics store
+        // (area overlay) so the bug report can name it.
+        JarvisStateRepository.addDiagnostic("overlay", "SHOW_FAILED", reason)
         runCatching {
             val channelId = "jarvis_overlay_channel"
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

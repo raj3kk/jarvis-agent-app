@@ -3,6 +3,7 @@ package com.jarvis.autonomous.agent
 import android.content.Context
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.ProjectStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -127,6 +128,9 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
 
         val apiKey = prefs.apiKey
         if (apiKey.isBlank()) {
+            // 1.4.2: a missing key is a diagnosable state, not just
+            // a chat reply — the bug report names it.
+            JarvisStateRepository.addDiagnostic("llm", "NO_KEY", "API key missing in preferences")
             return@withContext AgentDecision(
                 reply = "Bhai, pehle AI Brain tab mein jaake apni Gemini ya OpenAI/Groq API Key daal de taaki mera dimaag full power pe chal sake!",
                 thought = "API key is missing in preferences",
@@ -240,6 +244,9 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     "API error: $detail.$hint"
                 }
             }
+            // 1.4.2: record the failure for the bug report (HTTP
+            // code + body message only — never the key or URL).
+            JarvisStateRepository.addDiagnostic("llm", kind, detail)
             AgentDecision(
                 reply = reply,
                 thought = "Exception: ${e.message}",
@@ -349,6 +356,58 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
               "isCompleted": false
             }
         """.trimIndent()
+    }
+
+    /**
+     * 1.4.2 "Test key" button (AI Brain): one cheap generateContent
+     * call against the SAVED provider/model/key, returning the HTTP
+     * result VERBATIM (code + body message). The key and the request
+     * URL are NEVER included in the returned string or any log —
+     * only the status and the body's error text, so a 400/403 names
+     * a restricted/disabled key instead of a vague "kaam nahi karta".
+     * Gemini only: other providers get a plain note (their test path
+     * is the normal decide() error surfacing, already recorded).
+     */
+    suspend fun testApiKey(): String {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (prefs.provider != AiProvider.GEMINI) {
+                    return@withContext "Test abhi sirf Gemini provider ke liye hai " +
+                        "(current provider: ${prefs.provider.displayName}). " +
+                        "Gemini chuno, key daal kar Save karo, phir Test dabao."
+                }
+                val key = prefs.apiKey
+                if (key.isBlank()) {
+                    return@withContext "Key khaali hai — pehle AI Brain me key daal kar Save karo."
+                }
+                val model = prefs.modelName
+                val body = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("parts", JSONArray().apply {
+                                put(JSONObject().put("text", "hi"))
+                            })
+                        })
+                    })
+                }.toString()
+                    .toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                    .addHeader("x-goog-api-key", key)
+                    .post(body)
+                    .build()
+                val resp = httpClient.newCall(request).execute()
+                val respBody = resp.body?.string().orEmpty()
+                resp.close()
+                if (resp.isSuccessful) {
+                    "OK (HTTP 200) — key kaam kar rahi hai, model: $model"
+                } else {
+                    "HTTP ${resp.code}: ${respBody.take(300)}"
+                }
+            } catch (e: Exception) {
+                "Network error: ${(e.message ?: "unknown").take(200)}"
+            }
+        }
     }
 
     private fun callGeminiApi(

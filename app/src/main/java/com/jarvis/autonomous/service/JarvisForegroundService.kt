@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.R
@@ -44,6 +45,8 @@ class JarvisForegroundService : Service() {
         const val NOTIFICATION_ID = 1001
 
         const val ACTION_START_LISTENING = "com.jarvis.autonomous.ACTION_START_LISTENING"
+        const val ACTION_STOP_LISTENING = "com.jarvis.autonomous.ACTION_STOP_LISTENING"
+        const val ACTION_RETRY_MIC = "com.jarvis.autonomous.ACTION_RETRY_MIC"
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
         const val ACTION_TEXT_COMMAND = "com.jarvis.autonomous.ACTION_TEXT_COMMAND"
         const val EXTRA_COMMAND_TEXT = "extra_command_text"
@@ -104,6 +107,28 @@ class JarvisForegroundService : Service() {
             } else {
                 voiceManager.speakAndWait(text)
             }
+        }
+    }
+
+    /**
+     * 1.4.2: name the recognizer failure in plain language. The old
+     * code spoke nothing and showed nothing, so ERROR_NETWORK (no
+     * Google voice service) looked identical to a permission loss.
+     * Raw codes: SpeechRecognizer.ERROR_NETWORK=2, ERROR_AUDIO=3,
+     * ERROR_SERVER=4, ERROR_CLIENT=5, ERROR_INSUFFICIENT_PERMISSIONS=9.
+     */
+    private fun micErrorSpeech(code: Int, reason: String): String {
+        return when (code) {
+            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_SERVER ->
+                "Mic band ho gaya — Google voice service nahi mil rahi. " +
+                    "Internet ya Google app check karo, phir Retry dabao."
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                "Mic band ho gaya — microphone permission nahi mili. " +
+                    "Permissions tab se mic permission do, phir Retry dabao."
+            SpeechRecognizer.ERROR_AUDIO, SpeechRecognizer.ERROR_CLIENT ->
+                "Mic band ho gaya — mic kisi aur app ke paas hai ya " +
+                    "recognizer fail ho gaya. Retry dabao."
+            else -> "Mic band ho gaya — $reason Retry dabao."
         }
     }
 
@@ -189,6 +214,11 @@ class JarvisForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 1.4.2: a startup crash used to die silently (no record of
+        // WHICH init step failed — the likely "home redirect" cause).
+        // Record the failure to the persisted diagnostics file first,
+        // then rethrow so crash behaviour itself is unchanged.
+        try {
         prefs = JarvisPreferences(this)
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("JARVIS Active — Listening in background"))
@@ -249,6 +279,10 @@ class JarvisForegroundService : Service() {
 
             override fun onMicStoppedByUser() {
                 JarvisStateRepository.addLog("Mic stopped by user (mic band karo) — task untouched.")
+                // 1.4.2: a user stop clears any fatal banner too.
+                JarvisStateRepository.setMicFatal(null)
+                JarvisStateRepository.setMicLoopEnabled(false)
+                JarvisStateRepository.setMicListening(false)
                 // A-H8: a pending reply dies with the mic; A-M8:
                 // an explicit user stop clears the persisted flag
                 // (service recreation must NOT revive a stopped mic).
@@ -264,11 +298,33 @@ class JarvisForegroundService : Service() {
             }
 
             override fun onListeningStateChanged(listening: Boolean) {
-                // HUD mic dot only.
+                // HUD mic dot only — plus the 1.4.2 diagnostics
+                // mirror so the bug report can state live state.
+                JarvisStateRepository.setMicListening(listening)
             }
 
             override fun onMicError(reason: String) {
+                // 1.4.2: terminal mic death used to end in this
+                // log line ONLY — no banner, no speech, no retry —
+                // which is exactly the reported on/off/on flapping
+                // with silence. Now it is VISIBLE on three channels:
+                // (1) persisted diagnostics entry with the raw
+                // recognizer code, (2) a command-tab banner with a
+                // Retry button, (3) a spoken reason.
+                val code = if (::micManager.isInitialized) {
+                    micManager.lastRecognizerErrorCode
+                } else -1
+                val spoken = micErrorSpeech(code, reason)
                 JarvisStateRepository.addLog("Mic error: $reason")
+                JarvisStateRepository.addDiagnostic("mic", "REC_$code", reason)
+                JarvisStateRepository.setMicFatal(
+                    com.jarvis.autonomous.data.MicFatalState(spoken, code)
+                )
+                JarvisStateRepository.setMicLoopEnabled(false)
+                JarvisStateRepository.setMicListening(false)
+                serviceScope.launch {
+                    runCatching { speakWrapped(spoken) }
+                }
             }
         })
         micManager.setStopSpeakingCallback { voiceManager.stopSpeaking() }
@@ -312,6 +368,16 @@ class JarvisForegroundService : Service() {
 
         JarvisStateRepository.setForegroundRunning(true)
         JarvisStateRepository.addLog("Jarvis Foreground Service started.")
+        } catch (e: Exception) {
+            runCatching {
+                com.jarvis.autonomous.data.JarvisDiagnosticsFile.appendCrash("main", e)
+            }
+            JarvisStateRepository.addDiagnostic(
+                "nav", "STARTUP_CRASH",
+                "Foreground service onCreate failed: ${e.javaClass.simpleName}: ${e.message ?: ""}"
+            )
+            throw e
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -341,12 +407,48 @@ class JarvisForegroundService : Service() {
                     voiceManager.stopListeningInternal()
                     if (micManager.start()) {
                         setMicLoopPersisted(true)
+                        JarvisStateRepository.setMicFatal(null)
+                        JarvisStateRepository.setMicLoopEnabled(true)
                         startVadMonitor()
                     } else {
                         voiceManager.triggerManualVoiceCommand()
                     }
                 } else {
                     voiceManager.triggerManualVoiceCommand()
+                }
+            }
+
+            ACTION_STOP_LISTENING -> {
+                // 1.4.2: the UI had no mic-off button — buttons only
+                // sent START, and start() is a no-op when already
+                // enabled, so a dead loop could never be revived
+                // from the UI. Stop clears the loop AND the fatal
+                // banner; a later start begins fresh.
+                if (::micManager.isInitialized) {
+                    micManager.stop()
+                }
+                setMicLoopPersisted(false)
+                JarvisStateRepository.setMicFatal(null)
+                JarvisStateRepository.setMicLoopEnabled(false)
+                JarvisStateRepository.setMicListening(false)
+                JarvisStateRepository.addLog("Mic stopped from UI (mic off button).")
+            }
+
+            ACTION_RETRY_MIC -> {
+                // 1.4.2: Retry after a terminal death. start() is a
+                // fresh begin here because stopWithError already
+                // cleared `enabled` — it is not the no-op path.
+                if (::micManager.isInitialized) {
+                    voiceManager.stopListeningInternal()
+                    if (micManager.start()) {
+                        setMicLoopPersisted(true)
+                        JarvisStateRepository.setMicFatal(null)
+                        JarvisStateRepository.setMicLoopEnabled(true)
+                        startVadMonitor()
+                        JarvisStateRepository.addLog("Mic restarted from Retry button.")
+                    } else {
+                        JarvisStateRepository.addLog("Mic Retry failed to start the loop.")
+                    }
                 }
             }
 

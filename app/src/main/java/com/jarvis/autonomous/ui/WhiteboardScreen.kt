@@ -42,6 +42,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -135,6 +138,23 @@ fun WhiteboardScreen() {
         WhiteboardStore.init(context)
         canDrawOverlays = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             Settings.canDrawOverlays(context)
+    }
+    // 1.4.2: the old code checked overlay permission ONCE (remember
+    // + LaunchedEffect(Unit)). Granting from this tab's own settings
+    // button and pressing Back never refreshed it, so the tab kept
+    // saying "not granted" while the Permissions tab (which
+    // re-checks on ON_RESUME) correctly showed granted. Same
+    // ON_RESUME pattern as PermissionsChecklistScreen.
+    val whiteboardLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(whiteboardLifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                canDrawOverlays = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                    Settings.canDrawOverlays(context)
+            }
+        }
+        whiteboardLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { whiteboardLifecycleOwner.lifecycle.removeObserver(observer) }
     }
     // B-M11: when this screen goes away, the latest strokes/messages
     // are flushed synchronously — no reliance on an async save that

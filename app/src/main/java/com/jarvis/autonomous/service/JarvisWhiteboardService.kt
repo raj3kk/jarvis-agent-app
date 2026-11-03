@@ -201,6 +201,12 @@ class JarvisWhiteboardService : Service() {
             JarvisStateRepository.addLog(
                 "Whiteboard overlay not shown: overlay permission denied."
             )
+            // 1.4.2: denied path also lands in diagnostics (area
+            // overlay) so the bug report can name it.
+            JarvisStateRepository.addDiagnostic(
+                "overlay", "DENIED",
+                "Whiteboard overlay not shown: overlay permission denied."
+            )
             if (!deniedNoticePosted) {
                 deniedNoticePosted = true
                 WhiteboardStore.postMessage(
