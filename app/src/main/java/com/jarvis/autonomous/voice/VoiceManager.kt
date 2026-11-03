@@ -119,7 +119,21 @@ class VoiceManager(
         // B-M13: serialised — concurrent speaks queue here instead
         // of racing Kokoro's shared track/stop flag. Signature
         // unchanged (suspend fun speakAndWait(String): Boolean).
+        // 1.4.9 (Step 1e): the queue was unbounded AND unmarked —
+        // a speak stuck behind a long utterance looked exactly
+        // like a dead speak (SPK_START written upstream, then
+        // silence). Now a wait over 5 s is marked with its
+        // duration; the queue itself is unchanged (bounding it
+        // would refuse queued speaks, a behaviour change).
+        val queuedAtMs = System.currentTimeMillis()
         return speakMutex.withLock {
+            val waitedMs = System.currentTimeMillis() - queuedAtMs
+            if (waitedMs > 5_000L) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_SPEAK_QUEUED",
+                    "Speak waited ${waitedMs}ms on speakMutex before starting (concurrent speaks queue)."
+                )
+            }
             stopListeningInternal()
 
             if (!prefs.kokoroEnabled) {

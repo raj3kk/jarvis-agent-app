@@ -617,6 +617,17 @@ object KokoroTtsClient {
                     "Kokoro unavailable: ${ready.exceptionOrNull()?.message} " +
                         "— no fallback voice in the Kokoro-only build."
                 )
+                // 1.4.9 (Step 1b): this failure was log-only, so
+                // a phone report could not tell a speak that died
+                // in asset-ensure from any other pre-engine
+                // failure. It now has its own diagnostic code
+                // (fsync'd: this runs in :tts, which may die).
+                JarvisStateRepository.addDiagnosticSync(
+                    "tts", "TTS_ENSURE_FAILED",
+                    "Kokoro speak-triggered asset ensure failed: " +
+                        "${ready.exceptionOrNull()?.javaClass?.simpleName}: " +
+                        "${ready.exceptionOrNull()?.message ?: ""} — no fallback voice."
+                )
                 return false
             }
         }
@@ -977,6 +988,20 @@ object KokoroTtsClient {
         val minBuf = AudioTrack.getMinBufferSize(
             rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        // 1.4.9 (Step 1d): the old code built the track
+        // unconditionally — a getMinBufferSize error (<= 0) or
+        // an uninitialized track used to surface only as a
+        // generic WRITE_FAIL / PLAYBACK_ERROR, or as a silent
+        // "success" when the drain wait timed out. Each stage
+        // now has its own named failure, and a drain timeout
+        // is a FAILURE, never a success.
+        if (minBuf <= 0) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_MINBUF_ERROR",
+                "AudioTrack getMinBufferSize failed (value=$minBuf, rate=$rate) — no track built."
+            )
+            return false
+        }
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -994,9 +1019,24 @@ object KokoroTtsClient {
             .setBufferSizeInBytes(maxOf(minBuf * bufferScale, pcm.size))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_TRACK_UNINITIALIZED",
+                "AudioTrack built but not initialized (state=${track.state}) — playback refused, not silently skipped."
+            )
+            runCatching { track.release() }
+            return false
+        }
         try {
             currentTrack = track
             track.play()
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_PLAY_NOT_STARTED",
+                    "AudioTrack.play() returned but track is not playing (playState=${track.playState})."
+                )
+                return false
+            }
             var offset = 0
             var writeFailed = false
             while (offset < pcm.size && !stopped.get()) {
@@ -1023,7 +1063,7 @@ object KokoroTtsClient {
                 return false
             }
             val frames = pcm.size / 2
-            runBlocking {
+            val drainDone = runBlocking {
                 withTimeoutOrNull(60_000L) {
                     while (!stopped.get() &&
                         track.playState == AudioTrack.PLAYSTATE_PLAYING &&
@@ -1031,9 +1071,17 @@ object KokoroTtsClient {
                     ) {
                         delay(50L)
                     }
-                }
+                } != null
             }
-            return !stopped.get()
+            if (stopped.get()) return false
+            if (!drainDone) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_DRAIN_TIMEOUT",
+                    "AudioTrack drain timed out after 60s (head < $frames frames) — treated as failure, not success."
+                )
+                return false
+            }
+            return true
         } finally {
             runCatching { track.stop(); track.release() }
             if (currentTrack == track) currentTrack = null

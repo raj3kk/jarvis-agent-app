@@ -127,6 +127,15 @@ object TtsProcessClient {
                         pending = null
                         pendingProgress = null
                         pendingReq = null
+                        // 1.4.9 (Step 1e): pendingKind is cleared
+                        // wherever pending is cleared — it used
+                        // to survive every non-death clear (reply,
+                        // send-failure, timeout), leaving a stale
+                        // kind behind. Harmless in practice (the
+                        // claim logic reads it only when pending
+                        // is non-null), but stale state is how
+                        // the next subtle bug starts.
+                        pendingKind = null
                     }
                 }
                 true
@@ -151,11 +160,17 @@ object TtsProcessClient {
     /** Last :tts-area marker code in the in-memory diagnostics
      * mirror (the last 150 persisted lines). Names the stage
      * the dying process reached — the single most useful fact
-     * in the next phone report's death line. */
+     * in the next phone report's death line.
+     * 1.4.9 (Step 1h): skip NATIVE_TTS_PROCESS_DIED lines
+     * themselves — after a death, the mirror's last tts-area
+     * code IS a previous death line, so the next episode used
+     * to report "last marker: NATIVE_TTS_PROCESS_DIED"
+     * (useless). Now it names the real last speak marker
+     * (e.g. SPK_GENERATE_START). */
     private fun lastTtsMarker(): String {
         return runCatching {
             JarvisStateRepository.diagnostics.value
-                .lastOrNull { it.area == "tts" }?.code ?: "none"
+                .lastOrNull { it.area == "tts" && it.code != "NATIVE_TTS_PROCESS_DIED" }?.code ?: "none"
         }.getOrDefault("none")
     }
 
@@ -411,6 +426,7 @@ object TtsProcessClient {
                 if (pending == deferred) {
                     pending = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             // A dead binder here is the same native-death case;
@@ -438,6 +454,7 @@ object TtsProcessClient {
                     pending = null
                     pendingProgress = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             lastFailure = FAIL_TIMEOUT
@@ -519,6 +536,7 @@ object TtsProcessClient {
                     pending = null
                     pendingProgress = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             if (lastFailure == null) {
@@ -542,6 +560,7 @@ object TtsProcessClient {
                     pending = null
                     pendingProgress = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             lastFailure = FAIL_TIMEOUT
@@ -615,6 +634,7 @@ object TtsProcessClient {
                     pending = null
                     pendingProgress = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             if (lastFailure == null) {
@@ -634,6 +654,7 @@ object TtsProcessClient {
                     pending = null
                     pendingProgress = null
                     pendingReq = null
+                    pendingKind = null
                 }
             }
             lastFailure = FAIL_TIMEOUT

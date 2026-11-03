@@ -223,6 +223,15 @@ class KokoroTtsService : Service() {
         if (!foregroundPromoted) return
         foregroundPromoted = false
         runCatching { stopForeground(true) }
+        // 1.4.9 (Step 1e): promote had TTS_FG_STARTED but demote
+        // was silent — a report could not tell whether a
+        // promotion was still live at death time. Now the
+        // demote is marked too (fsync'd: the next death may
+        // come from another process state change).
+        JarvisStateRepository.addDiagnosticSync(
+            "tts", "TTS_FG_DEMOTED",
+            "TTS service demoted from foreground after speak."
+        )
     }
 
     private val incomingCallback = Handler.Callback { msg ->

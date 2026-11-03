@@ -635,14 +635,27 @@ fun JarvisMainApp(
                                         kokoroError = null
                                         kokoroChecking = true
                                         kokoroScope.launch {
-                                            val result = KokoroTtsClient.ensureAssetsReady(context) { stage, copied, total ->
+                                            // 1.4.9 (Step 1c): the old
+                                            // direct
+                                            // KokoroTtsClient.ensureAssetsReady
+                                            // call ran a copy from the MAIN
+                                            // process, breaking the 1.4.5
+                                            // single-writer rule — a
+                                            // per-process mutex cannot
+                                            // exclude the :tts process, so
+                                            // a main-process delete/recopy
+                                            // under a loaded mmap'd engine
+                                            // is a use-after-delete hazard.
+                                            // Route through :tts instead.
+                                            val ok = TtsProcessClient.ensure(context) { stage, copied, total ->
                                                 kokoroStage = stage
                                                 kokoroCopiedMb = copied
                                                 kokoroTotalMb = total
                                             }
                                             kokoroChecking = false
-                                            if (result.isFailure) {
-                                                kokoroError = result.exceptionOrNull()?.message
+                                            if (!ok) {
+                                                kokoroError = TtsProcessClient.lastFailure
+                                                    ?: "Kokoro setup fail ho gaya"
                                             }
                                         }
                                     }
@@ -1852,14 +1865,40 @@ fun AiBrainSettingsScreen(
                     Button(
                         enabled = kokoroReady && kokoroOn,
                         onClick = {
+                            // 1.4.9 (Step 1a): Test Voice had two
+                            // fully-silent stages — a greyed button
+                            // writes nothing, and a
+                            // startForegroundService throw writes
+                            // nothing (no try/catch, no marker).
+                            // Now the tap itself is marked, the
+                            // service-start result is marked, and
+                            // a throw is caught + marked — a Test
+                            // Voice report can always name the
+                            // stage it reached.
+                            JarvisStateRepository.addDiagnostic(
+                                "tts", "TEST_VOICE_START",
+                                "Test Voice tapped in AI Brain Kokoro card."
+                            )
                             val testIntent = Intent(
                                 aiBrainContext,
                                 JarvisForegroundService::class.java
                             ).apply { action = JarvisForegroundService.ACTION_SPEAK_TEST }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                aiBrainContext.startForegroundService(testIntent)
-                            } else {
-                                aiBrainContext.startService(testIntent)
+                            runCatching {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    aiBrainContext.startForegroundService(testIntent)
+                                } else {
+                                    aiBrainContext.startService(testIntent)
+                                }
+                            }.onSuccess {
+                                JarvisStateRepository.addDiagnostic(
+                                    "tts", "TEST_VOICE_SENT",
+                                    "Test Voice service start requested (ACTION_SPEAK_TEST)."
+                                )
+                            }.onFailure {
+                                JarvisStateRepository.addDiagnostic(
+                                    "tts", "TEST_VOICE_START_FAILED",
+                                    "Test Voice service start threw: ${it.javaClass.simpleName} — tap never reached the service."
+                                )
                             }
                         },
                         modifier = Modifier.fillMaxWidth()

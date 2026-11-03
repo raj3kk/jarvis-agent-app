@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -497,7 +498,11 @@ class JarvisForegroundService : Service() {
         try {
         prefs = JarvisPreferences(this)
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("JARVIS Active — Listening in background"))
+        // 1.4.9 (Step 1g): NEVER the raw 2-arg startForeground
+        // here — it applies all manifest types
+        // (microphone|specialUse) and crashes on SDK 34+ when
+        // RECORD_AUDIO is absent (phone crash 23:13:31).
+        startForegroundSafe(buildNotification("JARVIS Active — Listening in background"))
 
         acquirePartialWakeLock()
 
@@ -750,6 +755,11 @@ class JarvisForegroundService : Service() {
                         deferVadUntilGreeting()
                     }
                     JarvisStateRepository.addLog("Mic loop restored after service recreation.")
+                    // 1.4.9 (Step 1g): restore is a mic start —
+                    // re-apply the qualified type set (onCreate
+                    // may have started specialUse-only if the
+                    // grant arrived after it).
+                    refreshForegroundTypes()
                 }
             }
         }
@@ -876,6 +886,9 @@ class JarvisForegroundService : Service() {
                         JarvisStateRepository.setMicFatal(null)
                         JarvisStateRepository.setMicLoopEnabled(true)
                         startVadMonitor()
+                        // 1.4.9 (Step 1g): mic is live now —
+                        // qualify for the microphone type.
+                        refreshForegroundTypes()
                     } else {
                         voiceManager.triggerManualVoiceCommand()
                     }
@@ -917,6 +930,9 @@ class JarvisForegroundService : Service() {
                         JarvisStateRepository.setMicLoopEnabled(true)
                         startVadMonitor()
                         JarvisStateRepository.addLog("Mic restarted from Retry button.")
+                        // 1.4.9 (Step 1g): mic is live now —
+                        // qualify for the microphone type.
+                        refreshForegroundTypes()
                     } else {
                         JarvisStateRepository.addLog("Mic Retry failed to start the loop.")
                     }
@@ -1021,6 +1037,87 @@ class JarvisForegroundService : Service() {
         }
     }
 
+    /**
+     * 1.4.9 (Step 1g): FGS-type gating — phone crash 2026-11-03
+     * 23:13:31 was "Unable to create service ... Starting FGS
+     * with type microphone ... requires permissions". On SDK
+     * 34+, startForeground() with the microphone type requires
+     * RECORD_AUDIO already granted, else SecurityException —
+     * and the old 2-arg startForeground() applied ALL manifest
+     * types (microphone|specialUse), so ANY service start with
+     * mic permission absent crashed onCreate (the 1.4.8
+     * "verified N/A" verdict was wrong: onCreate never touches
+     * RECORD_AUDIO, but the manifest microphone type alone
+     * triggers the check). The manifest is the upper bound;
+     * the runtime call picks a subset from it. So:
+     * specialUse always (no runtime prerequisite); microphone
+     * only when RECORD_AUDIO is currently granted. Every
+     * startForeground on this service MUST go through
+     * [startForegroundSafe], never the raw 2-arg call.
+     */
+    private fun qualifiedForegroundTypes(): Int {
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        if (ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        return types
+    }
+
+    private fun startForegroundSafe(notification: Notification) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, qualifiedForegroundTypes())
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            // TOCTOU (permission revoked between check and call)
+            // or a background-start restriction: retry with
+            // specialUse-only (no runtime prerequisite). If even
+            // that fails, record and continue — a foreground
+            // promotion must never crash service creation.
+            JarvisStateRepository.addDiagnostic(
+                "nav", "FGS_TYPE_FALLBACK",
+                "Foreground start with qualified types failed (${e.javaClass.simpleName}) — retrying specialUse-only."
+            )
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID, notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            }.onFailure {
+                JarvisStateRepository.addDiagnostic(
+                    "nav", "FGS_START_FAILED",
+                    "Foreground start failed even with specialUse-only (${it.javaClass.simpleName}) — service continues without foreground state."
+                )
+            }
+        }
+    }
+
+    /**
+     * 1.4.9 (Step 1g): re-apply the qualified type set after a
+     * mic start — the common case is a grant that arrived
+     * AFTER onCreate (user grants RECORD_AUDIO in Settings,
+     * then taps mic): onCreate started specialUse-only, and
+     * only now does the service qualify for microphone.
+     * Called only after micManager.start() returned true
+     * (permission necessarily granted at that point).
+     * Mic stop does NOT downgrade the type: wake-word
+     * listening may recapture immediately after a user stop,
+     * and keeping the type while permission is held is
+     * harmless.
+     */
+    private fun refreshForegroundTypes() {
+        startForegroundSafe(buildNotification("JARVIS Active — Listening in background"))
+    }
+
     private fun buildNotification(statusText: String): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
@@ -1101,10 +1198,11 @@ class JarvisForegroundService : Service() {
      */
     private fun refreshBounceNotification() {
         runCatching {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification("JARVIS Active — Listening in background")
-            )
+            // 1.4.9 (Step 1g): same crash vector as onCreate —
+            // the old 2-arg call re-applied all manifest types,
+            // including microphone, even when RECORD_AUDIO was
+            // absent. Route through the qualified helper.
+            startForegroundSafe(buildNotification("JARVIS Active — Listening in background"))
         }
     }
 
