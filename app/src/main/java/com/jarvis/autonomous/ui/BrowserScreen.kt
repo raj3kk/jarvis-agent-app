@@ -597,16 +597,6 @@ object JarvisBackgroundBrowser {
         result
     }
 
-    /** Callback variant of [browse] for non-suspend callers. */
-    fun browseAsync(
-        context: Context,
-        rawUrl: String,
-        timeoutMs: Long = 30_000L,
-        onResult: (BrowserPageResult) -> Unit
-    ) {
-        scope.launch { onResult(browse(context, rawUrl, timeoutMs)) }
-    }
-
     private suspend fun loadAndExtract(url: String, context: Context): BrowserPageResult {
         val webView = obtainWebView(context)
         val deferred = CompletableDeferred<BrowserPageResult>()

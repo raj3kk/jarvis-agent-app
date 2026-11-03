@@ -221,9 +221,6 @@ object ProjectStore {
         return if (content.isBlank()) FileRead.Empty else FileRead.Ok(content)
     }
 
-    fun fileExists(context: Context, project: String, fileName: String): Boolean =
-        readFileStatus(context, project, fileName) is FileRead.Ok
-
     /** Result of a write that keeps the working copy and the
      *  Documents export distinct (B-M6): a working-copy success with a
      *  failed export must NEVER be reported as "export ho gaya". */
@@ -324,24 +321,6 @@ object ProjectStore {
 
     // ---- Build validation (engine build-summary step) ----
 
-    /** Extracts same-folder asset references (href/src) from HTML,
-     *  skipping absolute URLs, protocol-relative URLs, data: URIs
-     *  and pure anchors. Kept for callers that need the raw list;
-     *  VALIDATION ([validateProject]) does NOT use this — it resolves
-     *  every reference relative to its own file's directory and
-     *  treats leading-slash references as errors (see B-M7). */
-    fun referencedAssets(html: String): List<String> {
-        val regex = Regex("""(?:href|src)\s*=\s*["']([^"']+)["']""")
-        return regex.findAll(html)
-            .map { it.groupValues[1].substringBefore("?").substringBefore("#").trim() }
-            .filter {
-                it.isNotBlank() && !it.startsWith("http://") && !it.startsWith("https://") &&
-                    !it.startsWith("//") && !it.startsWith("data:")
-            }
-            .mapNotNull { sanitizeFileName(it) }
-            .distinct()
-            .toList()
-    }
 
     /** CSS url(...) references, same skipping rules as HTML refs. */
     private fun referencedCssUrls(css: String): List<String> {

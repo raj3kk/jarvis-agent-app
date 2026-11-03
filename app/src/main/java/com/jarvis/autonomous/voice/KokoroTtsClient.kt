@@ -148,17 +148,6 @@ object KokoroTtsClient {
     }
 
     /**
-     * B-C1: the bundled model is verified by EXACT size, never by
-     * ">50MB" (a truncated 60MB copy used to pass). Sources, in
-     * order: (1) the sizes manifest written by [ensureAssetsReady]
-     * after a verified copy; (2) the bundled asset size via
-     * openFd when the asset is stored uncompressed. A legacy
-     * 1.3.0 download dir with neither source keeps the old
-     * >50MB check as a fallback — but a Sherpa init failure on
-     * such a dir deletes it and forces a fresh copy (see [speak]),
-     * so a corrupt legacy dir can never return false forever.
-     */
-    /**
      * 1.4.5 part 3 (item 2a): download-complete now means SIZES
      * match pins AND HASHES match pins. The hash manifest
      * (kokoro-hashes.txt) is compared by cheap string equality —
@@ -189,21 +178,6 @@ object KokoroTtsClient {
         return true
     }
 
-    /** Sizes manifest written by [ensureAssetsReady] (rel=size lines). */
-    private const val SIZES_MANIFEST_FILE = "kokoro-sizes.txt"
-
-    private fun readSizesManifest(dir: File): Map<String, Long>? {
-        val manifest = File(dir, SIZES_MANIFEST_FILE)
-        if (!manifest.exists()) return null
-        return runCatching {
-            manifest.readLines()
-                .mapNotNull { line ->
-                    val idx = line.lastIndexOf('=')
-                    if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1).toLong()
-                }.toMap().takeIf { it.isNotEmpty() }
-        }.getOrNull()
-    }
-
     /** Hashes manifest written by [ensureAssetsReady] (rel=sha256 lines). */
     private const val HASHES_MANIFEST_FILE = "kokoro-hashes.txt"
 
@@ -223,14 +197,6 @@ object KokoroTtsClient {
         runCatching {
             File(dir, HASHES_MANIFEST_FILE).writeText(
                 hashes.entries.joinToString("\n") { "${it.key}=${it.value}" }
-            )
-        }
-    }
-
-    private fun writeSizesManifest(dir: File, sizes: Map<String, Long>) {
-        runCatching {
-            File(dir, SIZES_MANIFEST_FILE).writeText(
-                sizes.entries.joinToString("\n") { "${it.key}=${it.value}" }
             )
         }
     }
@@ -418,14 +384,6 @@ object KokoroTtsClient {
                             val espeakOk = File(vdir, "espeak-ng-data").walkTopDown().any { it.isFile }
                             if (espeakOk) {
                                 writeHashesManifest(vdir, hashes)
-                                writeSizesManifest(
-                                    vdir,
-                                    mapOf(
-                                        MODEL_FILE to PIN_MODEL_SIZE,
-                                        VOICES_FILE to PIN_VOICES_SIZE,
-                                        TOKENS_FILE to PIN_TOKENS_SIZE
-                                    )
-                                )
                                 val totalMB = bundledModelBytes(context) / 1_000_000L
                                 onProgress("ready", totalMB, totalMB)
                                 return@runCatching
@@ -521,9 +479,6 @@ object KokoroTtsClient {
                     }
                     onProgress("copying", copiedBytes / 1_000_000L, totalMB)
                 }
-                // B-C1: record exact copied sizes so later
-                // isDownloaded() checks verify exact sizes.
-                writeSizesManifest(dir, sizes.filterValues { it > 0 })
                 // 1.4.5 (item 2a): HARD FAIL on hash mismatch of a
                 // FRESH copy — a truncated/corrupt bundled file must
                 // never reach a native engine load. Bad file is

@@ -556,9 +556,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         val error: String?
     )
 
-    fun makePhoneCall(nameOrNumber: String): Boolean =
-        makePhoneCallWithReason(nameOrNumber).first
-
     /** Returns (success, reason): ok | contact_not_found |
      *  contact_ambiguous | permission_denied | dial_failed. A name
      *  that does not resolve is NEVER dialled as a tel: string. */
@@ -586,9 +583,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             false to "dial_failed"
         }
     }
-
-    private fun lookupContactNumber(contactName: String): String? =
-        lookupContactNumberDetailed(contactName).number
 
     /**
      * A-C3 contact matching: EXACT name match wins; otherwise a

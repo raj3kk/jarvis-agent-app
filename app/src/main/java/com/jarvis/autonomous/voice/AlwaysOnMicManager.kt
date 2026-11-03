@@ -367,14 +367,8 @@ class AlwaysOnMicManager(
     /** True while the loop is enabled (between [start] and [stop]). */
     fun isEnabled(): Boolean = enabled
 
-    /** True while a recognizer session is currently live. */
-    fun isListeningActive(): Boolean = listeningActive
-
     /** Current recognizer locale ("hi-IN" or "en-IN"). */
     fun currentLanguage(): String = currentLanguage
-
-    /** True when the optional VAD monitor is running. */
-    fun isVadActive(): Boolean = vadMonitor?.isRunning() == true
 
     fun isRecordAudioGranted(): Boolean {
         return ContextCompat.checkSelfPermission(
@@ -954,10 +948,6 @@ class AlwaysOnMicManager(
         if (sttPath == "deepgram") return true
         vadJob = vadScope.launch { monitor.runLoop() }
         return true
-    }
-
-    fun disableVadMonitor() {
-        stopVadMonitor()
     }
 
     /**

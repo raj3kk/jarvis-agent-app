@@ -73,9 +73,6 @@ class TurnDetector {
     /** Current buffered transcript (trimmed), even mid-turn. */
     fun currentText(): String = buffer.trim()
 
-    /** True once any speech text has arrived for the current turn. */
-    fun hasText(): Boolean = buffer.isNotBlank()
-
     /**
      * A new partial result arrived. System partials are cumulative
      * WITHIN one recognizer session, so a same-session partial

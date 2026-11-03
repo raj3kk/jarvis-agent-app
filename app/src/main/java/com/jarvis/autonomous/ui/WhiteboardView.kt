@@ -88,14 +88,6 @@ class WhiteboardView @JvmOverloads constructor(
         invalidate()
     }
 
-    fun getStrokes(): List<WhiteboardStroke> = strokes.toList()
-
-    fun clearDrawing() {
-        strokes.clear()
-        currentPoints = mutableListOf()
-        invalidate()
-    }
-
     private fun pathFor(points: List<WhiteboardPoint>): Path {
         val path = Path()
         if (points.isEmpty()) return path

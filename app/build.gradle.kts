@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 13
-        versionName = "1.4.5-PRO"
+        versionCode = 14
+        versionName = "1.4.6-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
@@ -141,11 +141,9 @@ dependencies {
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
-    implementation("androidx.lifecycle:lifecycle-service:2.8.3")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
-    implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 

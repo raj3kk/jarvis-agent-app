@@ -80,7 +80,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             if (!LocalLlmManager.isDownloaded(context)) {
                 // A-C6: a missing-model error is NOT a completed turn.
                 return@withContext AgentDecision(
-                    reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~475 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
+                    reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~304 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
                     thought = "Local model not downloaded",
                     action = "NONE",
                     isCompleted = false,

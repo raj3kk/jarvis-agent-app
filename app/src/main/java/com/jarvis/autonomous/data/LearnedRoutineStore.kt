@@ -112,8 +112,6 @@ class LearnedRoutineStore(context: Context) {
         return true
     }
 
-    fun pendingStepCount(): Int = pendingSteps.size
-
     fun clearPending() {
         pendingSteps.clear()
     }
@@ -179,16 +177,6 @@ class LearnedRoutineStore(context: Context) {
         }
         return null
     }
-
-    fun deleteRoutine(id: String): Boolean {
-        val all = loadRoutines()
-        val kept = all.filterNot { it.id == id }
-        if (kept.size == all.size) return false
-        saveRoutines(kept)
-        return true
-    }
-
-    fun allRoutines(): List<LearnedRoutine> = loadRoutines()
 
     // ------------------------------------------------------------------
     // REPLAY SAFETY (hard rule): confirmation-required steps

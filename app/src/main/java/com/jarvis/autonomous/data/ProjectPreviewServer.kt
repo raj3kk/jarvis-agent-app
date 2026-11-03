@@ -153,15 +153,6 @@ class ProjectPreviewServer(
         return false
     }
 
-    @Synchronized
-    fun stop() {
-        isAlive = false
-        runCatching { serverSocket?.close() }
-        serverSocket = null
-        runCatching { acceptExecutor?.shutdownNow() }
-        acceptExecutor = null
-    }
-
     /**
      * A response is either small in-memory bytes (error pages, the
      * redirect stub) or a file streamed in 8 KB chunks (B-L12: never
@@ -473,24 +464,6 @@ class ProjectPreviewServer(
         private val startMutex = Mutex()
 
         /**
-         * Best-effort accessor (old callers). Returns the existing
-         * instance when one exists — even a starting one — instead of
-         * overwriting an in-flight start. Prefer [ensureRunningReady]:
-         * this one can return a server whose [isRunning] is false when
-         * the port could not be bound — check [isRunning] before
-         * loading any URL.
-         */
-        @Synchronized
-        fun ensureRunning(context: Context): ProjectPreviewServer {
-            val existing = instance
-            if (existing != null) return existing
-            val server = ProjectPreviewServer(context.applicationContext)
-            server.start()
-            instance = server
-            return server
-        }
-
-        /**
          * The UI entry point: returns (server, ready). Only load a
          * preview URL when ready == true; otherwise show the error
          * state — never a WebView pointed at a dead server.
@@ -512,10 +485,5 @@ class ProjectPreviewServer(
             server to ready
         }
 
-        @Synchronized
-        fun stop() {
-            runCatching { instance?.stop() }
-            instance = null
-        }
     }
 }

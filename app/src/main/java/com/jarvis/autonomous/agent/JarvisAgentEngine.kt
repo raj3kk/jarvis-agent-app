@@ -88,7 +88,6 @@ class JarvisAgentEngine(
     private var lastExecutedAction: String = ""
 
     /** URLs deferred by the B-M3 visibility check (never auto-loaded). */
-    fun pendingDeferredBrowseUrls(): List<String> = deferredBrowseUrls.toList()
 
     /** Clears ALL per-attempt state (A-C7): routine buffer, browser
      *  approvals and sensitive confirmations. Called at every task
