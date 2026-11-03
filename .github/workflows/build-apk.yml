@@ -40,7 +40,7 @@ jobs:
       - name: Assert versionCode greater than previous release
         run: |
           set -e
-          VC=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle.kts | head -1)
+          VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
           echo "versionCode in tree: $VC (floor PREV_VC=12, previous delivered 1.4.4-PRO)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
