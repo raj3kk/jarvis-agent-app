@@ -253,9 +253,27 @@ class JarvisForegroundService : Service() {
             // spike together at launch.
             drainPendingVad()
             if (!ok) {
+                // 1.4.6: the old "(Kokoro OFF or TTS failed)" text
+                // was ambiguous — a report could not tell which
+                // stage failed. Now the stage is named explicitly
+                // from the toggle + the TTS client's last failure
+                // (:tts-side ENGINE_INIT_FAIL / HASH_MISMATCH, if
+                // present in diagnostics, are the deeper cause
+                // under a TTS_FAILED stage).
+                val stage = when {
+                    !prefs.kokoroEnabled -> "KOKORO_OFF"
+                    TtsProcessClient.lastFailure != null -> TtsProcessClient.lastFailure
+                    else -> "TTS_FAILED"
+                }
                 JarvisStateRepository.addDiagnostic(
                     "tts", "GREET_FAIL",
-                    "Startup greeting could not be spoken (Kokoro OFF or TTS failed) — text shown in chat."
+                    "Startup greeting could not be spoken — stage=$stage " +
+                        "(KOKORO_OFF = toggle OFF in AI Brain; " +
+                        "TTS_BIND_FAILED = :tts bind failed; " +
+                        "NATIVE_TTS_PROCESS_DIED = :tts died; " +
+                        "TTS_PROCESS_TIMEOUT = no :tts reply; " +
+                        "TTS_BUSY = concurrent speak; TTS_FAILED = " +
+                        "other speak failure) — text shown in chat."
                 )
                 // 1.4.5 visible failure: if the isolated TTS
                 // process died mid-greeting, say so in chat

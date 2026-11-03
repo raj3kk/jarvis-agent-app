@@ -351,7 +351,19 @@ fun JarvisMainApp(
                 kokoroTotalMb = total
             }
             kokoroChecking = false
-            kokoroError = if (ok) null else "Kokoro setup fail ho gaya — dobara try karo."
+            // 1.4.6: an ensure that lost to an in-flight speak
+            // (TTS_BUSY) is NOT a setup failure — the speak's own
+            // :tts ensure completes the assets (copyMutex in
+            // :tts) — so it must not paint a "setup fail"
+            // overlay during a greeting speak. Only a real
+            // ensure failure shows the error.
+            kokoroError = if (ok) {
+                null
+            } else if (TtsProcessClient.lastFailure == TtsProcessClient.FAIL_BUSY) {
+                null
+            } else {
+                "Kokoro setup fail ho gaya — dobara try karo."
+            }
         }
     }
     val showKokoroOverlay = !kokoroDismissed &&

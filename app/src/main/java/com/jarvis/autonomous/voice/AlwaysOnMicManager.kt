@@ -223,6 +223,11 @@ class AlwaysOnMicManager(
     private var wakeActive: Boolean = false
     private var wakeRestartRunnable: Runnable? = null
     private var wakeBackoffMs: Long = WAKE_RESTART_BASE_MS
+    // 1.4.6: last time the no-key chat line was posted (the wake
+    // start is retried after every speak, so an ungated line
+    // would spam the chat — 5 min gate, same wording as the
+    // loop-start no-key banner).
+    private var lastWakeNoKeyChatMs: Long = 0L
     // One-shot session (loop OFF only).
     private var oneShotJob: Job? = null
     @Volatile
@@ -1074,6 +1079,26 @@ class AlwaysOnMicManager(
                 "stt", "WAKE_NO_KEY",
                 "Wake-word session refused: no Deepgram key saved."
             )
+            // 1.4.6: WAKE_NO_KEY used to be diagnostics-only —
+            // invisible in the app — so "catch nahi karta" looked
+            // like a listening bug when listening could never
+            // start (Deepgram-only policy: no key = no listening
+            // at all). Now it also posts a visible chat line
+            // (5-min gated: wake start is retried after every
+            // speak, and an ungated line would spam the chat).
+            // The mic-loop start path already banners this via
+            // onMicError; this covers the wake-word path, which
+            // runs at every launch (wakeWordEnabled default ON).
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastWakeNoKeyChatMs >= 300_000L) {
+                lastWakeNoKeyChatMs = nowMs
+                JarvisStateRepository.addChatMessage(
+                    "System",
+                    "Sunna shuru nahi ho sakta — Deepgram key nahi " +
+                        "hai. AI Brain me Deepgram key daal kar Save " +
+                        "dabao, phir mic on karo."
+                )
+            }
             return false
         }
         if (wakeActive) {

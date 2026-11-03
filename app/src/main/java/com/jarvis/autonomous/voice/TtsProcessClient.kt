@@ -84,6 +84,10 @@ object TtsProcessClient {
     private var pending: CompletableDeferred<Outcome>? = null
     private var pendingProgress: ((String, Long, Long) -> Unit)? = null
     private var pendingReq: Long? = null
+    /** 1.4.6: which op holds [pending] ("SPEAK" | "ENSURE" | "RESET").
+     * Set in the same synchronized block as the claim, so whenever
+     * [pending] is non-null the kind belongs to the live holder. */
+    private var pendingKind: String? = null
     private var nextReqId: Long = 0L
 
     private val replyMessenger = Messenger(
@@ -223,18 +227,80 @@ object TtsProcessClient {
         }
         val deferred = CompletableDeferred<Outcome>()
         val reqId = synchronized(lock) { ++nextReqId }
-        synchronized(lock) {
-            if (pending != null) {
-                lastFailure = FAIL_BUSY
-                JarvisStateRepository.addDiagnostic(
-                    "tts", "TTS_BUSY",
-                    "Second concurrent speak refused (main process " +
-                        "serialises speaks) — caller degrades visibly."
-                )
-                return false
+        // 1.4.6 GREETING-FAIL ROOT CAUSE (20:49:45 phone report:
+        // SPK_START -> TTS_BUSY -> SPK_END ok=false in 86 ms, no
+        // ENGINE markers): the launch-time Kokoro asset ensure
+        // (MainActivity, TtsProcessClient.ensure) holds `pending`
+        // for the whole ~190 MB hash-verify/copy, and the startup
+        // greeting speak arrived while it held the slot — the old
+        // code refused the speak instantly (TTS_BUSY), so the
+        // greeting could never be heard on a first/uncached
+        // launch even though the engine itself was healthy. The
+        // fix: a speak WAITS for a setup holder (ENSURE/RESET) —
+        // awaiting the holder's deferred (never completing it) —
+        // then re-claims; a speak-vs-speak collision still
+        // refuses instantly (TTS_BUSY), preserving 1.4.5
+        // serialisation. Bounded: 3 waits, 600 s each (the
+        // ensure bound); on timeout the old busy failure returns.
+        var claimed = false
+        var setupWaits = 0
+        while (!claimed) {
+            val state = synchronized(lock) {
+                when {
+                    pending == null -> {
+                        pending = deferred
+                        pendingReq = reqId
+                        pendingKind = "SPEAK"
+                        "CLAIMED"
+                    }
+                    pendingKind == "ENSURE" || pendingKind == "RESET" -> "WAIT_SETUP"
+                    else -> "BUSY"
+                }
             }
-            pending = deferred
-            pendingReq = reqId
+            when (state) {
+                "CLAIMED" -> claimed = true
+                "BUSY" -> {
+                    lastFailure = FAIL_BUSY
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "TTS_BUSY",
+                        "Second concurrent speak refused (main process " +
+                            "serialises speaks) — caller degrades visibly."
+                    )
+                    return false
+                }
+                else -> {
+                    if (setupWaits >= 3) {
+                        lastFailure = FAIL_BUSY
+                        JarvisStateRepository.addDiagnostic(
+                            "tts", "TTS_BUSY",
+                            "Speak gave up waiting for Kokoro setup " +
+                                "(ensure/reset) — caller degrades visibly."
+                        )
+                        return false
+                    }
+                    setupWaits++
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "TTS_WAIT_SETUP",
+                        "Speak waiting for Kokoro setup (ensure/reset) " +
+                            "to finish before speaking (launch-copy race)."
+                    )
+                    val holder = synchronized(lock) { pending }
+                    val timedOut = if (holder != null) {
+                        withTimeoutOrNull(600_000L) { holder.await() } == null
+                    } else {
+                        false
+                    }
+                    if (timedOut) {
+                        lastFailure = FAIL_BUSY
+                        JarvisStateRepository.addDiagnostic(
+                            "tts", "TTS_BUSY",
+                            "Speak setup-wait timed out (600 s) — caller " +
+                                "degrades visibly."
+                        )
+                        return false
+                    }
+                }
+            }
         }
         val sent = runCatching {
             val msg = Message.obtain(null, KokoroTtsService.MSG_SPEAK)
@@ -334,11 +400,17 @@ object TtsProcessClient {
         synchronized(lock) {
             if (pending != null) {
                 lastFailure = FAIL_BUSY
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_BUSY",
+                    "Reset refused: another TTS request (speak or " +
+                        "ensure) in flight — retry after it ends."
+                )
                 return false
             }
             pending = deferred
             pendingProgress = onProgress
             pendingReq = reqId
+            pendingKind = "RESET"
         }
         val sent = runCatching {
             val msg = Message.obtain(null, KokoroTtsService.MSG_RESET)
@@ -424,11 +496,17 @@ object TtsProcessClient {
         synchronized(lock) {
             if (pending != null) {
                 lastFailure = FAIL_BUSY
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_BUSY",
+                    "Ensure refused: another TTS request (speak or " +
+                        "reset) in flight — caller retries later."
+                )
                 return false
             }
             pending = deferred
             pendingProgress = onProgress
             pendingReq = reqId
+            pendingKind = "ENSURE"
         }
         val sent = runCatching {
             val msg = Message.obtain(null, KokoroTtsService.MSG_ENSURE)

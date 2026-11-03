@@ -127,6 +127,18 @@ class VoiceManager(
                     "Kokoro voice OFF in settings — nothing spoken " +
                         "(Kokoro-only build: no other voice is used)."
                 )
+                // 1.4.6: toggle-OFF used to leave NO diagnostic —
+                // only a log line — so a phone report with
+                // SPK_END ok=false and no ENGINE markers could
+                // not distinguish "toggle OFF" from a TTS failure.
+                // Now it has its own code (KOKORO_OFF), distinct
+                // from TTS_BIND_FAILED / ENGINE_INIT_FAIL /
+                // HASH_MISMATCH / NATIVE_TTS_PROCESS_DIED.
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "KOKORO_OFF",
+                    "Speak refused: Kokoro voice OFF in settings — " +
+                        "nothing spoken (toggle ON in AI Brain to speak)."
+                )
                 return@withLock false
             }
 
