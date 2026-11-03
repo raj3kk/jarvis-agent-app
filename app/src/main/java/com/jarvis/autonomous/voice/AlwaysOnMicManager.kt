@@ -210,7 +210,7 @@ class AlwaysOnMicManager(
 
     /** Deepgram stream listener — one instance per loop start,
      *  reused across idle-suspend reconnects. */
-    private val deepgramListener = object : DeepgramSttClient.Listener {
+    private val deepgramListener: DeepgramSttClient.Listener = object : DeepgramSttClient.Listener {
         override fun onOpen() {
             if (!enabled) return
             deepgramConnecting = false

@@ -11,6 +11,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import okio.toByteString
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -152,7 +153,7 @@ class DeepgramSttClient(private val apiKey: String) {
     fun sendPcm(bytes: ByteArray, length: Int): Boolean {
         if (closed.get()) return false
         val ws = webSocket ?: return false
-        val ok = ws.send(ByteString.of(bytes, 0, length))
+        val ok = ws.send(bytes.toByteString(0, length))
         if (ok) lastSendMs = System.currentTimeMillis()
         return ok
     }
