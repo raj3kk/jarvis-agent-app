@@ -49,6 +49,9 @@ class WhiteboardView @JvmOverloads constructor(
     }
     private val strokes = mutableListOf<WhiteboardStroke>()
     private var currentPoints = mutableListOf<WhiteboardPoint>()
+    // B-L9: the pointer that owns the in-progress stroke. A second
+    // finger must never hijack (or finish) the first finger's stroke.
+    private var activePointerId: Int = MotionEvent.INVALID_POINTER_ID
     // Backing fields are NOT named currentColor/currentWidth: a Kotlin
     // var already generates a JVM setter setCurrentColor/setCurrentWidth,
     // so a fun of the same name would be a platform declaration clash.
@@ -76,9 +79,12 @@ class WhiteboardView @JvmOverloads constructor(
     }
 
     fun setStrokes(newStrokes: List<WhiteboardStroke>) {
+        // B-M11: only the FINISHED strokes are replaced. The in-progress
+        // stroke (currentPoints) belongs to the finger still on the
+        // screen — the old code wiped it on every store emission, so a
+        // stroke vanished mid-draw whenever the store updated.
         strokes.clear()
         strokes.addAll(newStrokes)
-        currentPoints = mutableListOf()
         invalidate()
     }
 
@@ -115,20 +121,58 @@ class WhiteboardView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val point = WhiteboardPoint(event.x, event.y)
-        when (event.action) {
+        // B-L9: actionMasked (not action — the pointer index rides in
+        // the low bits of action on multi-touch) + pointer-id tracking
+        // + historical points, so fast strokes keep their intermediate
+        // points instead of straight-line jumps.
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                currentPoints = mutableListOf(point)
+                activePointerId = event.getPointerId(0)
+                currentPoints = mutableListOf(
+                    WhiteboardPoint(event.getX(0), event.getY(0))
+                )
                 invalidate()
+                return true
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // A second finger is ignored: the first finger's stroke
+                // continues untouched.
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                currentPoints.add(point)
+                val index = event.findPointerIndex(activePointerId)
+                if (index < 0) return true
+                for (h in 0 until event.historySize) {
+                    currentPoints.add(
+                        WhiteboardPoint(
+                            event.getHistoricalX(index, h),
+                            event.getHistoricalY(index, h)
+                        )
+                    )
+                }
+                currentPoints.add(
+                    WhiteboardPoint(event.getX(index), event.getY(index))
+                )
                 invalidate()
                 return true
             }
-            MotionEvent.ACTION_UP -> {
-                currentPoints.add(point)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val liftedId = event.getPointerId(event.actionIndex)
+                if (liftedId != activePointerId) return true
+                val index = event.findPointerIndex(activePointerId)
+                if (index >= 0) {
+                    for (h in 0 until event.historySize) {
+                        currentPoints.add(
+                            WhiteboardPoint(
+                                event.getHistoricalX(index, h),
+                                event.getHistoricalY(index, h)
+                            )
+                        )
+                    }
+                    currentPoints.add(
+                        WhiteboardPoint(event.getX(index), event.getY(index))
+                    )
+                }
                 if (currentPoints.size >= 2) {
                     val finished = WhiteboardStroke(
                         points = currentPoints.toList(),
@@ -139,11 +183,13 @@ class WhiteboardView @JvmOverloads constructor(
                     onStrokeFinished?.invoke(finished)
                 }
                 currentPoints = mutableListOf()
+                activePointerId = MotionEvent.INVALID_POINTER_ID
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
                 currentPoints = mutableListOf()
+                activePointerId = MotionEvent.INVALID_POINTER_ID
                 invalidate()
                 return true
             }

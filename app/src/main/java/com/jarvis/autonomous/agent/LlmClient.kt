@@ -4,6 +4,7 @@ import android.content.Context
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.ProjectStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -39,8 +40,17 @@ data class AgentDecision(
     val browserSpeakSummary: Boolean = true,
     val browserShowPage: Boolean = false,
     val askUser: Boolean = false,
-    val isCompleted: Boolean = true
+    val isCompleted: Boolean = true,
+    // A-C6: explicit decision kind. "OK" = normal; "ERROR" = API /
+    // config failure (never complete, never persist, never index);
+    // "PARSE_ERROR" = truncated / multi-object JSON (retry once);
+    // "RATE_LIMITED" = HTTP 429 (distinct, retry with backoff).
+    val decisionKind: String = "OK"
 )
+
+/** Thrown ONLY by strict JSON parsing (A-M2): truncation or a
+ *  second merged object. Never converted into a partial action. */
+class DecisionParseException(message: String) : IllegalArgumentException(message)
 
 class LlmClient(private val context: Context, private val prefs: JarvisPreferences) {
 
@@ -67,11 +77,13 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         // generated on the phone itself after the one-time load.
         if (prefs.provider == AiProvider.LOCAL) {
             if (!LocalLlmManager.isDownloaded(context)) {
+                // A-C6: a missing-model error is NOT a completed turn.
                 return@withContext AgentDecision(
                     reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~475 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
                     thought = "Local model not downloaded",
                     action = "NONE",
-                    isCompleted = true
+                    isCompleted = false,
+                    decisionKind = "ERROR"
                 )
             }
             // Builder bypass (audit S7): the local chat path returns
@@ -86,7 +98,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     reply = "Website banana local model se nahi hoga — iske liye AI Brain me Gemini ya Groq chuno, phir dobara bolo; ya Projects tab me Create Website Project dabao aur file khud edit karo.",
                     thought = "Local provider cannot emit project actions",
                     action = "NONE",
-                    isCompleted = true
+                    isCompleted = false,
+                    decisionKind = "ERROR"
                 )
             }
             return@withContext try {
@@ -106,7 +119,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     reply = "Local model se jawab nahi aaya (${(e.message ?: "").take(120)}). AI Brain me dobara Gemini chuno ya model reload karo.",
                     thought = "Local LLM error: ${e.message}",
                     action = "NONE",
-                    isCompleted = true
+                    isCompleted = false,
+                    decisionKind = "ERROR"
                 )
             }
         }
@@ -118,7 +132,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 thought = "API key is missing in preferences",
                 action = "NONE",
                 askUser = false,
-                isCompleted = true
+                isCompleted = false,
+                decisionKind = "ERROR"
             )
         }
 
@@ -164,9 +179,10 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         }
 
         return@withContext try {
-            // 404 fallback chain: if the chosen model is dead/overloaded
-            // (404/503), try the provider's verified fallbacks before giving
-            // up, so one retired model ID can never brick the whole agent.
+            // A-M1 fallback chain: ANY attempt failure (429 / 401 /
+            // network / JSON-shape / empty body) is fallback-eligible
+            // — the old code only fell back on 404/503, so one rate
+            // limit or dead key bricked the whole agent.
             val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
                 .map { it.trim().removePrefix("models/") }
                 .filter { it.isNotBlank() }.distinct()
@@ -192,11 +208,11 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                         )
                     }
                     break
-                } catch (e: IllegalStateException) {
-                    val isModelGone = e.message?.contains("HTTP 404") == true ||
-                        e.message?.contains("HTTP 503") == true
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (e: Exception) {
                     lastError = e
-                    if (!isModelGone || candidate == candidates.last()) throw e
+                    if (candidate == candidates.last()) throw e
                     // else: fall through to the next candidate model
                 }
             }
@@ -204,16 +220,33 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         } catch (e: Exception) {
             // Do NOT truncate the error to 60 chars any more: that hid the
             // "404 model not found" detail that would have named the fix.
+            // A-C6/A-M1: the kind is explicit and isCompleted is FALSE —
+            // an error turn must never persist as a verified routine
+            // or index as a success, and a rate limit is surfaced
+            // distinctly (retry), never as completion.
             val detail = (e.message ?: "Unknown error").take(300)
-            val hint = if (detail.contains("404")) {
-                " Model nahi mila — AI Brain me provider ka default model check karo."
-            } else ""
+            val kind = when {
+                e is DecisionParseException -> "PARSE_ERROR"
+                detail.contains("429") -> "RATE_LIMITED"
+                else -> "ERROR"
+            }
+            val reply = when (kind) {
+                "PARSE_ERROR" -> "Model ka jawab adhoora/gadbad aaya, dobara koshish kar raha hoon."
+                "RATE_LIMITED" -> "Rate limit lag gaya hai, thodi der me dobara koshish karunga."
+                else -> {
+                    val hint = if (detail.contains("404")) {
+                        " Model nahi mila — AI Brain me provider ka default model check karo."
+                    } else ""
+                    "API error: $detail.$hint"
+                }
+            }
             AgentDecision(
-                reply = "API error: $detail.$hint",
+                reply = reply,
                 thought = "Exception: ${e.message}",
                 action = "NONE",
                 askUser = false,
-                isCompleted = true
+                isCompleted = false,
+                decisionKind = kind
             )
         }
     }
@@ -443,14 +476,47 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             .removePrefix("```")
             .removeSuffix("```")
             .trim()
-        // Robust extraction: some models wrap the JSON in prose even
-        // with responseMimeType/json_object. Parsing the first '{'
-        // .. last '}' substring recovers the decision instead of
-        // failing the whole build step with an API error.
-        val obj = runCatching { JSONObject(cleaned) }.getOrElse {
-            val start = cleaned.indexOf('{')
-            val end = cleaned.lastIndexOf('}')
-            if (start >= 0 && end > start) JSONObject(cleaned.substring(start, end + 1)) else throw it
+        // A-M2 STRICT parsing: some models wrap the JSON in prose,
+        // so the first '{' is still the start — but the object must
+        // end at its MATCHING close brace (string-aware scan). A
+        // truncated reply (no matching close) or trailing content
+        // after the close (a second, merged object) is a parse
+        // error — never a partial action, never a merged decision.
+        val start = cleaned.indexOf('{')
+        if (start < 0) throw DecisionParseException("Model reply me JSON object nahi mila")
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var end = -1
+        for (i in start until cleaned.length) {
+            val c = cleaned[i]
+            if (inString) {
+                if (escaped) escaped = false
+                else if (c == '\\') escaped = true
+                else if (c == '"') inString = false
+                continue
+            }
+            when (c) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        end = i
+                        break
+                    }
+                }
+            }
+        }
+        if (end < 0) throw DecisionParseException("Model JSON adhoora/truncated hai")
+        val trailing = cleaned.substring(end + 1).trim().removePrefix("```").trim()
+        if (trailing.isNotEmpty()) {
+            throw DecisionParseException("Model reply me ek se zyada JSON object mile (merge) — partial action nahi liya")
+        }
+        val obj = try {
+            JSONObject(cleaned.substring(start, end + 1))
+        } catch (e: Exception) {
+            throw DecisionParseException("Model JSON parse nahi hua: ${e.message}")
         }
         // Normalise project/file names through the store's ONE
         // canonical form (audit S7): raw model spellings ("Meri
@@ -463,10 +529,80 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         val rawFile = obj.optString("fileName", "")
         val projectName = if (rawProject.isBlank()) "" else ProjectStore.sanitizeProjectName(rawProject)
         val fileName = if (rawFile.isBlank()) "" else (ProjectStore.sanitizeFileName(rawFile) ?: "index.html")
+        // A-H1 per-action validation: known-action allowlist,
+        // required non-blank fields, in-range values. A bad decision
+        // throws (=> error decision, never executed, never partial).
+        // Coordinates are range-checked against the screen again in
+        // the engine gate; here negatives are rejected outright.
+        val action = obj.optString("action", "NONE").uppercase()
+        val knownActions = setOf(
+            "NONE", "OPEN_APP", "YOUTUBE_SEARCH", "YOUTUBE_PLAY",
+            "WHATSAPP_SEND", "OPEN_URL", "OPEN_BROWSER", "REPLY_NOTIFICATION",
+            "TAP_NODE", "TAP_XY", "LONG_PRESS_XY", "TYPE_TEXT", "SCROLL",
+            "NAVIGATE", "MEDIA_CONTROL", "COPY_CLIPBOARD", "WAIT",
+            "FLASHLIGHT", "VOLUME", "CALL", "SET_ALARM", "SAVE_MEMORY",
+            "CREATE_PROJECT", "WRITE_PROJECT_FILE"
+        )
+        if (action !in knownActions) throw DecisionParseException("Unknown action: $action")
+        val appName = obj.optString("appName", "")
+        val nodeId = obj.optInt("nodeId", -1)
+        val x = obj.optInt("x", -1)
+        val y = obj.optInt("y", -1)
+        val text = obj.optString("text", "")
+        val contact = obj.optString("contact", "")
+        val volumePercent = obj.optInt("volumePercent", 50)
+        val alarmHour = obj.optInt("alarmHour", 7)
+        val alarmMinute = obj.optInt("alarmMinute", 0)
+        val direction = obj.optString("direction", "DOWN")
+        val navTarget = obj.optString("navTarget", "BACK")
+        val memoryNote = obj.optString("memoryNote", "")
+        val fileContent = obj.optString("fileContent", "")
+        val browserUrl = obj.optString("browserUrl", "")
+        fun need(cond: Boolean, msg: String) {
+            if (!cond) throw DecisionParseException(msg)
+        }
+        when (action) {
+            "OPEN_APP" -> need(appName.isNotBlank(), "OPEN_APP appName blank")
+            "YOUTUBE_SEARCH", "YOUTUBE_PLAY" -> need(
+                text.isNotBlank() || appName.isNotBlank(), "$action query blank"
+            )
+            "WHATSAPP_SEND", "REPLY_NOTIFICATION" -> need(
+                contact.isNotBlank() && text.isNotBlank(), "$action contact/text blank"
+            )
+            "OPEN_URL" -> need(text.isNotBlank(), "OPEN_URL text blank")
+            "OPEN_BROWSER" -> need(browserUrl.isNotBlank(), "OPEN_BROWSER browserUrl blank")
+            "TAP_NODE" -> need(nodeId > 0, "TAP_NODE nodeId missing")
+            "TAP_XY", "LONG_PRESS_XY" -> need(
+                x >= 0 && y >= 0, "$action coordinates negative — rejected, never coerced"
+            )
+            "TYPE_TEXT" -> need(text.isNotBlank(), "TYPE_TEXT text blank")
+            "SCROLL" -> need(
+                direction.uppercase() in setOf("DOWN", "UP", "LEFT", "RIGHT", "NEXT", "PREVIOUS"),
+                "SCROLL direction invalid"
+            )
+            "NAVIGATE" -> need(
+                navTarget.uppercase() in setOf(
+                    "BACK", "HOME", "RECENTS", "NOTIFICATIONS",
+                    "QUICK_SETTINGS", "LOCK_SCREEN", "SCREENSHOT"
+                ), "NAVIGATE target invalid"
+            )
+            "MEDIA_CONTROL" -> need(
+                text.uppercase() in setOf("PLAY_PAUSE", "NEXT", "PREVIOUS", "PLAY", "PAUSE"),
+                "MEDIA_CONTROL text invalid"
+            )
+            "COPY_CLIPBOARD" -> need(text.isNotBlank(), "COPY_CLIPBOARD text blank")
+            "VOLUME" -> need(volumePercent in 0..100, "VOLUME out of range — rejected, never coerced")
+            "CALL" -> need(contact.isNotBlank(), "CALL contact blank")
+            "SET_ALARM" -> need(
+                alarmHour in 0..23 && alarmMinute in 0..59, "SET_ALARM time out of range"
+            )
+            "SAVE_MEMORY" -> need(memoryNote.isNotBlank(), "SAVE_MEMORY memoryNote blank")
+            "WRITE_PROJECT_FILE" -> need(fileContent.isNotBlank(), "WRITE_PROJECT_FILE fileContent blank")
+        }
         return AgentDecision(
             reply = obj.optString("reply", ""),
             thought = obj.optString("thought", ""),
-            action = obj.optString("action", "NONE").uppercase(),
+            action = action,
             appName = obj.optString("appName", ""),
             nodeId = obj.optInt("nodeId", -1),
             x = obj.optInt("x", -1),
@@ -488,7 +624,10 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             browserSpeakSummary = obj.optBoolean("browserSpeakSummary", true),
             browserShowPage = obj.optBoolean("browserShowPage", false),
             askUser = obj.optBoolean("askUser", false),
-            isCompleted = obj.optBoolean("isCompleted", true)
+            // A-H1: isCompleted defaults FALSE for non-NONE actions —
+            // a step without an explicit completion flag must NOT
+            // end the task (engine exits on isCompleted only, A-H2).
+            isCompleted = obj.optBoolean("isCompleted", action == "NONE")
         )
     }
 }

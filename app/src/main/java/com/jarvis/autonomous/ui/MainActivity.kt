@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Mic
@@ -233,9 +234,30 @@ fun JarvisMainApp(
     val showKokoroOverlay = !kokoroDismissed &&
         (kokoroChecking || (kokoroStage == "copying") || kokoroError != null)
 
+    // C-B13: the permission-result map is HANDLED, not ignored.
+    // A denied mic permission explains itself in a banner, can be
+    // re-requested from that banner, and disables voice UI until
+    // granted (re-checked on every resume, so granting it in
+    // Settings clears the banner on return).
+    var micPermissionDenied by remember { mutableStateOf(false) }
     val runtimePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ -> }
+    ) { result ->
+        micPermissionDenied =
+            result[Manifest.permission.RECORD_AUDIO] != true
+    }
+    val mainLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(mainLifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                micPermissionDenied = ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.RECORD_AUDIO
+                ) != PackageManager.PERMISSION_GRANTED
+            }
+        }
+        mainLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { mainLifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(Unit) {
         val perms = mutableListOf(
@@ -295,6 +317,12 @@ fun JarvisMainApp(
                     icon = { Icon(Icons.Default.Security, contentDescription = null) },
                     label = { Text("Licence") }
                 )
+                NavigationBarItem(
+                    selected = selectedTab == 7,
+                    onClick = { selectedTab = 7 },
+                    icon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                    label = { Text("Whiteboard") }
+                )
             }
         }
     ) { innerPadding ->
@@ -308,7 +336,8 @@ fun JarvisMainApp(
                     onStartVoice = onStartVoice,
                     onStopTask = onStopTask,
                     onSendTextCommand = onSendTextCommand,
-                    onNavigatePermissions = { selectedTab = 1 }
+                    onNavigatePermissions = { selectedTab = 1 },
+                    voiceDisabled = micPermissionDenied
                 )
 
                 1 -> PermissionsChecklistScreen()
@@ -331,9 +360,43 @@ fun JarvisMainApp(
                 5 -> BrowserScreen(browserHost)
 
                 6 -> LicenceScreen()
+
+                7 -> WhiteboardScreen()
             }
         }
     }
+        // C-B13 mic-permission explainer banner (above content,
+        // below the Kokoro overlay when that is showing).
+        if (micPermissionDenied) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFF5D6D6))
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "Microphone permission nahi mili — voice band hai. " +
+                            "Bina mic ke Jarvis sirf text commands par kaam karega.",
+                        fontSize = 13.sp,
+                        color = Color(0xFF3B2F2A)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                runtimePermissionLauncher.launch(
+                                    arrayOf(Manifest.permission.RECORD_AUDIO)
+                                )
+                            }
+                        ) { Text("Dobara permission maango") }
+                        Button(
+                            onClick = { selectedTab = 1 },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF8A7A70)
+                            )
+                        ) { Text("Permissions kholo") }
+                    }
+                }
+            }
+        }
         // Kokoro first-run overlay (blocks the chat behind it while
         // copying, so a tap cannot queue a speak that silently fails).
         if (showKokoroOverlay) {
@@ -424,7 +487,9 @@ fun CommandCenterScreen(
     onStartVoice: () -> Unit,
     onStopTask: () -> Unit,
     onSendTextCommand: (String) -> Unit,
-    onNavigatePermissions: () -> Unit
+    onNavigatePermissions: () -> Unit,
+    /** C-B13: true while RECORD_AUDIO is denied — voice UI disabled. */
+    voiceDisabled: Boolean = false
 ) {
     val agentState by JarvisStateRepository.agentState.collectAsState()
     val currentGoal by JarvisStateRepository.currentGoal.collectAsState()
@@ -516,7 +581,10 @@ fun CommandCenterScreen(
                 state = agentState,
                 onClick = {
                     if (agentState == AgentRunState.IDLE) {
-                        onStartVoice()
+                        // C-B13: voice disabled -> go to Permissions
+                        // instead of firing a voice start that can
+                        // only fail.
+                        if (voiceDisabled) onNavigatePermissions() else onStartVoice()
                     } else {
                         onStopTask()
                     }
@@ -691,6 +759,7 @@ fun CommandCenterScreen(
             )
             Spacer(modifier = Modifier.width(8.dp))
             IconButton(
+                enabled = textInput.isNotBlank() || !voiceDisabled,
                 onClick = {
                     if (textInput.isNotBlank()) {
                         onSendTextCommand(textInput)
@@ -1051,7 +1120,6 @@ fun AiBrainSettingsScreen(
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
     var stepDelay by remember { mutableFloatStateOf(prefs.stepDelayMs.toFloat()) }
-    var voiceSpeed by remember { mutableFloatStateOf(prefs.voiceSpeed) }
     var saveBanner by remember { mutableStateOf("") }
 
     Column(
@@ -1246,6 +1314,42 @@ fun AiBrainSettingsScreen(
                     ) {
                         Text(if (kokoroReady) "Use Kokoro Voice" else "Kokoro setup karo (bundled copy, no download)")
                     }
+                    // B-C1 reset path: corrupt copy? Delete the
+                    // whole model dir and re-copy bundled assets
+                    // fresh — this is the Settings retry that
+                    // actually fixes a bad copy, not just re-checks it.
+                    Button(
+                        enabled = !kokoroWorking,
+                        onClick = {
+                            kokoroWorking = true
+                            kokoroProgress = "Reset ho raha hai — purana model delete, dobara copy…"
+                            kokoroScope.launch {
+                                val result = KokoroTtsClient.resetAndCopy(kokoroContext) { stage, copied, total ->
+                                    kokoroScope.launch {
+                                        kokoroProgress = when (stage) {
+                                            "checking_space" -> "Storage check ho raha hai…"
+                                            "copying" -> "Dobara copy ho raha hai: $copied / $total MB."
+                                            else -> "Ready ✅"
+                                        }
+                                    }
+                                }
+                                kokoroWorking = false
+                                if (result.isSuccess) {
+                                    kokoroReady = true
+                                    kokoroProgress = "Kokoro reset complete ✅ — fresh copy taiyaar."
+                                    kokoroOn = true
+                                } else {
+                                    kokoroReady = false
+                                    kokoroProgress = result.exceptionOrNull()?.message
+                                        ?: "Kokoro reset fail ho gaya."
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                    ) {
+                        Text("Kokoro reset — dobara copy karo")
+                    }
                 }
             }
         }
@@ -1376,14 +1480,15 @@ fun AiBrainSettingsScreen(
             valueRange = 300f..2500f
         )
 
+        // B-L12: the old Voice Speech Speed slider is REMOVED —
+        // it only ever tuned system TTS, which no longer exists
+        // (Kokoro-only build, fixed speed 1.0f). A slider that
+        // saves a dead pref is worse than no slider.
         Text(
-            text = "Voice Speech Speed: ${"%.2f".format(voiceSpeed)}x",
+            text = "Voice speed: Kokoro fixed speed par bolta hai " +
+                "(speed slider hataya gaya — wo sirf purani system " +
+                "voice ko control karta tha, Kokoro ko nahi).",
             fontSize = 13.sp
-        )
-        Slider(
-            value = voiceSpeed,
-            onValueChange = { voiceSpeed = it },
-            valueRange = 0.7f..1.6f
         )
 
         Button(
@@ -1403,7 +1508,6 @@ fun AiBrainSettingsScreen(
                 prefs.kokoroEnabled = kokoroOn
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
-                prefs.voiceSpeed = voiceSpeed
                 onSettingsUpdated()
                 saveBanner = "Settings Saved & Applied Successfully ✅"
             },

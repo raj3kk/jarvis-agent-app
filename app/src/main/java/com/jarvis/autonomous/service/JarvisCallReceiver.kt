@@ -3,7 +3,6 @@ package com.jarvis.autonomous.service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.provider.ContactsContract
 import android.telephony.TelephonyManager
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -32,10 +31,17 @@ class JarvisCallReceiver : BroadcastReceiver() {
         val prefs = JarvisPreferences(context.applicationContext)
         if (!prefs.autoAnnounceNotifications) return
 
+        // C-B13 GENERIC-ONLY: no contact-name lookup (phone-state
+        // permissions are NOT restored, so the caller is never
+        // pretended). Blank number -> generic marker; the engine
+        // turns it into "call aa rahi hai, number nahi dikh raha".
+        // Non-blank on purpose: the foreground service only
+        // announces non-blank display values.
         val number = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER) ?: ""
-        val name = lookupContactName(context, number)
-        val display = name.ifBlank { number.ifBlank { "unknown number" } }
-        JarvisStateRepository.addLog("Incoming call ringing from $display")
+        val display = number.ifBlank { "number nahi dikh raha" }
+        JarvisStateRepository.addLog(
+            "Incoming call ringing (number ${if (number.isBlank()) "hidden" else "present"})"
+        )
 
         val announceIntent = Intent(context.applicationContext, JarvisForegroundService::class.java).apply {
             action = JarvisForegroundService.ACTION_ANNOUNCE_CALL
@@ -46,26 +52,4 @@ class JarvisCallReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun lookupContactName(context: Context, number: String): String {
-        if (number.isBlank()) return ""
-        val digits = number.filter { it.isDigit() }.takeLast(10)
-        if (digits.length < 7) return ""
-        return runCatching {
-            val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
-            val projection = arrayOf(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER
-            )
-            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
-                val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                while (cursor.moveToNext()) {
-                    val name = cursor.getString(nameIdx) ?: continue
-                    val num = cursor.getString(numIdx) ?: continue
-                    if (num.filter { it.isDigit() }.takeLast(10) == digits) return name
-                }
-            }
-            ""
-        }.getOrDefault("")
-    }
 }

@@ -1,7 +1,5 @@
 package com.jarvis.autonomous.ui
 
-import android.view.ViewGroup
-import android.webkit.WebView
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -32,7 +30,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
 import kotlinx.coroutines.Dispatchers
@@ -79,9 +76,20 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
     var fileError by remember { mutableStateOf<String?>(null) }
     var previewBaseUrl by remember { mutableStateOf<String?>(null) }
     var previewNonce by remember { mutableStateOf(0) }
+    // B-L5: which project the inline preview is actually showing.
+    // The nonce bump on Save and the clear-on-delete below are scoped
+    // to THIS project only — editing project B must never reload (or
+    // clear) project A's preview.
+    var previewProject by remember { mutableStateOf<String?>(null) }
     var previewStarting by remember { mutableStateOf(false) }
     var previewError by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("") }
+    // B-L6: true once the editor text differs from the loaded file.
+    // A file/project switch with unsaved edits asks first (banner
+    // below) instead of silently discarding them.
+    var editorDirty by remember { mutableStateOf(false) }
+    // B-L6: a switch the user has not confirmed yet (project, file).
+    var pendingSwitch by remember { mutableStateOf<Pair<String, String>?>(null) }
     val scope = rememberCoroutineScope()
 
     // Full preview URL: the ?v= nonce busts the WebView cache on
@@ -96,6 +104,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
     }
 
     fun loadFile(project: String, file: String) {
+        selected = project
         selectedFile = file
         when (val read = ProjectStore.readFileStatus(context, project, file)) {
             is ProjectStore.FileRead.Ok -> {
@@ -111,14 +120,51 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 fileError = "File khaali hai: $project/$file — isme koi code nahi hai. Neeche Restore dabao ya dobara likho."
             }
         }
+        editorDirty = false
+    }
+
+    /**
+     * B-L6 gate: when the editor has unsaved edits and the target is
+     * a DIFFERENT file/project, the switch is parked in pendingSwitch
+     * and the banner below asks — loadFile() is NOT called, so the
+     * edits survive until the user chooses Discard or Cancel. A
+     * switch to the already-open file, or with a clean editor, loads
+     * immediately. Callers that just saved/created the file use
+     * loadFile() directly (no gate — there is nothing to lose).
+     */
+    fun requestLoad(project: String, file: String) {
+        if (editorDirty && (project != selected || file != selectedFile)) {
+            pendingSwitch = project to file
+            return
+        }
+        loadFile(project, file)
     }
 
     fun openProject(name: String) {
         val clean = ProjectStore.sanitizeProjectName(name)
         refresh()
-        selected = clean
+        // B-L5 + B-L6 ordering: the dirty gate runs BEFORE the preview
+        // is cleared — a parked switch (user has not confirmed yet)
+        // must not destroy the old project's preview, and the banner's
+        // Discard path clears it when the switch actually happens.
+        if (editorDirty && clean != selected) {
+            pendingSwitch = clean to "index.html"
+            return
+        }
+        previewBaseUrl = null
+        previewProject = null
         previewError = null
         loadFile(clean, "index.html")
+    }
+
+    /** B-L7: one detail string for every validation failure mode —
+     *  missing, empty AND invalid (absolute/escaping) references —
+     *  so a failure never falls through to a generic message. */
+    fun validationDetail(validation: ProjectStore.ProjectValidation): String {
+        val parts = validation.missingFiles.map { "$it missing" } +
+            validation.emptyFiles.map { "$it khaali" } +
+            validation.invalidRefs.map { "$it galat reference" }
+        return parts.joinToString(", ")
     }
 
     /**
@@ -137,10 +183,8 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 ProjectStore.validateProject(context, clean)
             }
             if (!validation.ok) {
-                val detail = (validation.missingFiles.map { "$it missing" } +
-                    validation.emptyFiles.map { "$it khaali" }).joinToString(", ")
                 previewStarting = false
-                previewError = "Preview nahi chal sakta — $detail. Pehle Projects editor me file theek karo ya Jarvis ko dobara banane bolo."
+                previewError = "Preview nahi chal sakta — ${validationDetail(validation)}. Pehle Projects editor me file theek karo ya Jarvis ko dobara banane bolo."
                 return@launch
             }
             val (_, ready) = withContext(Dispatchers.IO) {
@@ -152,6 +196,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 return@launch
             }
             previewBaseUrl = ProjectStore.localhostUrl(clean)
+            previewProject = clean
             previewNonce += 1
             status = "Preview chal raha hai: ${ProjectStore.localhostUrl(clean)}"
         }
@@ -163,10 +208,19 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
      * Browser tab borrows it without reloading — see BrowserScreen).
      * Requires the coordinator wiring (browserHost); without it, the
      * inline preview is shown instead and the status says so.
+     * B-M7: validated with the SAME gate as Preview — an unvalidated
+     * project must not open in the Browser tab either.
      */
     fun openInBrowser(project: String) {
         val clean = ProjectStore.sanitizeProjectName(project)
         scope.launch {
+            val validation = withContext(Dispatchers.IO) {
+                ProjectStore.validateProject(context, clean)
+            }
+            if (!validation.ok) {
+                previewError = "Browser me nahi khol sakta — ${validationDetail(validation)}. Pehle Projects editor me file theek karo ya Jarvis ko dobara banane bolo."
+                return@launch
+            }
             val (_, ready) = withContext(Dispatchers.IO) {
                 ProjectPreviewServer.ensureRunningReady(context)
             }
@@ -178,6 +232,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
             val host = browserHost
             if (host == null) {
                 previewBaseUrl = url
+                previewProject = clean
                 previewNonce += 1
                 status = "Browser tab wiring abhi coordinator se pending hai — preview yahin (same engine) khul gaya: $url"
             } else {
@@ -223,16 +278,36 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                     onClick = {
                         if (newName.isBlank()) {
                             status = "Pehle project ka naam likho."
+                        } else if (ProjectStore.isRejectedProjectName(newName)) {
+                            // B-M5: "." / ".." are refused outright —
+                            // they must never become a project folder.
+                            status = "'.' ya '..' project ka naam nahi ho sakta."
                         } else {
                             // Single canonical name form (store-side
                             // sanitize) — the old screen-side regex
                             // produced a different selected name than
                             // the listed project, hiding file chips.
-                            val clean = ProjectStore.sanitizeProjectName(newName)
+                            val normalized = ProjectStore.sanitizeProjectName(newName)
+                            // B-M5: a DIFFERENT raw name that normalises
+                            // onto an existing folder gets a suffix
+                            // (-2, -3, …), never a silent overwrite of
+                            // that folder's index.html. An exact-name
+                            // re-create keeps the old re-build meaning.
+                            val clean = if (ProjectStore.projectExists(context, normalized) &&
+                                newName.trim() != normalized
+                            ) {
+                                ProjectStore.uniqueProjectName(context, newName)
+                            } else {
+                                normalized
+                            }
                             ProjectStore.createProject(context, clean, null)
                             newName = ""
                             openProject(clean)
-                            status = "Project ban gaya — index.html, style.css, script.js ready hain."
+                            status = if (clean != normalized) {
+                                "Project ban gaya — '$normalized' pehle se tha, isliye '$clean' banaya gaya. index.html, style.css, script.js ready hain."
+                            } else {
+                                "Project ban gaya — index.html, style.css, script.js ready hain."
+                            }
                         }
                     },
                     modifier = Modifier.fillMaxWidth()
@@ -267,14 +342,27 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                         OutlinedButton(onClick = { openInBrowser(project.name) }) { Text("Browser me kholo", fontSize = 12.sp) }
                         OutlinedButton(
                             onClick = {
-                                ProjectStore.deleteProject(context, project.name)
-                                if (selected == project.name) {
-                                    selected = null
-                                    previewBaseUrl = null
-                                    previewError = null
+                                // B-M6: deleteProject's Boolean is
+                                // respected — a failed delete must not
+                                // claim success, and the Documents copy
+                                // is left alone by the store in that
+                                // case. Preview state clears only for
+                                // the project actually deleted (B-L5).
+                                val deleted = ProjectStore.deleteProject(context, project.name)
+                                if (!deleted) {
+                                    status = "Delete NAHI hua: ${project.name} — dobara try karo."
+                                } else {
+                                    if (selected == project.name) {
+                                        selected = null
+                                    }
+                                    if (previewProject == project.name) {
+                                        previewBaseUrl = null
+                                        previewProject = null
+                                        previewError = null
+                                    }
+                                    refresh()
+                                    status = "Project delete ho gaya: ${project.name}"
                                 }
-                                refresh()
-                                status = "Project delete ho gaya: ${project.name}"
                             }
                         ) { Text("Delete", fontSize = 12.sp) }
                     }
@@ -287,6 +375,38 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         if (current != null) {
             val files = projects.firstOrNull { it.name == current }?.files ?: emptyList()
             Text("Editing: $current", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            // B-L6: unsaved-edit confirmation banner. Shown only when
+            // a switch was parked; Discard loads the parked file and
+            // drops the edits, Cancel keeps editing the current file.
+            val parked = pendingSwitch
+            if (parked != null) {
+                Text(
+                    "Unsaved edits hain — switch karne par ye edits khatam ho jayengi.",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFB3261E)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            pendingSwitch = null
+                            editorDirty = false
+                            // B-L5: a confirmed PROJECT switch clears
+                            // the old preview; a same-project file
+                            // switch leaves it alone.
+                            if (parked.first != selected) {
+                                previewBaseUrl = null
+                                previewProject = null
+                                previewError = null
+                            }
+                            loadFile(parked.first, parked.second)
+                        }
+                    ) { Text("Discard karke switch karo", fontSize = 12.sp) }
+                    OutlinedButton(
+                        onClick = { pendingSwitch = null }
+                    ) { Text("Cancel (edit karte raho)", fontSize = 12.sp) }
+                }
+            }
             if (files.isEmpty()) {
                 Text(
                     "Is project me koi file nahi hai. Template files dobara banao, ya neeche se nayi file jodo.",
@@ -308,7 +428,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                     files.forEach { file ->
                         FilterChip(
                             selected = selectedFile == file,
-                            onClick = { loadFile(current, file) },
+                            onClick = { requestLoad(current, file) },
                             label = { Text(file, fontSize = 12.sp) }
                         )
                     }
@@ -322,10 +442,17 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 if (restoreContent.isNotBlank()) {
                     OutlinedButton(
                         onClick = {
-                            if (ProjectStore.writeFile(context, current, selectedFile, restoreContent)) {
+                            // B-M6: the restore reports its export
+                            // status too, not just the working copy.
+                            val result = ProjectStore.writeFileDetailed(context, current, selectedFile, restoreContent)
+                            if (result.workingOk) {
                                 loadFile(current, selectedFile)
                                 refresh()
-                                status = "Restore ho gaya: $current/$selectedFile"
+                                status = if (result.exportOk) {
+                                    "Restore ho gaya: $current/$selectedFile"
+                                } else {
+                                    "Restore ho gaya (working copy), lekin Documents export fail hua: $current/$selectedFile"
+                                }
                             } else {
                                 status = "Restore nahi ho paya — dobara try karo."
                             }
@@ -336,7 +463,12 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
             if (files.isNotEmpty()) {
                 OutlinedTextField(
                     value = fileContent,
-                    onValueChange = { fileContent = it },
+                    onValueChange = {
+                        fileContent = it
+                        // B-L6: any edit marks the editor dirty until
+                        // a successful Save clears it.
+                        editorDirty = true
+                    },
                     label = { Text("$current / $selectedFile") },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -346,15 +478,28 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
-                            val ok = ProjectStore.writeFile(context, current, selectedFile, fileContent)
-                            if (!ok) {
-                                status = "Save NAHI hua: $current/$selectedFile — khaali template file ya galat naam ho sakta hai."
+                            // B-M6: the save reports working-copy and
+                            // Documents-export status separately — an
+                            // export failure is never announced as
+                            // "export ho gaya".
+                            val result = ProjectStore.writeFileDetailed(context, current, selectedFile, fileContent)
+                            if (!result.workingOk) {
+                                status = "Save NAHI hua: $current/$selectedFile — khaali file ya galat naam ho sakta hai."
                                 return@Button
                             }
+                            editorDirty = false
                             refresh()
-                            // Preview open hai to turant refresh (cache-bust nonce).
-                            if (previewBaseUrl != null) previewNonce += 1
-                            status = "Saved: $current/$selectedFile — Documents/JarvisProjects me bhi export ho gaya."
+                            // B-L5: reload the preview only when the
+                            // file just saved belongs to the project
+                            // actually being previewed.
+                            if (previewBaseUrl != null && previewProject == current) {
+                                previewNonce += 1
+                            }
+                            status = if (result.exportOk) {
+                                "Saved: $current/$selectedFile — Documents/JarvisProjects me bhi export ho gaya."
+                            } else {
+                                "Saved (working copy): $current/$selectedFile — lekin Documents export FAIL hua, Files app me naya version nahi dikhega."
+                            }
                             fileError = null
                         }
                     ) { Text("Save File") }
@@ -380,12 +525,31 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                             status = "Galat file naam — sirf letters, digits, ., -, _ aur / use karo, .. mat likho."
                             return@OutlinedButton
                         }
-                        val content = ProjectStore.defaultFileContent(safe, current)
-                        if (ProjectStore.writeFile(context, current, safe, content)) {
+                        // B-L6: blank writes are refused for ALL files
+                        // now, so a new non-template file gets a small
+                        // placeholder comment instead of a refused
+                        // empty write (the editor then shows real
+                        // content to replace, not a mystery failure).
+                        val template = ProjectStore.defaultFileContent(safe, current)
+                        val content = if (template.isNotBlank()) {
+                            template
+                        } else if (safe.lowercase().endsWith(".css")) {
+                            "/* new file: $safe */\n"
+                        } else if (safe.lowercase().endsWith(".js")) {
+                            "// new file: $safe\n"
+                        } else {
+                            "<!-- new file: $safe -->\n"
+                        }
+                        val result = ProjectStore.writeFileDetailed(context, current, safe, content)
+                        if (result.workingOk) {
                             newFileName = ""
                             refresh()
                             loadFile(current, safe)
-                            status = "File jod di: $current/$safe"
+                            status = if (result.exportOk) {
+                                "File jod di: $current/$safe"
+                            } else {
+                                "File jod di (working copy): $current/$safe — lekin Documents export fail hua."
+                            }
                         } else {
                             status = "File nahi bani: $current/$safe — save fail hua."
                         }
@@ -414,26 +578,18 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         if (url != null && previewErr == null) {
             Text("Live Preview (localhost, isi phone par — Browser tab wala engine):", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Text(previewBaseUrl ?: url, fontSize = 12.sp, color = Color(0xFFB85C38))
-            // The shared WebView instance. Factory detaches it from
-            // any previous parent (e.g. the Browser tab); update
-            // loads ONLY when the target URL string changes, so the
-            // Browser tab can later borrow it back without a reload,
-            // and typing in the editor never resets the preview.
-            // onRelease deliberately does NOT destroy it.
-            AndroidView(
-                factory = { ctx ->
-                    val shared: WebView = JarvisBackgroundBrowser.obtainWebView(ctx)
-                    (shared.parent as? ViewGroup)?.removeView(shared)
-                    shared
-                },
-                update = { webView ->
-                    if (webView.url != url) {
-                        webView.loadUrl(url)
-                    }
-                },
-                onRelease = {
-                    // Shared instance survives tab switches: no destroy.
-                },
+            // B-L4: the preview renders through the shared JarvisWebView
+            // composable (same engine as the Browser tab) WITH its error
+            // callbacks wired — the old raw AndroidView had no error
+            // path, so a dead server left a blank box with no reason.
+            // A load failure now lands in previewError above instead.
+            // The update block loads ONLY when the target URL string
+            // changes, so the Browser tab can later borrow it back
+            // without a reload, and typing in the editor never resets
+            // the preview. onRelease deliberately does NOT destroy it.
+            JarvisWebView(
+                targetUrl = url,
+                onError = { previewError = it },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(420.dp)

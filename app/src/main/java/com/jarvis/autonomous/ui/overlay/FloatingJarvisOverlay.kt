@@ -1,6 +1,8 @@
 package com.jarvis.autonomous.ui.overlay
 
 import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -14,6 +16,8 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import com.jarvis.autonomous.R
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisStateRepository
 import kotlinx.coroutines.CoroutineScope
@@ -40,6 +44,11 @@ class FloatingJarvisOverlay(
     fun show() {
         if (rootView != null) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
+            // B-L13: a denied overlay used to fail silently — the user
+            // just saw no pill and no reason. Surface it on both
+            // channels the app already has: the state log (visible in
+            // Memory & Logs) and a notification.
+            reportShowFailure("Overlay permission nahi mili.")
             return
         }
 
@@ -147,6 +156,13 @@ class FloatingJarvisOverlay(
             orbButton = orb
             statusTextView = statusLabel
             stopButton = stopBtn
+        }.onFailure {
+            // B-L13: a failed addView must not leave a live status
+            // scope collecting into a null view forever, and must not
+            // fail silently either. Report, then return before the
+            // scope below is launched.
+            reportShowFailure("Overlay window add nahi ho paya: ${it.message ?: "unknown error"}")
+            return
         }
 
         overlayScope = CoroutineScope(SupervisorJob() + Dispatchers.Main).apply {
@@ -157,6 +173,33 @@ class FloatingJarvisOverlay(
                 ) { state, step -> state to step }.collect { (state, step) ->
                     updateHudAppearance(state, step)
                 }
+            }
+        }
+    }
+
+    /** B-L13 failure channel: state log + notification, best effort
+     *  (a missing notification permission must not throw here). */
+    private fun reportShowFailure(reason: String) {
+        JarvisStateRepository.addLog("Jarvis overlay nahi khul paya: $reason")
+        runCatching {
+            val channelId = "jarvis_overlay_channel"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    channelId,
+                    "JARVIS Overlay",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Reports when the floating Jarvis overlay cannot be shown"
+                }
+                val nm = context.getSystemService(NotificationManager::class.java)
+                nm.createNotificationChannel(channel)
+                val notification = NotificationCompat.Builder(context, channelId)
+                    .setSmallIcon(R.drawable.ic_jarvis_core)
+                    .setContentTitle("JARVIS overlay nahi khula")
+                    .setContentText(reason)
+                    .setAutoCancel(true)
+                    .build()
+                nm.notify(1004, notification)
             }
         }
     }

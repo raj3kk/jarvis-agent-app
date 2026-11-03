@@ -219,28 +219,6 @@ class JarvisPreferences(context: Context) {
         }
         set(value) = prefs.edit().putLong("step_delay_ms", value.coerceIn(300L, 5000L)).apply()
 
-    var voiceSpeed: Float
-        get() {
-            val v = prefs.getFloat("voice_speed", 1.30f)
-            if (v == 1.05f) {
-                prefs.edit().putFloat("voice_speed", 1.30f).apply()
-                return 1.30f
-            }
-            return v
-        }
-        set(value) = prefs.edit().putFloat("voice_speed", value.coerceIn(0.6f, 1.8f)).apply()
-
-    var voicePitch: Float
-        get() {
-            val v = prefs.getFloat("voice_pitch", 1.15f)
-            if (v == 0.95f) {
-                prefs.edit().putFloat("voice_pitch", 1.15f).apply()
-                return 1.15f
-            }
-            return v
-        }
-        set(value) = prefs.edit().putFloat("voice_pitch", value.coerceIn(0.6f, 1.5f)).apply()
-
     // Persistent chat memory: the last 30 turns survive app restarts, so
     // Jarvis does not forget the conversation (or the user) on relaunch.
     // ChatEntry lives in this same package, so no import is needed.

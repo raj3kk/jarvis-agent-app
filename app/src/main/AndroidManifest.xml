@@ -20,9 +20,21 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!-- App discovery & Hardware Control -->
-    <uses-permission
-        android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
+    <!-- NOTE (1.4.1, C-B17): QUERY_ALL_PACKAGES was dropped. Launcher
+         discovery keeps working WITHOUT it via the scoped <queries>
+         declaration below (MAIN/LAUNCHER intent only): the service
+         queries launchable apps by intent, and only the matched
+         app's label/package is ever logged — no installed-app list
+         is collected or sent anywhere. MATCH_ALL is kept (not
+         MATCH_DEFAULT_ONLY) deliberately: LAUNCHER activities do not
+         declare CATEGORY_DEFAULT, so MATCH_DEFAULT_ONLY would return
+         nothing and break app launching by name. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.FLASHLIGHT" />

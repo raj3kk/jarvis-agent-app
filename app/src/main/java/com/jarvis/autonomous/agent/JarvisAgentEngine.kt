@@ -37,9 +37,21 @@ import java.net.URL
 class JarvisAgentEngine(
     private val context: Context,
     private val prefs: JarvisPreferences,
-    private val onSpeakAndAwait: suspend (String) -> Unit,
+    // B-M8 (1.4.1): Boolean = spoken aloud (true) vs TTS failed /
+    // unavailable (false). Callers inside this file go through
+    // speak() below, which falls back to a visible chat prompt on
+    // false instead of waiting for an answer to an unspoken question.
+    // NOTE (coordinator-owned): JarvisForegroundService's lambda
+    // must return Boolean after this change — it is NOT edited here.
+    private val onSpeakAndAwait: suspend (String) -> Boolean,
     private val onRequestUserVoiceReply: suspend () -> String?,
-    private val onShowBrowserPage: ((String) -> Unit)? = null
+    private val onShowBrowserPage: ((String) -> Unit)? = null,
+    // B-M3 (1.4.1, coordinator-wired): true when the Browser tab is
+    // currently visible. Null = host gives no visibility signal, in
+    // which case background browse proceeds as before (see
+    // executeBrowserLoad) — the coordinator must wire this for the
+    // full no-hijack guarantee.
+    private val isBrowserTabVisible: (() -> Boolean)? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val llmClient = LlmClient(context, prefs)
@@ -57,6 +69,29 @@ class JarvisAgentEngine(
     private val approvedBrowserUrls = mutableSetOf<String>()
     private var interruptedBrowseChecked = false
     private var loopUserCommand: String = ""
+    // A-C2/A-C5/B-M9 task-scoped state: confirmed sensitive actions
+    // live only for the current attempt and expire at task end.
+    private val confirmedSensitiveKeys = mutableSetOf<String>()
+    // B-M3: background loads deferred because the Browser tab was visible.
+    private val deferredBrowseUrls = mutableListOf<String>()
+    // A-C4: an OPEN_URL awaiting approval must reopen externally on
+    // yes, not via the background-browser path.
+    private var pendingBrowserOpenExternal: Boolean = false
+    private var lastBuildWritten: Boolean = false
+    private var lastExecutedAction: String = ""
+
+    /** URLs deferred by the B-M3 visibility check (never auto-loaded). */
+    fun pendingDeferredBrowseUrls(): List<String> = deferredBrowseUrls.toList()
+
+    /** Clears ALL per-attempt state (A-C7): routine buffer, browser
+     *  approvals and sensitive confirmations. Called at every task
+     *  start and every termination path, so nothing leaks across
+     *  attempts. */
+    private fun clearTaskScopedState() {
+        learnedRoutineStore.clearPending()
+        approvedBrowserUrls.clear()
+        confirmedSensitiveKeys.clear()
+    }
 
     // Last build validation, set by the CREATE/WRITE branches so
     // the loop can repair (§5c) or summarise (§6) without a second
@@ -73,12 +108,76 @@ class JarvisAgentEngine(
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
         } catch (e: Exception) {
-            JarvisStateRepository.addLog("isOnline check failed (${e.message}) — assuming online.")
-            true
+            // A-M7: a connectivity-check throw must NEVER assume
+            // online — a failed check means "unknown", and the safe
+            // reading is offline (pause, warn, do not complete).
+            JarvisStateRepository.addLog("isOnline check failed (${e.message}) — treating as offline.")
+            false
         }
     }
 
+    // ---- 1.4.1 safety helpers (A-C1 negation, B-M8 speak fallback) ----
+
+    private val NEGATION_TOKENS = setOf(
+        "nahi", "nahin", "nhi", "no", "never", "not", "mat", "mt",
+        "dont", "don't", "na", "kabhi"
+    )
+
+    /** Lowercase + punctuation-stripped tokens ("don't" -> "dont"). */
+    private fun replyTokens(reply: String): List<String> =
+        reply.lowercase().replace(Regex("[^a-z ]"), " ")
+            .split(" ").filter { it.isNotBlank() }
+
+    /** True when the reply contains ANY negation token. A negated
+     *  reply must NEVER confirm (A-C1) — checked before every
+     *  affirmative test in this file. */
+    private fun containsNegation(reply: String): Boolean =
+        replyTokens(reply).any { it in NEGATION_TOKENS }
+
+    private fun isDeclineReply(reply: String): Boolean {
+        val lower = reply.lowercase().trim()
+        if (containsNegation(reply)) return true
+        return lower in setOf(
+            "rehne do", "rehne de", "rehene do", "chhodo", "chhod do",
+            "cancel", "band karo", "ruk ja", "ruko", "bas kar"
+        )
+    }
+
+    /** Negation-aware yes: affirmative words AND no negation token.
+     *  "mat bhejo" contains "bhej" but is a NO, never a yes. */
+    private fun isYesReply(reply: String): Boolean {
+        if (reply.isBlank() || containsNegation(reply)) return false
+        val lower = reply.lowercase()
+        return lower.contains("haan") || lower.contains("yes") ||
+            lower.contains("chalao") || lower.contains("play") ||
+            lower.contains("bajao") || lower.contains("bhej") ||
+            lower.contains("send") || lower.contains("khol do") ||
+            lower.contains("dikhao") || lower.trim() == "ok"
+    }
+
+    /** B-M8: speak, falling back to a VISIBLE chat prompt when TTS
+     *  reports failure. Returns the spoken flag. */
+    private suspend fun speak(text: String): Boolean {
+        val spoken = onSpeakAndAwait(text)
+        if (!spoken) {
+            JarvisStateRepository.addChatMessage("Jarvis", text)
+        }
+        return spoken
+    }
+
+    /** Ask a question and await a voice reply — but NEVER wait for an
+     *  answer to a question that was not spoken (B-M8): on TTS
+     *  failure the chat prompt above is the fallback and null is
+     *  returned immediately. */
+    private suspend fun askUserVoice(prompt: String): String? {
+        if (!speak(prompt)) return null
+        return onRequestUserVoiceReply()
+    }
+
     private fun isAffirmativeReply(lower: String): Boolean {
+        // A-C1: any negation token vetoes, even next to a yes-word
+        // ("haan nahi", "yes mat karo" are NOT approvals).
+        if (containsNegation(lower)) return false
         // Deliberately narrow: a bare "khol" must NOT count, or a
         // fresh command like "youtube kholo" would be misread as
         // approval for a pending page. Only standalone yes-words
@@ -102,9 +201,86 @@ class JarvisAgentEngine(
         val host = url.substringAfter("://", url).substringBefore("/")
         val hostNoWww = host.removePrefix("www.")
         val firstLabel = hostNoWww.substringBefore(".")
+        // B-M9: full URL or explicitly user-named host only. A bare
+        // host label counts only as a WHOLE word in the command
+        // ("news" must not match "news18.com" via substring).
         if (cmd.contains(url.lowercase()) || cmd.contains(hostNoWww)) return "user-asked"
-        if (firstLabel.length >= 3 && cmd.contains(firstLabel)) return "user-asked"
+        val cmdTokens = cmd.replace(Regex("[^a-z0-9 ]"), " ")
+            .split(" ").filter { it.isNotBlank() }
+        if (firstLabel.length >= 4 && cmdTokens.contains(firstLabel)) return "user-asked"
         return null
+    }
+
+    // ---- A-C2 hard pre-execution gate (code, never prompt text) ----
+
+    private enum class GateOutcome { ALLOW, BLOCK_STEP, PAUSE_TASK, ABORT_TASK }
+
+    private val PAY_SEND_KEYWORDS = listOf(
+        "pay", "payment", "upi", "checkout", "place order", "confirm order",
+        "buy now", "send", "bhej"
+    )
+
+    /**
+     * Runs BEFORE any decision action executes. Validation blocks
+     * (A-H1) reject bad steps without executing them; sensitive
+     * actions (send / reply / call / pay-like tap / type) require an
+     * explicit, negation-aware confirmation in code (A-C2) unless
+     * already confirmed for this task attempt, or the user turned
+     * confirmations off in settings. A decline ABORTS the task
+     * (A-C5); an unspoken question pauses it (B-M8).
+     */
+    private suspend fun checkExecutionGate(
+        d: AgentDecision,
+        snapshotHasPayment: Boolean
+    ): Pair<GateOutcome, String> {
+        // A-H1 validation blocks (engine side; LlmClient parses too).
+        when (d.action) {
+            "TAP_NODE" -> if (d.nodeId <= 0) return GateOutcome.BLOCK_STEP to "TAP_NODE nodeId missing"
+            "TAP_XY", "LONG_PRESS_XY" -> {
+                val metrics = context.resources.displayMetrics
+                if (d.x < 0 || d.y < 0 || d.x > metrics.widthPixels || d.y > metrics.heightPixels) {
+                    return GateOutcome.BLOCK_STEP to
+                        "Coordinates (${d.x}, ${d.y}) out of screen range — rejected, never coerced"
+                }
+            }
+            "VOLUME" -> if (d.volumePercent !in 0..100) return GateOutcome.BLOCK_STEP to "VOLUME out of range"
+            "SET_ALARM" -> if (d.alarmHour !in 0..23 || d.alarmMinute !in 0..59) {
+                return GateOutcome.BLOCK_STEP to "SET_ALARM time out of range"
+            }
+            "WHATSAPP_SEND", "REPLY_NOTIFICATION" -> {
+                if (d.contact.isBlank() || d.text.isBlank()) {
+                    return GateOutcome.BLOCK_STEP to "${d.action} contact/text blank"
+                }
+            }
+            "CALL" -> if (d.contact.isBlank()) return GateOutcome.BLOCK_STEP to "CALL contact blank"
+            "TYPE_TEXT" -> if (d.text.isBlank()) return GateOutcome.BLOCK_STEP to "TYPE_TEXT blank"
+            "OPEN_URL" -> Unit // scheme + approval handled in its branch (A-C4)
+        }
+        // Sensitive-action confirmation (OPEN_URL excluded here: its
+        // branch runs the same browser-approval gate, A-C4).
+        val payLike = snapshotHasPayment ||
+            PAY_SEND_KEYWORDS.any { (d.text + " " + d.contact).lowercase().contains(it) }
+        val isSensitive = d.action in setOf("WHATSAPP_SEND", "REPLY_NOTIFICATION", "CALL") ||
+            (payLike && d.action in setOf("TAP_NODE", "TAP_XY", "TYPE_TEXT"))
+        if (!isSensitive) return GateOutcome.ALLOW to ""
+        val key = "${d.action}:${d.contact.ifBlank { d.text.take(40) }}"
+        if (confirmedSensitiveKeys.contains(key)) return GateOutcome.ALLOW to ""
+        if (!prefs.confirmSensitiveActions) {
+            confirmedSensitiveKeys.add(key)
+            return GateOutcome.ALLOW to ""
+        }
+        val question = when (d.action) {
+            "WHATSAPP_SEND" -> "${d.contact} ko ye message bhejna hai: ${d.text}. Bhej dun?"
+            "REPLY_NOTIFICATION" -> "${d.contact} ko ye jawab bhejna hai: ${d.text}. Bhej dun?"
+            "CALL" -> "${d.contact} ko call lagau?"
+            else -> "Ye payment/send wala step hai, kar dun?"
+        }
+        val reply = askUserVoice(question) ?: return GateOutcome.PAUSE_TASK to "question not spoken"
+        if (isAffirmativeReply(reply.lowercase()) || isYesReply(reply)) {
+            confirmedSensitiveKeys.add(key)
+            return GateOutcome.ALLOW to ""
+        }
+        return GateOutcome.ABORT_TASK to "user declined"
     }
 
     private fun persistChat() {
@@ -118,6 +294,7 @@ class JarvisAgentEngine(
     fun cancelActiveTask(reason: String = "Task stopped by user.") {
         activeTaskJob?.cancel()
         activeTaskJob = null
+        clearTaskScopedState()
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, reason)
         JarvisStateRepository.setCurrentGoal("")
         JarvisStateRepository.addLog(reason)
@@ -131,7 +308,7 @@ class JarvisAgentEngine(
         scope.launch {
             val announcement = "Bhai, $sender ka message aaya hai: ${message.take(90)}"
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            onSpeakAndAwait(announcement)
+            speak(announcement)
         }
     }
 
@@ -143,9 +320,18 @@ class JarvisAgentEngine(
     fun announceIncomingCall(displayNameOrNumber: String) {
         if (isTaskRunning()) return
         scope.launch {
-            val announcement = "Bhai, call aa raha hai, $displayNameOrNumber se."
+            // C-B13: when the number is blank/unknown, announce
+            // GENERICALLY and honestly — never "unknown number se"
+            // and never a pretended contact name.
+            val announcement = if (displayNameOrNumber.isBlank() ||
+                displayNameOrNumber == "number nahi dikh raha"
+            ) {
+                "Bhai, call aa rahi hai, number nahi dikh raha."
+            } else {
+                "Bhai, call aa raha hai, $displayNameOrNumber se."
+            }
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            onSpeakAndAwait(announcement)
+            speak(announcement)
         }
     }
 
@@ -159,6 +345,13 @@ class JarvisAgentEngine(
      */
     private fun tryNoAiRoutine(lower: String, trimmed: String): Boolean {
         val acc = JarvisAccessibilityService.instance
+        // Patterns suggestions (1.4.1 audit gap): "patterns dikhao" /
+        // "suggestions dikhao" lists approved patterns as chat
+        // suggestions only — never stored, never auto-executed.
+        if (lower.contains("pattern") && (lower.contains("dikhao") || lower.contains("suggestion"))) {
+            fetchPatternSuggestions()
+            return true
+        }
         // YouTube: "youtube par <query> chalao/play/bajao"
         val ytMatch = Regex(
             "youtube\\s+(?:par|pe|me)?\\s*(.+?)\\s*(?:chalao|play|bajao|sunao|dikhao)\\s*$"
@@ -168,34 +361,33 @@ class JarvisAgentEngine(
                 .replace(Regex("^(par|pe|me)\\s+"), "").trim()
             if (query.isNotBlank()) {
                 if (acc == null) {
-                    scope.launch { onSpeakAndAwait("Accessibility service on nahi hai, isliye YouTube nahi khol sakta. Permissions screen se on karo.") }
+                    scope.launch { speak("Accessibility service on nahi hai, isliye YouTube nahi khol sakta. Permissions screen se on karo.") }
                     return true
                 }
                 activeTaskJob?.cancel()
                 activeTaskJob = scope.launch {
                     try {
-                        onSpeakAndAwait("YouTube par $query dhoondh raha hoon.")
+                        speak("YouTube par $query dhoondh raha hoon.")
                         if (!acc.searchYouTube(query)) {
-                            onSpeakAndAwait("YouTube nahi khul paya.")
+                            speak("YouTube nahi khul paya.")
                             return@launch
                         }
                         kotlinx.coroutines.delay(3000L)
                         val video = acc.findFirstYouTubeVideo()
                         if (video == null) {
-                            onSpeakAndAwait("Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
+                            speak("Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
                             return@launch
                         }
                         val title = video.text.ifBlank { video.contentDesc }
-                        onSpeakAndAwait("Pehli video $title mili hai. Chalau?")
-                        val reply = onRequestUserVoiceReply()?.lowercase() ?: ""
-                        if (reply.contains("haan") || reply.contains("yes") ||
-                            reply.contains("chalao") || reply.contains("play") ||
-                            reply.contains("bajao")
-                        ) {
+                        // A-C1: negation-aware confirmation — "mat
+                        // chalao" must NEVER play. askUserVoice also
+                        // never waits when the question was unspoken.
+                        val reply = askUserVoice("Pehli video $title mili hai. Chalau?")
+                        if (reply != null && isYesReply(reply)) {
                             val ok = acc.tapNode(video.id)
-                            onSpeakAndAwait(if (ok) "Chala diya." else "Tap nahi ho paya.")
+                            speak(if (ok) "Chala diya." else "Tap nahi ho paya.")
                         } else {
-                            onSpeakAndAwait("Theek hai, nahi chalaya.")
+                            speak("Theek hai, nahi chalaya.")
                         }
                     } catch (e: Exception) {
                         JarvisStateRepository.addLog("YouTube routine error: ${e.message}")
@@ -213,21 +405,20 @@ class JarvisAgentEngine(
             val message = waMatch.groupValues[2].trim()
             if (contact.isNotBlank() && message.isNotBlank()) {
                 if (acc == null) {
-                    scope.launch { onSpeakAndAwait("Accessibility service on nahi hai, isliye WhatsApp nahi bhej sakta.") }
+                    scope.launch { speak("Accessibility service on nahi hai, isliye WhatsApp nahi bhej sakta.") }
                     return true
                 }
                 activeTaskJob?.cancel()
                 activeTaskJob = scope.launch {
                     try {
-                        onSpeakAndAwait("$contact ko ye message bhejna hai: $message. Bhej dun?")
-                        val reply = onRequestUserVoiceReply()?.lowercase() ?: ""
-                        if (reply.contains("haan") || reply.contains("yes") ||
-                            reply.contains("bhej") || reply.contains("send")
-                        ) {
+                        // A-C1: "mat bhejo" contains "bhej" but is a
+                        // NO — isYesReply vetoes on any negation token.
+                        val reply = askUserVoice("$contact ko ye message bhejna hai: $message. Bhej dun?")
+                        if (reply != null && isYesReply(reply)) {
                             val ok = acc.sendWhatsAppMessage(contact, message)
-                            onSpeakAndAwait(if (ok) "Message bhej diya." else "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
+                            speak(if (ok) "Message bhej diya." else "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
                         } else {
-                            onSpeakAndAwait("Theek hai, message nahi bheja.")
+                            speak("Theek hai, message nahi bheja.")
                         }
                     } catch (e: Exception) {
                         JarvisStateRepository.addLog("WhatsApp routine error: ${e.message}")
@@ -249,7 +440,7 @@ class JarvisAgentEngine(
             } else {
                 "Abhi time hai ${"%02d".format(now.hour)} baj kar ${"%02d".format(now.minute)} minute."
             }
-            scope.launch { onSpeakAndAwait(answer) }
+            scope.launch { speak(answer) }
             return true
         }
         if (acc != null) {
@@ -258,14 +449,14 @@ class JarvisAgentEngine(
                 lower.contains("flashlight on")
             ) {
                 val ok = acc.toggleFlashlight(true)
-                scope.launch { onSpeakAndAwait(if (ok) "Torch on kar diya." else "Torch on nahi ho payi.") }
+                scope.launch { speak(if (ok) "Torch on kar diya." else "Torch on nahi ho payi.") }
                 return true
             }
             if (lower.contains("torch off") || lower.contains("torch bujhao") ||
                 lower.contains("flashlight off")
             ) {
                 val ok = acc.toggleFlashlight(false)
-                scope.launch { onSpeakAndAwait(if (ok) "Torch off kar diya." else "Torch off nahi ho payi.") }
+                scope.launch { speak(if (ok) "Torch off kar diya." else "Torch off nahi ho payi.") }
                 return true
             }
             // Volume: "volume 70 kar do"
@@ -273,7 +464,7 @@ class JarvisAgentEngine(
             if (volMatch != null) {
                 val pct = volMatch.groupValues[1].toInt().coerceIn(0, 100)
                 val ok = acc.setMediaVolumePercent(pct)
-                scope.launch { onSpeakAndAwait(if (ok) "Volume $pct percent kar diya." else "Volume set nahi ho paya.") }
+                scope.launch { speak(if (ok) "Volume $pct percent kar diya." else "Volume set nahi ho paya.") }
                 return true
             }
             // Media: play/pause/next/previous
@@ -281,26 +472,26 @@ class JarvisAgentEngine(
                 lower.contains("song pause")
             ) {
                 acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { onSpeakAndAwait("Music pause kar diya.") }
+                scope.launch { speak("Music pause kar diya.") }
                 return true
             }
             if (lower.contains("music play") || lower.contains("gaana chalao") ||
                 lower.contains("song play")
             ) {
                 acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { onSpeakAndAwait("Music play kar diya.") }
+                scope.launch { speak("Music play kar diya.") }
                 return true
             }
             if (lower.contains("next song") || lower.contains("agla gaana") ||
                 lower.contains("next gaana")
             ) {
                 acc.controlMediaPlayback("NEXT")
-                scope.launch { onSpeakAndAwait("Agla gaana chala diya.") }
+                scope.launch { speak("Agla gaana chala diya.") }
                 return true
             }
             if (lower.contains("previous song") || lower.contains("pichla gaana")) {
                 acc.controlMediaPlayback("PREVIOUS")
-                scope.launch { onSpeakAndAwait("Pichla gaana chala diya.") }
+                scope.launch { speak("Pichla gaana chala diya.") }
                 return true
             }
             // Direct call: "<name> ko call karo/lagao"
@@ -308,8 +499,17 @@ class JarvisAgentEngine(
             if (callMatch != null) {
                 val contact = callMatch.groupValues[1].trim()
                 if (contact.isNotBlank()) {
-                    val ok = acc.makePhoneCall(contact)
-                    scope.launch { onSpeakAndAwait(if (ok) "$contact ko call laga raha hoon." else "$contact ko call nahi lag payi — contact phone book me nahi mila ho sakta hai.") }
+                    // C-B13: failure reason is distinguished, never
+                    // a blanket "phone book me nahi mila".
+                    val (ok, reason) = acc.makePhoneCallWithReason(contact)
+                    val msg = when {
+                        ok -> "$contact ko call laga raha hoon."
+                        reason == "contact_not_found" -> "$contact phone book me nahi mila."
+                        reason == "contact_ambiguous" -> "$contact naam ke kai contacts mile, kaun sa wala batao."
+                        reason == "permission_denied" -> "Contact dekhne ki permission nahi hai, isliye call nahi lag payi."
+                        else -> "$contact ko call nahi lag payi."
+                    }
+                    scope.launch { speak(msg) }
                     return true
                 }
             }
@@ -321,7 +521,7 @@ class JarvisAgentEngine(
                 if (lower.contains("pm") && hour < 12) hour += 12
                 if (hour in 0..23 && minute in 0..59) {
                     val ok = acc.setSystemAlarm(hour, minute, "Jarvis Alarm")
-                    scope.launch { onSpeakAndAwait(if (ok) "Alarm $hour baj kar $minute minute par laga diya." else "Alarm nahi lag paya.") }
+                    scope.launch { speak(if (ok) "Alarm $hour baj kar $minute minute par laga diya." else "Alarm nahi lag paya.") }
                     return true
                 }
             }
@@ -331,7 +531,7 @@ class JarvisAgentEngine(
                 val app = openMatch.groupValues[1].trim()
                 if (app.isNotBlank() && app.length < 30) {
                     val ok = acc.launchApp(app)
-                    scope.launch { onSpeakAndAwait(if (ok) "$app khol diya." else "$app nahi khul paya.") }
+                    scope.launch { speak(if (ok) "$app khol diya." else "$app nahi khul paya.") }
                     return true
                 }
             }
@@ -350,7 +550,7 @@ class JarvisAgentEngine(
         val lower = trimmed.lowercase()
         if (lower in listOf("stop", "ruk ja", "ruko", "cancel", "jarvis stop", "bas kar")) {
             cancelActiveTask("Stopped on voice command.")
-            scope.launch { onSpeakAndAwait("Theek hai bhai, ruk gaya.") }
+            scope.launch { speak("Theek hai bhai, ruk gaya.") }
             return
         }
 
@@ -366,23 +566,36 @@ class JarvisAgentEngine(
                 pendingBrowserApprovalUrl = interruptedUrl
                 pendingBrowserShowPage = false
                 justSetInterrupted = true
-                scope.launch { onSpeakAndAwait("Browsing ruk gaya, dobara koshish karun?") }
+                scope.launch { speak("Browsing ruk gaya, dobara koshish karun?") }
             }
         }
 
         // Pending browser approval: the immediately following
-        // command is the answer. Affirmative -> load it; anything
-        // else clears the proposal and the new command runs.
+        // command is the answer. Affirmative -> load it; a bare
+        // negation ("nahi") declines and stops (A-C5) instead of
+        // being misread as a new command; anything else clears the
+        // proposal and the new command runs.
         val pendingUrl = pendingBrowserApprovalUrl
         if (pendingUrl != null && !justSetInterrupted) {
             pendingBrowserApprovalUrl = null
+            val openExternal = pendingBrowserOpenExternal
+            pendingBrowserOpenExternal = false
+            val negationOnly = replyTokens(lower).size <= 2 && containsNegation(lower)
+            if (negationOnly) {
+                pendingBrowserShowPage = false
+                scope.launch { speak("Theek hai, page nahi khola.") }
+                return
+            }
             if (isAffirmativeReply(lower)) {
                 approvedBrowserUrls.add(pendingUrl)
                 val showPage = pendingBrowserShowPage
                 pendingBrowserShowPage = false
                 activeTaskJob?.cancel()
                 activeTaskJob = scope.launch {
-                    if (showPage && onShowBrowserPage != null) {
+                    if (openExternal) {
+                        val ok = JarvisAccessibilityService.instance?.openUrlOrDeepLink(pendingUrl) ?: false
+                        JarvisStateRepository.addChatMessage("Jarvis", "Link khola: $pendingUrl (success=$ok)")
+                    } else if (showPage && onShowBrowserPage != null) {
                         onShowBrowserPage?.invoke(pendingUrl)
                         JarvisStateRepository.addChatMessage("Jarvis", "Page dikha raha hoon: $pendingUrl")
                     } else {
@@ -390,7 +603,7 @@ class JarvisAgentEngine(
                         JarvisStateRepository.addLog(summary)
                     }
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
-                    onSpeakAndAwait("Aur kya karna hai?")
+                    speak("Aur kya karna hai?")
                 }
                 return
             } else {
@@ -454,22 +667,28 @@ class JarvisAgentEngine(
         if (routine.steps.isEmpty()) return false
         JarvisStateRepository.addLog("Learned routine matched: '${routine.trigger}' (${routine.steps.size} steps)")
         activeTaskJob?.cancel()
+        clearTaskScopedState()
         activeTaskJob = scope.launch {
             val acc = JarvisAccessibilityService.instance
             for (step in routine.steps) {
                 if (!isOnline() && learnedRoutineStore.isNetworkDependent(step.action)) {
-                    onSpeakAndAwait("Internet nahi hai — is step ke liye network chahiye, isliye replay yahin rok raha hoon. Local kaam ho gaya hai, baaki net aane par dobara bolo.")
+                    speak("Internet nahi hai — is step ke liye network chahiye, isliye replay yahin rok raha hoon. Local kaam ho gaya hai, baaki net aane par dobara bolo.")
+                    clearTaskScopedState()
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Replay stopped offline")
                     return@launch
                 }
                 if (prefs.confirmSensitiveActions &&
                     learnedRoutineStore.isConfirmationRequired(step.action, step.target)
                 ) {
-                    onSpeakAndAwait("Ye step sensitive hai (${step.action}). Kar dun?")
-                    val reply = onRequestUserVoiceReply()?.lowercase() ?: ""
-                    if (!isAffirmativeReply(reply)) {
-                        JarvisStateRepository.addLog("Learned replay: sensitive step declined — falling back to LLM loop")
-                        runAutonomousLoop(trimmed)
+                    // A-C5: an explicit decline ABORTS the task
+                    // entirely — it must NOT fall back to the LLM
+                    // loop (only a step-mismatch may re-plan).
+                    val reply = askUserVoice("Ye step sensitive hai (${step.action}). Kar dun?")
+                    if (reply == null || !isAffirmativeReply(reply.lowercase())) {
+                        JarvisStateRepository.addLog("Learned replay: sensitive step declined — aborting task")
+                        speak("Theek hai, kaam rok diya.")
+                        clearTaskScopedState()
+                        JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
                         return@launch
                     }
                 }
@@ -482,7 +701,7 @@ class JarvisAgentEngine(
                 if (step.waitMs > 0) delay(step.waitMs)
             }
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Learned replay done")
-            onSpeakAndAwait("Ho gaya — seekha hua kaam dobara kar diya. Aur kya karna hai?")
+            speak("Ho gaya — seekha hua kaam dobara kar diya. Aur kya karna hai?")
         }
         return true
     }
@@ -566,14 +785,44 @@ class JarvisAgentEngine(
                     JarvisStateRepository.addLog("Global-learning upload skipped: device id unavailable.")
                     return@launch
                 }
-                val stepsJson = JSONArray()
+                // C-B1: map engine actions to the SERVER enums
+                // (lib/patterns.ts ALLOWED_ACTIONS / TARGET_KINDS).
+                // The old code sent target_kind "generic", which the
+                // server rejects, and no template_hash, which the
+                // server requires — both are fixed here. Steps with
+                // no server-enum mapping are dropped, never invented.
+                val mapped = mutableListOf<Pair<String, String>>()
                 for (step in routine.steps) {
+                    mapped.addAll(mapLearnedStepToServer(step.action))
+                }
+                if (mapped.isEmpty()) {
+                    JarvisStateRepository.addLog("Global-learning upload skipped: no server-mappable steps.")
+                    return@launch
+                }
+                val stepsJson = JSONArray()
+                for ((action, targetKind) in mapped) {
                     val obj = JSONObject()
-                    obj.put("action", step.action)
-                    obj.put("target_kind", "generic")
+                    obj.put("action", action)
+                    obj.put("target_kind", targetKind)
                     stepsJson.put(obj)
                 }
+                // C-B1: template_hash exactly as the server computes
+                // it — sha256 hex of canonical JSON
+                // {"steps":[{"action":...,"target_kind":...},...]}
+                // (key order action, target_kind; no spaces).
+                val canonical = buildString {
+                    append("{\"steps\":[")
+                    mapped.forEachIndexed { i, (action, targetKind) ->
+                        if (i > 0) append(",")
+                        append("{\"action\":\"$action\",\"target_kind\":\"$targetKind\"}")
+                    }
+                    append("]}")
+                }
+                val hashBytes = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(canonical.toByteArray(Charsets.UTF_8))
+                val templateHash = hashBytes.joinToString("") { "%02x".format(it) }
                 val body = JSONObject()
+                body.put("template_hash", templateHash)
                 body.put("steps", stepsJson)
                 body.put("licence_key", licenceKey)
                 body.put("device_id", deviceId)
@@ -585,7 +834,17 @@ class JarvisAgentEngine(
                 conn.readTimeout = 15000
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                 val code = conn.responseCode
-                JarvisStateRepository.addLog("Global-learning upload: HTTP $code (generic template only)")
+                // C-B1: log the server's error DETAIL, not just the
+                // HTTP code (the detail names the validation failure).
+                // The request body (licence key) is never logged.
+                val detail = if (code in 200..299) {
+                    "ok"
+                } else {
+                    runCatching {
+                        conn.errorStream?.bufferedReader()?.readText()?.take(300) ?: ""
+                    }.getOrDefault("")
+                }
+                JarvisStateRepository.addLog("Global-learning upload: HTTP $code $detail (generic template only)")
                 conn.disconnect()
             } catch (e: Exception) {
                 JarvisStateRepository.addLog("Global-learning upload failed (ignored): ${e.message}")
@@ -593,9 +852,89 @@ class JarvisAgentEngine(
         }
     }
 
+    /** C-B1 mapping: engine action -> server (action, target_kind)
+     *  pairs from lib/patterns.ts. Empty = unmappable, dropped. */
+    private fun mapLearnedStepToServer(engineAction: String): List<Pair<String, String>> =
+        when (engineAction.uppercase()) {
+            "OPEN_APP" -> listOf("OPEN_APP" to "APP")
+            "YOUTUBE_SEARCH" -> listOf("SEARCH" to "SEARCH_BOX")
+            "YOUTUBE_PLAY" -> listOf(
+                "SEARCH" to "SEARCH_BOX",
+                "TAP_FIRST_RESULT" to "FIRST_RESULT"
+            )
+            "SCROLL" -> listOf("SCROLL" to "GENERIC_BUTTON")
+            "NAVIGATE" -> listOf("NAVIGATE" to "GENERIC_BUTTON")
+            "WAIT" -> listOf("WAIT" to "GENERIC_BUTTON")
+            else -> emptyList()
+        }
+
+    /**
+     * PATTERNS FETCH (audit gap): fetches owner-APPROVED patterns
+     * (GET /api/patterns — the server returns approved=true rows
+     * only) and surfaces them as CHAT SUGGESTIONS. They are NEVER
+     * auto-applied and NEVER auto-executed: no routine is stored,
+     * no step runs, the user must ask for a pattern by name for
+     * anything to happen. Best-effort; failures are logged only.
+     */
+    fun fetchPatternSuggestions() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val conn = URL("$LICENCE_SERVER_URL/api/patterns?limit=20")
+                    .openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                val code = conn.responseCode
+                val text = if (code in 200..299) {
+                    conn.inputStream.bufferedReader().readText()
+                } else {
+                    runCatching {
+                        conn.errorStream?.bufferedReader()?.readText()?.take(200) ?: ""
+                    }.getOrDefault("")
+                }
+                conn.disconnect()
+                if (code !in 200..299) {
+                    JarvisStateRepository.addLog("Pattern suggestions fetch failed: HTTP $code $text")
+                    return@launch
+                }
+                val templates = JSONObject(text).optJSONArray("templates")
+                if (templates == null || templates.length() == 0) {
+                    JarvisStateRepository.addChatMessage(
+                        "Jarvis",
+                        "Approved patterns: abhi koi approved pattern nahi mila (sirf sujhav dikhata hoon, auto-apply kabhi nahi)."
+                    )
+                    return@launch
+                }
+                val lines = StringBuilder(
+                    "Approved patterns — sirf sujhav, auto-apply NAHI (kisi ko chalana ho to naam se bolo):"
+                )
+                for (i in 0 until templates.length()) {
+                    val t = templates.optJSONObject(i) ?: continue
+                    val steps = t.optJSONObject("template")?.optJSONArray("steps")
+                    val seq = StringBuilder()
+                    if (steps != null) {
+                        for (j in 0 until steps.length()) {
+                            if (j > 0) seq.append(" → ")
+                            seq.append(steps.optJSONObject(j)?.optString("action", "?") ?: "?")
+                        }
+                    }
+                    lines.append("\n• ${t.optString("template_hash", "").take(8)}: $seq")
+                }
+                JarvisStateRepository.addChatMessage("Jarvis", lines.toString())
+            } catch (e: Exception) {
+                JarvisStateRepository.addLog("Pattern suggestions fetch failed (ignored): ${e.message}")
+            }
+        }
+    }
+
     private suspend fun runAutonomousLoop(initialGoal: String, memoryContext: String = "") {
         var currentGoal = initialGoal
         loopUserCommand = initialGoal
+        // A-C7: a new attempt starts with a clean buffer — a previous
+        // attempt's steps must never leak into this task's routine.
+        clearTaskScopedState()
+        lastExecutedAction = ""
+        lastBuildWritten = false
         // Offline gate (1.4.0): cloud planning needs network.
         // Local (on-device) chat still works offline; no-AI local
         // routines already returned before this loop. Speak a
@@ -603,7 +942,7 @@ class JarvisAgentEngine(
         // cloud answer while offline.
         if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
             JarvisStateRepository.addChatMessage("You", currentGoal)
-            onSpeakAndAwait("Internet nahi hai — online kaam (AI planning, browsing, cloud actions) abhi nahi ho payega. Sirf phone ke andar wale kaam kar sakta hoon, jaise torch, volume, ya pehle se downloaded cheezein.")
+            speak("Internet nahi hai — online kaam (AI planning, browsing, cloud actions) abhi nahi ho payega. Sirf phone ke andar wale kaam kar sakta hoon, jaise torch, volume, ya pehle se downloaded cheezein.")
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Offline — local work only")
             return
         }
@@ -622,9 +961,21 @@ class JarvisAgentEngine(
         var step = 1
         var lastScreenHash = 0
         var consecutiveSameScreenCount = 0
+        var parseErrorRetries = 0
+        var rateLimitRetries = 0
 
         try {
             while (step <= maxSteps) {
+                // A-M7: per-step connectivity re-check — offline
+                // mid-task = pause (warn, do not complete, do not
+                // persist a routine), not a faked continuation.
+                if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
+                    speak("Internet chala gaya hai — kaam yahin rok raha hoon, complete nahi bol raha. Net aane par dobara bolo.")
+                    clearTaskScopedState()
+                    JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Paused offline mid-task")
+                    JarvisStateRepository.setCurrentGoal("")
+                    return
+                }
                 JarvisStateRepository.setAgentState(
                     AgentRunState.THINKING,
                     "Step $step/$maxSteps: Observing screen & thinking..."
@@ -638,15 +989,20 @@ class JarvisAgentEngine(
                     formattedTree = "Accessibility Service is NOT enabled yet. Only conversational chat, OPEN_APP, or hardware actions are available."
                 )
 
-                // Stuck-loop detection
+                // Stuck-loop detection (A-M11): stuck needs 2+
+                // CONSECUTIVE unchanged screens, and screen-invariant
+                // actions (volume / flashlight / media / WAIT) never
+                // count — an unchanged screen is EXPECTED after them.
                 val currentHash = snapshot.formattedTree.hashCode()
-                if (step > 1 && currentHash == lastScreenHash) {
+                val lastWasInvariant = lastExecutedAction in
+                    setOf("FLASHLIGHT", "VOLUME", "MEDIA_CONTROL", "WAIT")
+                if (step > 1 && currentHash == lastScreenHash && !lastWasInvariant) {
                     consecutiveSameScreenCount++
                 } else {
                     consecutiveSameScreenCount = 0
                 }
                 lastScreenHash = currentHash
-                val isStuck = consecutiveSameScreenCount >= 1
+                val isStuck = consecutiveSameScreenCount >= 2
 
                 // Capture live Multimodal Vision screenshot if enabled and needed
                 val needsVisualSight = prefs.visionModeEnabled && accService != null && (
@@ -686,14 +1042,53 @@ class JarvisAgentEngine(
                 )
 
                 JarvisStateRepository.addLog(
-                    "Step $step Decision: action=${decision.action}, thought=${decision.thought}"
+                    "Step $step Decision: action=${decision.action}, thought=${decision.thought}, kind=${decision.decisionKind}"
                 )
+
+                // A-C6 / A-M1 / A-M2: error kinds NEVER complete,
+                // NEVER persist a routine, NEVER index as success.
+                when (decision.decisionKind) {
+                    "ERROR" -> {
+                        speak(decision.reply)
+                        clearTaskScopedState()
+                        JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Error — task stopped")
+                        JarvisStateRepository.setCurrentGoal("")
+                        return
+                    }
+                    "PARSE_ERROR" -> {
+                        if (parseErrorRetries < 1) {
+                            parseErrorRetries++
+                            speak("Jawab adhoora aaya, ek baar dobara koshish kar raha hoon.")
+                            delay(2000L)
+                            continue
+                        }
+                        speak("Jawab baar-baar adhoora aa raha hai, isliye kaam rok raha hoon.")
+                        clearTaskScopedState()
+                        JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Parse error — task stopped")
+                        JarvisStateRepository.setCurrentGoal("")
+                        return
+                    }
+                    "RATE_LIMITED" -> {
+                        if (rateLimitRetries < 2) {
+                            rateLimitRetries++
+                            speak("Rate limit lag gaya hai, thodi der ruk kar dobara koshish kar raha hoon.")
+                            delay(5000L)
+                            continue
+                        }
+                        speak("Rate limit baar-baar lag raha hai, isliye kaam rok raha hoon.")
+                        clearTaskScopedState()
+                        JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Rate limited — task stopped")
+                        JarvisStateRepository.setCurrentGoal("")
+                        return
+                    }
+                }
 
                 // Speak reply if non-empty — but in fast mode (default),
                 // intermediate step updates are chat-only, NOT spoken aloud.
                 // Speaking every step serialises seconds of TTS in front of
                 // the next action and is the biggest perceived slowdown.
                 // Final answers, questions and casual chat are always spoken.
+                var replyWasSpoken = false
                 if (decision.reply.isNotBlank()) {
                     JarvisStateRepository.addChatMessage("Jarvis", decision.reply)
                     persistChat()
@@ -704,7 +1099,7 @@ class JarvisAgentEngine(
                             AgentRunState.SPEAKING,
                             "Speaking: ${decision.reply}"
                         )
-                        onSpeakAndAwait(decision.reply)
+                        replyWasSpoken = speak(decision.reply)
                     }
                 }
 
@@ -714,8 +1109,19 @@ class JarvisAgentEngine(
                         AgentRunState.WAITING_USER_REPLY,
                         "Waiting for your voice answer..."
                     )
-                    val userAnswer = onRequestUserVoiceReply()
+                    // B-M8: never wait for an answer to an unspoken
+                    // question — the chat prompt above is the fallback.
+                    val userAnswer = if (replyWasSpoken) onRequestUserVoiceReply() else null
                     if (!userAnswer.isNullOrBlank()) {
+                        // A-C5: an explicit decline ABORTS the task
+                        // entirely — it is not a clarification.
+                        if (isDeclineReply(userAnswer)) {
+                            speak("Theek hai, kaam rok diya.")
+                            clearTaskScopedState()
+                            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
+                            JarvisStateRepository.setCurrentGoal("")
+                            return
+                        }
                         JarvisStateRepository.addChatMessage("You", userAnswer)
                         persistChat()
                         currentGoal = "$currentGoal (User clarified: $userAnswer)"
@@ -723,11 +1129,41 @@ class JarvisAgentEngine(
                         step++
                         continue
                     } else {
+                        // A-C7: ask-user timeout clears the buffer.
+                        clearTaskScopedState()
                         JarvisStateRepository.setAgentState(
                             AgentRunState.IDLE,
                             "Paused — No voice reply received."
                         )
                         return
+                    }
+                }
+
+                // A-C2 hard gate, before ANY execution.
+                if (decision.action != "NONE") {
+                    val (gateOutcome, gateReason) = checkExecutionGate(
+                        decision, snapshot.hasSensitivePaymentPrompt
+                    )
+                    when (gateOutcome) {
+                        GateOutcome.BLOCK_STEP -> {
+                            previousActions.add("Step $step blocked by gate: $gateReason")
+                            step++
+                            continue
+                        }
+                        GateOutcome.PAUSE_TASK -> {
+                            clearTaskScopedState()
+                            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Paused — $gateReason")
+                            JarvisStateRepository.setCurrentGoal("")
+                            return
+                        }
+                        GateOutcome.ABORT_TASK -> {
+                            speak("Theek hai, kaam rok diya.")
+                            clearTaskScopedState()
+                            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
+                            JarvisStateRepository.setCurrentGoal("")
+                            return
+                        }
+                        GateOutcome.ALLOW -> Unit
                     }
                 }
 
@@ -740,6 +1176,7 @@ class JarvisAgentEngine(
                     val actionSummary = executeDecisionAction(decision, accService)
                     previousActions.add("Step $step: $actionSummary")
                     recordLoopStep(decision)
+                    lastExecutedAction = decision.action
                 }
 
                 // Builder §5c: a failed build validation is NEVER a
@@ -753,21 +1190,39 @@ class JarvisAgentEngine(
                             v.emptyFiles.map { "$it khaali" }).joinToString(", ")
                         val repairNote = "Build validation fail ho gaya — $detail. In files ko dobara likh raha hoon, success tabhi bolunga jab validation OK ho."
                         JarvisStateRepository.addChatMessage("Jarvis", repairNote)
-                        onSpeakAndAwait(repairNote)
+                        speak(repairNote)
                         currentGoal = "$initialGoal (Repair: $detail dobara likhna hai)"
                         step++
                         continue
                     }
                 }
 
-                if (decision.isCompleted || decision.action == "NONE") {
+                // A-M10: WRITE_PROJECT_FILE with written==false is
+                // a FAILURE — speak/show it, never "Ho gaya", never
+                // complete, never persist a routine for it.
+                if (decision.action == "WRITE_PROJECT_FILE" && !lastBuildWritten) {
+                    speak("File likh nahi paya — project ya file ka naam galat ho sakta hai. Dobara naam batao.")
+                    JarvisStateRepository.addChatMessage(
+                        "Jarvis",
+                        "WRITE_PROJECT_FILE fail ho gaya (written=false) — file disk par nahi likhi gayi."
+                    )
+                    clearTaskScopedState()
+                    JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Write failed — task stopped")
+                    JarvisStateRepository.setCurrentGoal("")
+                    return
+                }
+
+                // A-H2: exit the loop on isCompleted ONLY. NONE +
+                // not-completed stays in the loop and re-observes
+                // instead of silently completing.
+                if (decision.isCompleted) {
                     // Builder §6: validated build summary, spoken
                     // AND in chat — unless the LLM's own reply
                     // already is that summary (same files + preview
                     // line), in which case speaking it twice would
                     // just be noise.
                     if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE") &&
-                        lastBuildValidation?.ok == true
+                        lastBuildValidation?.ok == true && lastBuildWritten
                     ) {
                         val projectName = ProjectStore.sanitizeProjectName(
                             decision.projectName.ifBlank { lastBuildProject.ifBlank { "jarvis-site" } }
@@ -780,7 +1235,7 @@ class JarvisAgentEngine(
                                 "Preview: ${ProjectStore.localhostUrl(projectName)} — " +
                                 "Projects tab me Preview dabao, ya Browser me kholo (full-screen, wahi preview)."
                             JarvisStateRepository.addChatMessage("Jarvis", summary)
-                            onSpeakAndAwait(summary)
+                            speak(summary)
                         }
                     }
                     // Verified completion: persist the learned
@@ -803,7 +1258,8 @@ class JarvisAgentEngine(
                         "Task Completed — Ready for next command"
                     )
                     JarvisStateRepository.setCurrentGoal("")
-                    onSpeakAndAwait("Aur kya karna hai?")
+                    clearTaskScopedState()
+                    speak("Aur kya karna hai?")
                     return
                 }
 
@@ -812,16 +1268,16 @@ class JarvisAgentEngine(
                 step++
             }
 
-            learnedRoutineStore.clearPending()
+            clearTaskScopedState()
             JarvisStateRepository.setAgentState(
                 AgentRunState.IDLE,
                 "Reached max steps ($maxSteps). Ready."
             )
-            onSpeakAndAwait("Bhai, maine $maxSteps steps complete kiye. Aur kya karna hai?")
+            speak("Bhai, maine $maxSteps steps complete kiye. Aur kya karna hai?")
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            learnedRoutineStore.clearPending()
+            clearTaskScopedState()
             JarvisStateRepository.addLog("Agent Loop Error: ${e.message}")
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Error: ${e.localizedMessage}")
         }
@@ -834,11 +1290,28 @@ class JarvisAgentEngine(
      * interrupted / failed loads speak exactly that.
      */
     private suspend fun executeBrowserLoad(url: String, speakSummary: Boolean): String {
+        // B-M3: never hijack the visible page. When the host says
+        // the Browser tab is visible, queue/defer — never navigate
+        // the shared WebView away silently. (Null host signal =
+        // coordinator has not wired visibility yet; the load
+        // proceeds as before and the gap is logged.)
+        if (isBrowserTabVisible?.invoke() == true) {
+            deferredBrowseUrls.add(url)
+            speak("Browser tab me abhi ek page khula hai, isliye is page ko background me load nahi kar raha — tab se hatne par dobara bolo.")
+            JarvisStateRepository.addChatMessage(
+                "Jarvis",
+                "Deferred (Browser tab visible, page hijack nahi kiya): $url"
+            )
+            return "OPEN_BROWSER deferred (browser tab visible): '$url'"
+        }
+        if (isBrowserTabVisible == null) {
+            JarvisStateRepository.addLog("B-M3 note: browser visibility signal not wired (coordinator) — background load proceeding.")
+        }
         val result = JarvisBackgroundBrowser.browse(context, url)
         return when (result.status) {
             BrowserBrowseStatus.COMPLETED -> {
                 if (result.isNonHttps) {
-                    onSpeakAndAwait(
+                    speak(
                         "Note: ye page secure (https) nahi hai, " +
                             "isliye is par koi password ya payment mat daalna."
                     )
@@ -846,7 +1319,7 @@ class JarvisAgentEngine(
                 val summary = listOf(result.title, result.mainText.take(500))
                     .filter { it.isNotBlank() }.joinToString(" — ")
                 if (speakSummary && summary.isNotBlank()) {
-                    onSpeakAndAwait(summary)
+                    speak(summary)
                 }
                 JarvisStateRepository.addChatMessage(
                     "Jarvis",
@@ -856,11 +1329,11 @@ class JarvisAgentEngine(
                 "OPEN_BROWSER background '${result.url}' title='${result.title}' chars=${result.mainText.length}"
             }
             BrowserBrowseStatus.INTERRUPTED_PROCESS_KILLED -> {
-                onSpeakAndAwait("Browsing ruk gaya, dobara koshish karun?")
+                speak("Browsing ruk gaya, dobara koshish karun?")
                 "OPEN_BROWSER interrupted '$url' (no content fabricated)"
             }
             BrowserBrowseStatus.FAILED -> {
-                onSpeakAndAwait(
+                speak(
                     "Page nahi khul paya: ${result.errorMessage}. Dobara koshish karun?"
                 )
                 "OPEN_BROWSER failed '$url': ${result.errorMessage}"
@@ -905,9 +1378,28 @@ class JarvisAgentEngine(
             }
 
             "OPEN_URL" -> {
-                val ok = acc?.openUrlOrDeepLink(d.text) ?: false
-                delay(800L)
-                "OPEN_URL('${d.text}') -> success=$ok"
+                // A-C4: same browser-approval gate as OPEN_BROWSER,
+                // http(s)-only allowlist. normalizeBrowserUrl returns
+                // "" for upi:/tel:/sms:/intent: and other schemes, so
+                // those are blocked at the gate, never opened. The
+                // accessibility openUrlOrDeepLink hardens this again.
+                val url = normalizeBrowserUrl(d.text)
+                if (url.isEmpty()) {
+                    "OPEN_URL blocked: sirf http/https allowed hai (upi:/tel:/sms:/intent: blocked)"
+                } else {
+                    val kind = browserApprovalKind(url)
+                    if (kind == null) {
+                        pendingBrowserApprovalUrl = url
+                        pendingBrowserOpenExternal = true
+                        pendingBrowserShowPage = false
+                        speak("Ye link kholun? $url")
+                        "OPEN_URL awaiting approval for '$url'"
+                    } else {
+                        val ok = acc?.openUrlOrDeepLink(url) ?: false
+                        delay(800L)
+                        "OPEN_URL('$url') -> success=$ok ($kind)"
+                    }
+                }
             }
 
             "REPLY_NOTIFICATION" -> {
@@ -972,8 +1464,10 @@ class JarvisAgentEngine(
             }
 
             "CALL" -> {
-                val ok = acc?.makePhoneCall(d.contact) ?: false
-                "CALL('${d.contact}') -> success=$ok"
+                // C-B13: the summary carries the distinct reason —
+                // permission-denied is never reported as not-found.
+                val (ok, reason) = acc?.makePhoneCallWithReason(d.contact) ?: (false to "dial_failed")
+                "CALL('${d.contact}') -> success=$ok reason=$reason"
             }
 
             "SET_ALARM" -> {
@@ -991,6 +1485,7 @@ class JarvisAgentEngine(
                 ProjectStore.createProject(context, name, d.fileContent.ifBlank { null })
                 val v = ProjectStore.validateProject(context, name)
                 lastBuildValidation = v
+                lastBuildWritten = v.ok
                 lastBuildProject = name
                 val files = ProjectStore.listProjects(context)
                     .firstOrNull { it.name == ProjectStore.sanitizeProjectName(name) }
@@ -1006,8 +1501,8 @@ class JarvisAgentEngine(
                 // (never invent a name, never CREATE as a modify).
                 var name = d.projectName.ifBlank { ProjectStore.lastTouchedProject(context) ?: "" }
                 if (name.isBlank()) {
-                    onSpeakAndAwait("Kaun se project me likhun? Project ka naam bolo.")
-                    val answer = onRequestUserVoiceReply()?.trim() ?: ""
+                    // B-M8: never wait for an answer to an unspoken question.
+                    val answer = askUserVoice("Kaun se project me likhun? Project ka naam bolo.")?.trim() ?: ""
                     name = if (answer.isNotBlank()) {
                         ProjectStore.sanitizeProjectName(answer)
                     } else {
@@ -1016,12 +1511,14 @@ class JarvisAgentEngine(
                 }
                 if (name.isBlank()) {
                     lastBuildValidation = null
+                    lastBuildWritten = false
                     "WRITE_PROJECT_FILE blocked: project naam nahi mila (written=false)"
                 } else {
                     val file = d.fileName.ifBlank { "index.html" }
                     val written = ProjectStore.writeFile(context, name, file, d.fileContent)
                     val v = ProjectStore.validateProject(context, name)
                     lastBuildValidation = v
+                    lastBuildWritten = written
                     lastBuildProject = name
                     "WRITE_PROJECT_FILE('$name/$file', written=$written, ${d.fileContent.length} chars) -> " +
                         "validation=${if (v.ok) "OK" else "FAILED missing=${v.missingFiles} empty=${v.emptyFiles}"}, " +
@@ -1044,7 +1541,7 @@ class JarvisAgentEngine(
                     if (kind == null) {
                         pendingBrowserApprovalUrl = url
                         pendingBrowserShowPage = d.browserShowPage
-                        onSpeakAndAwait("Ye page kholun? $url")
+                        speak("Ye page kholun? $url")
                         "OPEN_BROWSER awaiting approval for '$url'"
                     } else if (d.browserShowPage) {
                         if (onShowBrowserPage != null) {

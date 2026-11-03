@@ -31,6 +31,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -73,6 +74,7 @@ fun WhiteboardScreen() {
     // BEFORE it, per the kotlin_prepush_checks skill (declaration order).
     val context = LocalContext.current
     val storeState by WhiteboardStore.state.collectAsState()
+    val loadError by WhiteboardStore.loadError.collectAsState()
     var selectedColor by remember { mutableStateOf(WhiteboardView.COLORS.first()) }
     var captionText by remember {
         mutableStateOf(WhiteboardStore.state.value.userCaption ?: "")
@@ -84,9 +86,38 @@ fun WhiteboardScreen() {
                 Settings.canDrawOverlays(context)
         )
     }
+    // B-L10: bounds pass + inSampleSize downsample to the displayed
+    // size (screen width x 240dp). The old code decoded the picked
+    // image at full resolution into this preview — a 50 MP photo
+    // could OOM the app from the whiteboard tab alone. Oversized or
+    // non-image files decode to null and show the fallback text.
     val imageBitmap = remember(storeState.imagePath) {
         val path = storeState.imagePath ?: return@remember null
-        runCatching { BitmapFactory.decodeFile(path) }.getOrNull()
+        runCatching {
+            val file = java.io.File(path)
+            if (!file.isFile || file.length() <= 0L ||
+                file.length() > 50L * 1024L * 1024L
+            ) {
+                return@runCatching null
+            }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+            val mime = bounds.outMimeType
+            if (mime == null || !mime.startsWith("image/")) return@runCatching null
+            val density = context.resources.displayMetrics.density
+            val targetWidth = context.resources.displayMetrics.widthPixels
+                .coerceAtLeast(1)
+            val targetHeight = (240f * density).toInt().coerceAtLeast(1)
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= targetWidth &&
+                bounds.outHeight / (sample * 2) >= targetHeight
+            ) {
+                sample *= 2
+            }
+            val decode = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeFile(path, decode)
+        }.getOrNull()
     }
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -104,6 +135,14 @@ fun WhiteboardScreen() {
         WhiteboardStore.init(context)
         canDrawOverlays = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             Settings.canDrawOverlays(context)
+    }
+    // B-M11: when this screen goes away, the latest strokes/messages
+    // are flushed synchronously — no reliance on an async save that
+    // teardown could leave in flight.
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { WhiteboardStore.flushSync() }
+        }
     }
     LaunchedEffect(storeState.userCaption) {
         val saved = storeState.userCaption
@@ -130,6 +169,18 @@ fun WhiteboardScreen() {
             fontWeight = FontWeight.Bold,
             color = terracotta
         )
+
+        // B-C5: a corrupt saved board is surfaced here, never silently
+        // shown as an empty board.
+        val corruptError = loadError
+        if (corruptError != null) {
+            Text(
+                text = corruptError,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFB3261E)
+            )
+        }
 
         // Plain-language mode explanation — never silently pretend the
         // floating board is available when it is not.

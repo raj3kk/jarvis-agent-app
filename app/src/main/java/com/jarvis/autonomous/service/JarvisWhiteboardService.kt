@@ -117,6 +117,11 @@ class JarvisWhiteboardService : Service() {
     private var messagesTextView: TextView? = null
     private var currentParams: WindowManager.LayoutParams? = null
     private var serviceScope: CoroutineScope? = null
+    // B-C2: guards the denied-permission notice so the store message
+    // below cannot re-trigger itself in a loop (postMessage restarts
+    // this service, which would otherwise re-post on every start).
+    private var deniedNoticePosted: Boolean = false
+    private val deniedNotificationId = 1003
 
     override fun onCreate() {
         super.onCreate()
@@ -186,20 +191,58 @@ class JarvisWhiteboardService : Service() {
     private fun showWindow() {
         if (collapsedView != null || expandedView != null) return
         if (!canDrawOverlays()) {
-            // Never bypass the permission screen: no window, and the
-            // message is already safe in WhiteboardStore for the in-app
-            // fallback screen. Do not open Settings from a service here;
-            // the in-app screen offers that button.
+            // B-C2: NEVER log-only. The denied path must reach the
+            // user visibly: (1) a message in the shared store, so it
+            // shows in the in-app Whiteboard tab's message list, and
+            // (2) a notification, so it is seen even when the app is
+            // not open. The never-upload rule is untouched — both
+            // channels are on-device only. The guard above prevents
+            // the store post from looping back through postMessage.
             JarvisStateRepository.addLog(
                 "Whiteboard overlay not shown: overlay permission denied."
             )
+            if (!deniedNoticePosted) {
+                deniedNoticePosted = true
+                WhiteboardStore.postMessage(
+                    "Floating whiteboard nahi khul paya — overlay permission nahi mili. " +
+                        "In-app Whiteboard tab me draw karo, ya overlay permission do."
+                )
+                notifyDenied()
+            }
             return
         }
+        deniedNoticePosted = false
         showCollapsed()
     }
 
-    private fun showCollapsed() {
-        val manager = windowManager ?: return
+    /** Visible denied notice via the service's own notification
+     *  channel, opening the app on tap. Best effort — a missing
+     *  notification permission must not crash the service. */
+    private fun notifyDenied() {
+        runCatching {
+            createNotificationChannel()
+            val openAppIntent = PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_jarvis_core)
+                .setContentTitle("JARVIS Whiteboard nahi khula")
+                .setContentText(
+                    "Overlay permission nahi mili — in-app Whiteboard tab me draw karo."
+                )
+                .setContentIntent(openAppIntent)
+                .setAutoCancel(true)
+                .build()
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(deniedNotificationId, notification)
+        }
+    }
+
+    private fun showCollapsed(): Boolean {
+        val manager = windowManager ?: return false
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -266,16 +309,13 @@ class JarvisWhiteboardService : Service() {
             manager.addView(pill, params)
             collapsedView = pill
             currentParams = params
-        }
+        }.isSuccess
     }
 
     private fun showExpanded() {
         val manager = windowManager ?: return
         val oldParams = currentParams
-        collapsedView?.let { view ->
-            runCatching { manager.removeView(view) }
-        }
-        collapsedView = null
+        // NOTE: the collapsed pill is NOT removed yet (see below).
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -411,13 +451,26 @@ class JarvisWhiteboardService : Service() {
         panel.addView(messagesLabel)
         panel.addView(messagesScroll)
 
-        runCatching {
+        // B-L8: add the panel FIRST, remove the pill only on success.
+        // The old order removed the pill first, so a failed addView
+        // left the user with neither pill nor panel.
+        val added = runCatching {
             manager.addView(panel, params)
-            expandedView = panel
-            drawingView = drawing
-            messagesTextView = messagesView
-            currentParams = params
+        }.isSuccess
+        if (!added) {
+            JarvisStateRepository.addLog(
+                "Whiteboard expanded panel could not be added — pill kept."
+            )
+            return
         }
+        collapsedView?.let { view ->
+            runCatching { manager.removeView(view) }
+        }
+        collapsedView = null
+        expandedView = panel
+        drawingView = drawing
+        messagesTextView = messagesView
+        currentParams = params
         // messagesTextView was null at the earlier updateMessagesText call
         // above, so refresh now that it is assigned.
         updateMessagesText(WhiteboardStore.state.value.messages)
@@ -425,13 +478,18 @@ class JarvisWhiteboardService : Service() {
 
     private fun showCollapsedFromExpanded() {
         val manager = windowManager ?: return
-        expandedView?.let { view ->
-            runCatching { manager.removeView(view) }
+        // Same add-first rule as showExpanded: the new pill must land
+        // before the expanded panel is removed, or a failed add leaves
+        // the user with no whiteboard at all.
+        val expanded = expandedView
+        if (showCollapsed()) {
+            expanded?.let { view ->
+                runCatching { manager.removeView(view) }
+            }
+            expandedView = null
+            drawingView = null
+            messagesTextView = null
         }
-        expandedView = null
-        drawingView = null
-        messagesTextView = null
-        showCollapsed()
     }
 
     private fun hideWindow() {
@@ -504,6 +562,10 @@ class JarvisWhiteboardService : Service() {
 
     override fun onDestroy() {
         hideWindow()
+        // B-M11: flush synchronously BEFORE cancelling the writer
+        // scope, or the latest strokes/messages could die with the
+        // service's async save still in flight.
+        runCatching { WhiteboardStore.flushSync() }
         serviceScope?.cancel()
         serviceScope = null
         super.onDestroy()

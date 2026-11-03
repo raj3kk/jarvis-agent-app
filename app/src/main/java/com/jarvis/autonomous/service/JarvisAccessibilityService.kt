@@ -216,10 +216,21 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     /**
      * Performs a physical tap gesture at (x, y).
+     * A-H1: out-of-range coordinates are REJECTED, never coerced —
+     * coercing a bad tap onto the screen edge taps the wrong thing.
      */
-    suspend fun tapCoordinates(x: Int, y: Int): Boolean = suspendCancellableCoroutine { cont ->
-        val safeX = x.coerceAtLeast(1).toFloat()
-        val safeY = y.coerceAtLeast(1).toFloat()
+    suspend fun tapCoordinates(x: Int, y: Int): Boolean {
+        val metrics = resources.displayMetrics
+        if (x < 0 || y < 0 || x > metrics.widthPixels || y > metrics.heightPixels) {
+            JarvisStateRepository.addLog("Tap rejected: ($x, $y) out of screen range")
+            return false
+        }
+        return tapCoordinatesInRange(x, y)
+    }
+
+    private suspend fun tapCoordinatesInRange(x: Int, y: Int): Boolean = suspendCancellableCoroutine { cont ->
+        val safeX = x.toFloat()
+        val safeY = y.toFloat()
         val path = Path().apply { moveTo(safeX, safeY) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 90L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
@@ -242,11 +253,21 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Performs a long press at (x, y).
+     * Performs a long press at (x, y). Same A-H1 rule as taps:
+     * out-of-range is rejected, never coerced.
      */
-    suspend fun longPressCoordinates(x: Int, y: Int): Boolean = suspendCancellableCoroutine { cont ->
-        val safeX = x.coerceAtLeast(1).toFloat()
-        val safeY = y.coerceAtLeast(1).toFloat()
+    suspend fun longPressCoordinates(x: Int, y: Int): Boolean {
+        val metrics = resources.displayMetrics
+        if (x < 0 || y < 0 || x > metrics.widthPixels || y > metrics.heightPixels) {
+            JarvisStateRepository.addLog("Long-press rejected: ($x, $y) out of screen range")
+            return false
+        }
+        return longPressCoordinatesInRange(x, y)
+    }
+
+    private suspend fun longPressCoordinatesInRange(x: Int, y: Int): Boolean = suspendCancellableCoroutine { cont ->
+        val safeX = x.toFloat()
+        val safeY = y.toFloat()
         val path = Path().apply { moveTo(safeX, safeY) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 850L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
@@ -272,6 +293,10 @@ class JarvisAccessibilityService : AccessibilityService() {
      * Types text into a specific node [ID] or the first available editable field on screen.
      */
     suspend fun typeText(nodeId: Int?, text: String, pressEnter: Boolean = true): Boolean {
+        if (text.isBlank()) {
+            JarvisStateRepository.addLog("Type failed: blank text rejected.")
+            return false
+        }
         var targetNode: AccessibilityNodeInfo? = if (nodeId != null && nodeId > 0) {
             latestNodesMap[nodeId]
         } else {
@@ -454,54 +479,106 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     fun setMediaVolumePercent(percent: Int): Boolean {
+        // A-H1: out-of-range volume is rejected, never coerced.
+        if (percent !in 0..100) {
+            JarvisStateRepository.addLog("Volume rejected: $percent% out of range")
+            return false
+        }
         return runCatching {
             val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val target = ((percent.coerceIn(0, 100) / 100.0) * max).toInt()
+            val target = ((percent / 100.0) * max).toInt()
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
             JarvisStateRepository.addLog("Volume set to $percent%")
             true
         }.getOrDefault(false)
     }
 
-    fun makePhoneCall(nameOrNumber: String): Boolean {
-        return runCatching {
-            var number = nameOrNumber.trim()
-            if (number.any { it.isLetter() }) {
-                // Lookup contact number by name
-                val resolved = lookupContactNumber(number)
-                if (resolved != null) number = resolved
+    /** Contact-lookup outcome (C-B13): the reason is distinguished,
+     *  never collapsed into a bare null. error is null on success. */
+    data class ContactLookupResult(
+        val number: String?,
+        val error: String?
+    )
+
+    fun makePhoneCall(nameOrNumber: String): Boolean =
+        makePhoneCallWithReason(nameOrNumber).first
+
+    /** Returns (success, reason): ok | contact_not_found |
+     *  contact_ambiguous | permission_denied | dial_failed. A name
+     *  that does not resolve is NEVER dialled as a tel: string. */
+    fun makePhoneCallWithReason(nameOrNumber: String): Pair<Boolean, String> {
+        var number = nameOrNumber.trim()
+        if (number.isBlank()) return false to "contact_not_found"
+        if (number.any { it.isLetter() }) {
+            val lookup = lookupContactNumberDetailed(number)
+            if (lookup.number == null) {
+                return false to (lookup.error ?: "contact_not_found")
             }
+            number = lookup.number
+        }
+        return try {
             val intent = Intent(Intent.ACTION_CALL).apply {
                 data = Uri.parse("tel:$number")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             startActivity(intent)
             JarvisStateRepository.addLog("Initiated phone call to $number")
-            true
-        }.getOrDefault(false)
+            true to "ok"
+        } catch (se: SecurityException) {
+            false to "permission_denied"
+        } catch (e: Exception) {
+            false to "dial_failed"
+        }
     }
 
-    private fun lookupContactNumber(contactName: String): String? {
-        return runCatching {
+    private fun lookupContactNumber(contactName: String): String? =
+        lookupContactNumberDetailed(contactName).number
+
+    /**
+     * A-C3 contact matching: EXACT name match wins; otherwise a
+     * SUBSTRING match counts only when it is UNIQUE. Zero matches
+     * -> contact_not_found; two or more -> contact_ambiguous (the
+     * caller must ask for disambiguation, never pick the first).
+     * A SecurityException (contacts permission denied) is reported
+     * distinctly, never as not-found.
+     */
+    fun lookupContactNumberDetailed(contactName: String): ContactLookupResult {
+        val query = contactName.trim()
+        if (query.isBlank()) return ContactLookupResult(null, "contact_not_found")
+        return try {
             val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
             val projection = arrayOf(
                 ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
                 ContactsContract.CommonDataKinds.Phone.NUMBER
             )
+            val exact = mutableListOf<String>()
+            val partial = mutableListOf<String>()
             contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
                 val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
                 while (cursor.moveToNext()) {
                     val name = cursor.getString(nameIdx) ?: continue
                     val number = cursor.getString(numIdx) ?: continue
-                    if (name.contains(contactName, ignoreCase = true)) {
-                        return number
+                    if (name.equals(query, ignoreCase = true)) {
+                        exact.add(number)
+                    } else if (name.contains(query, ignoreCase = true)) {
+                        partial.add(number)
                     }
                 }
             }
-            null
-        }.getOrNull()
+            val distinctExact = exact.distinct()
+            if (distinctExact.size == 1) return ContactLookupResult(distinctExact[0], null)
+            if (distinctExact.size > 1) return ContactLookupResult(null, "contact_ambiguous")
+            val distinctPartial = partial.distinct()
+            if (distinctPartial.size == 1) return ContactLookupResult(distinctPartial[0], null)
+            if (distinctPartial.size > 1) return ContactLookupResult(null, "contact_ambiguous")
+            ContactLookupResult(null, "contact_not_found")
+        } catch (se: SecurityException) {
+            ContactLookupResult(null, "permission_denied")
+        } catch (e: Exception) {
+            ContactLookupResult(null, "contact_not_found")
+        }
     }
 
     fun setSystemAlarm(hour: Int, minute: Int, label: String): Boolean {
@@ -579,14 +656,25 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Opens any URL or Android Deep Link directly.
+     * Opens an http(s) URL directly. A-C4 hardening: ANY other
+     * scheme (upi:/tel:/sms:/intent:/javascript:/file:/...) is
+     * blocked here, even if a caller bypassed the engine gate —
+     * this function no longer opens deep links at all.
      */
     fun openUrlOrDeepLink(rawUrl: String): Boolean {
+        val trimmed = rawUrl.trim()
+        if (trimmed.contains("://")) {
+            val scheme = trimmed.substringBefore("://").lowercase()
+            if (scheme != "http" && scheme != "https") {
+                JarvisStateRepository.addLog("URL blocked: non-http(s) scheme '$scheme'")
+                return false
+            }
+        }
         return runCatching {
-            val formatted = if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://") || rawUrl.contains("://")) {
-                rawUrl.trim()
+            val formatted = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+                trimmed
             } else {
-                "https://${rawUrl.trim()}"
+                "https://$trimmed"
             }
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(formatted)).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -670,15 +758,22 @@ class JarvisAccessibilityService : AccessibilityService() {
      */
     suspend fun sendWhatsAppMessage(contactOrNumber: String, message: String): Boolean {
         if (message.isBlank()) return false
-        val digits = runCatching {
-            var target = contactOrNumber.trim()
-            if (target.any { it.isLetter() }) {
-                lookupContactNumber(target)?.let { target = it }
+        // A-C3: an ambiguous name fails here — never send to the
+        // first substring match, never fall back to another contact.
+        var target = contactOrNumber.trim()
+        if (target.any { it.isLetter() }) {
+            val lookup = lookupContactNumberDetailed(target)
+            if (lookup.number == null) {
+                JarvisStateRepository.addLog(
+                    "WhatsApp send failed: contact '$contactOrNumber' lookup=${lookup.error}"
+                )
+                return false
             }
-            target.filter { it.isDigit() }.let {
-                if (it.length > 10 && it.startsWith("91")) it.drop(2) else it
-            }
-        }.getOrDefault("")
+            target = lookup.number
+        }
+        val digits = target.filter { it.isDigit() }.let {
+            if (it.length > 10 && it.startsWith("91")) it.drop(2) else it
+        }
         if (digits.length < 7) {
             JarvisStateRepository.addLog("WhatsApp send failed: contact '$contactOrNumber' not found in phone book")
             return false

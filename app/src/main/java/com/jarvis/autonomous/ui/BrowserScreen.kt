@@ -6,12 +6,16 @@ import android.content.Intent
 import android.net.Uri
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -58,6 +62,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -154,6 +160,10 @@ data class BrowserPageResult(
  * - localhost / 127.0.0.1 -> http:// (loopback never leaves the device,
  *   and the Projects localhost preview is http).
  * - Anything else (bare domain, e.g. "example.com") -> https:// prefix.
+ *
+ * B-L11: the loopback test parses the HOST, it never uses a prefix
+ * match — the old startsWith("127.0.0.1") treated the public domain
+ * "127.0.0.1.evil.com" as loopback.
  */
 fun normalizeBrowserUrl(raw: String): String {
     val trimmed = raw.trim()
@@ -161,12 +171,97 @@ fun normalizeBrowserUrl(raw: String): String {
     val lower = trimmed.lowercase()
     if (lower.startsWith("http://") || lower.startsWith("https://")) return trimmed
     if (lower.contains("://")) return ""
-    if (lower.startsWith("localhost") || lower.startsWith("127.0.0.1")) return "http://$trimmed"
+    val host = hostOfUrl(trimmed)
+    if (host != null && isLoopbackHost(host)) return "http://$trimmed"
     return "https://$trimmed"
+}
+
+/** Host of a URL with or without a scheme ("example.com:8080/x" ->
+ *  "example.com"). Null when no host can be parsed. */
+fun hostOfUrl(raw: String): String? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    if (trimmed.contains("://")) {
+        return runCatching { Uri.parse(trimmed).host?.lowercase() }.getOrNull()
+    }
+    // Schemeless: authority is everything before the first /, ? or #,
+    // minus any userinfo and port.
+    val authority = trimmed.substringBefore("/").substringBefore("?").substringBefore("#")
+    val hostPort = authority.substringAfter("@")
+    val host = if (hostPort.startsWith("[")) {
+        hostPort.substringBefore("]") + "]"
+    } else {
+        hostPort.substringBefore(":")
+    }
+    return host.lowercase().ifBlank { null }
+}
+
+/** Strict loopback test: exactly "localhost", 127.0.0.1 (or any
+ *  127.x.x.x loopback address), or IPv6 ::1 — never a suffix match, so
+ *  "127.0.0.1.evil.com" and "localhost.evil.com" are NOT loopback. */
+fun isLoopbackHost(host: String): Boolean {
+    val lower = host.lowercase()
+    if (lower == "localhost" || lower == "::1" || lower == "[::1]") return true
+    if (lower == "127.0.0.1") return true
+    val octets = lower.split(".")
+    return octets.size == 4 && octets[0] == "127" &&
+        octets.all { it.toIntOrNull() in 0..255 }
+}
+
+/** True when the URL's host is loopback (the Projects preview host). */
+fun isLoopbackUrl(url: String): Boolean {
+    val host = hostOfUrl(url) ?: return false
+    return isLoopbackHost(host)
 }
 
 /** True for any http:// URL (the non-HTTPS banner / warning condition). */
 fun isNonHttpsUrl(url: String): Boolean = url.startsWith("http://")
+
+/**
+ * B-L3: the non-HTTPS warning applies to real http pages, NOT to the
+ * loopback preview — the old banner warned on every http:// load,
+ * including the app's own localhost preview. Manifest
+ * usesCleartextTraffic=false still blocks real-http loads at the
+ * network layer; see [cleartextBlockedMessage].
+ */
+fun shouldWarnNonHttps(url: String): Boolean =
+    isNonHttpsUrl(url) && !isLoopbackUrl(url)
+
+/**
+ * B-L3: the message for a real-http load blocked by the manifest's
+ * usesCleartextTraffic=false. It names the cause explicitly instead of
+ * contradicting the manifest with a generic "load error".
+ */
+fun cleartextBlockedMessage(url: String): String =
+    "Ye http page nahi khul sakta — app me cleartext (non-https) traffic " +
+        "band hai. Is page ka https wala link use karo: $url"
+
+/**
+ * B-M3: the preview "?v=" cache-bust nonce is not part of a page's
+ * identity. Two URLs that differ only by that parameter are the same
+ * page, so a nonce bump must never force a reload of the Browser tab
+ * (or fool the already-loaded shortcut into re-fetching).
+ */
+fun stripPreviewNonce(url: String): String {
+    val hashIndex = url.indexOf('#')
+    val fragment = if (hashIndex >= 0) url.substring(hashIndex) else ""
+    val beforeFragment = if (hashIndex >= 0) url.substring(0, hashIndex) else url
+    val queryIndex = beforeFragment.indexOf('?')
+    if (queryIndex < 0) return url
+    val base = beforeFragment.substring(0, queryIndex)
+    val kept = beforeFragment.substring(queryIndex + 1).split("&")
+        .filter { param ->
+            val name = param.substringBefore("=").lowercase()
+            name != "v" && param.isNotEmpty()
+        }
+    return if (kept.isEmpty()) base + fragment else "$base?${kept.joinToString("&")}$fragment"
+}
+
+/** Equality ignoring only the preview ?v= nonce (see above). */
+fun urlsEqualIgnoringPreviewNonce(a: String?, b: String?): Boolean {
+    if (a == null || b == null) return false
+    return stripPreviewNonce(a) == stripPreviewNonce(b)
+}
 
 /**
  * Decodes one evaluateJavascript result. JS string results arrive as a
@@ -206,6 +301,32 @@ class BrowserHostState {
 
     /** Set by the coordinator to switch to the Browser tab. No-op until set. */
     var onShowBrowserTab: () -> Unit = {}
+
+    /**
+     * B-M3: the host is the record of what the Browser tab shows.
+     * EVERY navigation reports here — manual typing, back/forward,
+     * link clicks, engine loads — not just loadUrl/showLoadedPage.
+     * This never switches tabs; it only records the displayed page,
+     * so the engine's visibility check (W1's part) can read a true
+     * tab state instead of a stale loadUrl value.
+     */
+    fun reportDisplayedUrl(url: String) {
+        val normalized = normalizeBrowserUrl(url)
+        if (normalized.isEmpty()) return
+        if (foregroundUrl != normalized) {
+            foregroundUrl = normalized
+        }
+    }
+
+    /**
+     * B-M3: set by BrowserScreen on compose/dispose. The engine reads
+     * this (via JarvisBrowserHost.current) before starting a
+     * background browse, so it never hijacks a page the user is
+     * visibly reading. Volatile, not Compose state: it is read from
+     * background engine code, not from composition.
+     */
+    @Volatile
+    var isBrowserTabVisible: Boolean = false
 
     fun loadUrl(url: String) {
         val normalized = normalizeBrowserUrl(url)
@@ -284,6 +405,10 @@ object JarvisBackgroundBrowser {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var foregroundCallbacks: ForegroundCallbacks? = null
     private var pendingExtraction: PendingExtraction? = null
+    // B-M3: background browses are serialised. Without this, two
+    // concurrent browse() calls shared one WebView and one pending
+    // slot, and each call's clearPending() wiped the other's marker.
+    private val browseMutex = Mutex()
 
     private class PendingExtraction(
         val url: String,
@@ -369,16 +494,25 @@ object JarvisBackgroundBrowser {
 
     // -- Process-kill marker (FULL CHECK spec, notes §5) -------------------
 
+    // B-M10: commit(), not apply(), for the pending-browse marker —
+    // mark AND clear. apply() is async: a process kill in the gap
+    // after browse() "cleared" the marker could resurrect a finished
+    // browse as "interrupted" on the next launch (or lose a genuinely
+    // pending one). commit() is synchronous and tiny; the cost is nil.
     private fun markPending(context: Context, url: String) {
         context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putString(KEY_PENDING_URL, url).apply()
+            .edit().putString(KEY_PENDING_URL, url).commit()
     }
 
-    private fun clearPending(context: Context) {
-        context.applicationContext
+    private fun clearPendingIfMine(context: Context, url: String) {
+        val prefs = context.applicationContext
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().remove(KEY_PENDING_URL).apply()
+        // B-M3: clear only if the marker is still OURS — never null
+        // out another browse's marker (the cross-browse nulling bug).
+        if (prefs.getString(KEY_PENDING_URL, null) == url) {
+            prefs.edit().remove(KEY_PENDING_URL).commit()
+        }
     }
 
     /**
@@ -395,7 +529,7 @@ object JarvisBackgroundBrowser {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val url = prefs.getString(KEY_PENDING_URL, null)
         if (url != null) {
-            prefs.edit().remove(KEY_PENDING_URL).apply()
+            prefs.edit().remove(KEY_PENDING_URL).commit()
         }
         return url
     }
@@ -419,10 +553,10 @@ object JarvisBackgroundBrowser {
         context: Context,
         rawUrl: String,
         timeoutMs: Long = 30_000L
-    ): BrowserPageResult {
+    ): BrowserPageResult = browseMutex.withLock {
         val url = normalizeBrowserUrl(rawUrl)
         if (url.isEmpty()) {
-            return BrowserPageResult(
+            return@withLock BrowserPageResult(
                 url = rawUrl,
                 status = BrowserBrowseStatus.FAILED,
                 errorMessage = "Khaali ya blocked URL — sirf http/https pages allowed hain."
@@ -451,12 +585,16 @@ object JarvisBackgroundBrowser {
                 errorMessage = e.message ?: "Unknown error"
             )
         }
-        clearPending(context)
+        clearPendingIfMine(context, url)
         if (result.status != BrowserBrowseStatus.COMPLETED) {
             runCatching { obtainWebView(context).stopLoading() }
         }
-        pendingExtraction = null
-        return result
+        // B-M3: only clear OUR pending slot — a newer browse (queued
+        // behind the mutex) must keep its own extraction alive.
+        if (pendingExtraction?.url == url) {
+            pendingExtraction = null
+        }
+        result
     }
 
     /** Callback variant of [browse] for non-suspend callers. */
@@ -474,7 +612,10 @@ object JarvisBackgroundBrowser {
         val deferred = CompletableDeferred<BrowserPageResult>()
         val pending = PendingExtraction(url, deferred)
         pendingExtraction = pending
-        if (webView.url == url) {
+        // B-M3: the already-loaded shortcut compares ignoring the
+        // preview ?v= nonce — a preview page at "...?v=3" IS the page
+        // the browse asked for, not a different URL to re-fetch.
+        if (urlsEqualIgnoringPreviewNonce(webView.url, url)) {
             // Already loaded (e.g. foreground tab showed it): extract
             // without reloading.
             startExtraction(webView, pending)
@@ -484,24 +625,80 @@ object JarvisBackgroundBrowser {
         return deferred.await()
     }
 
+    /** Fails the pending browse when the displayed URL is no longer
+     *  the requested one (nonce-ignored: a preview "?v=" bump is not a
+     *  navigation). Returns true when it failed the browse (caller
+     *  stops), false when the URL is still ours. */
+    private fun failIfUrlMoved(webView: WebView, pending: PendingExtraction, why: String): Boolean {
+        if (urlsEqualIgnoringPreviewNonce(webView.url, pending.url)) return false
+        pending.deferred.complete(
+            BrowserPageResult(
+                url = pending.url,
+                status = BrowserBrowseStatus.FAILED,
+                errorMessage = why
+            )
+        )
+        return true
+    }
+
     private fun startExtraction(webView: WebView, pending: PendingExtraction) {
         if (!pending.extractionStarted.compareAndSet(false, true)) return
         scope.launch {
             delay(800L)
             if (pending.deferred.isCompleted) return@launch
+            // B-C4: re-check the URL immediately before EACH
+            // evaluateJavascript — a navigation during the settle
+            // delay must never let us extract the NEW page's text
+            // under the OLD page's URL.
+            if (failIfUrlMoved(
+                    webView, pending,
+                    "Page extraction se pehle badal gayi — galat page ka text nahi liya."
+                )
+            ) {
+                return@launch
+            }
             try {
-                val title = evaluateJs(webView, "document.title")
+                val title = evaluateJs(webView, "document.title", pending.url)
+                if (failIfUrlMoved(
+                        webView, pending,
+                        "Page title nikaalte waqt badal gayi — galat page ka text nahi liya."
+                    )
+                ) {
+                    return@launch
+                }
                 val rawText = evaluateJs(
                     webView,
-                    "document.body ? document.body.innerText.slice(0, 2000) : ''"
+                    "document.body ? document.body.innerText.slice(0, 2000) : ''",
+                    pending.url
                 )
+                if (failIfUrlMoved(
+                        webView, pending,
+                        "Page text nikaalte waqt badal gayi — galat page ka text nahi liya."
+                    )
+                ) {
+                    return@launch
+                }
                 val cleaned = rawText.replace(Regex("\\s+"), " ").trim().take(2000)
+                // B-M4: empty title AND empty text is FAILED, never a
+                // COMPLETED result with an empty chat answer.
+                if (title.isBlank() && cleaned.isBlank()) {
+                    pending.deferred.complete(
+                        BrowserPageResult(
+                            url = pending.url,
+                            status = BrowserBrowseStatus.FAILED,
+                            errorMessage = "Page khaali mili — na title mila, na padhne layak text."
+                        )
+                    )
+                    return@launch
+                }
                 pending.deferred.complete(
                     BrowserPageResult(
                         url = pending.url,
                         title = title,
                         mainText = cleaned,
-                        isNonHttps = isNonHttpsUrl(pending.url),
+                        // B-L3: loopback preview pages are exempt from
+                        // the non-HTTPS warning.
+                        isNonHttps = isNonHttpsUrl(pending.url) && !isLoopbackUrl(pending.url),
                         status = BrowserBrowseStatus.COMPLETED
                     )
                 )
@@ -517,14 +714,22 @@ object JarvisBackgroundBrowser {
         }
     }
 
-    private suspend fun evaluateJs(webView: WebView, script: String): String =
-        suspendCancellableCoroutine { continuation ->
+    private suspend fun evaluateJs(
+        webView: WebView,
+        script: String,
+        expectedUrl: String? = null
+    ): String {
+        // B-C4: the URL is re-checked immediately before the call, not
+        // just at the start of extraction (nonce-ignored, as above).
+        if (expectedUrl != null && !urlsEqualIgnoringPreviewNonce(webView.url, expectedUrl)) return ""
+        return suspendCancellableCoroutine { continuation ->
             webView.evaluateJavascript(script) { raw ->
                 if (continuation.isActive) {
                     continuation.resume(decodeJsString(raw))
                 }
             }
         }
+    }
 
     // -- The single shared client (foreground + background dispatch) -----
 
@@ -536,9 +741,13 @@ object JarvisBackgroundBrowser {
             val target = request?.url?.toString() ?: return false
             val scheme = request.url?.scheme?.lowercase() ?: ""
             // http/https stay INSIDE the app (return false). Everything
-            // else (intent:, tel: handled by the app itself, file:,
-            // javascript:, ...) is blocked — the browser never hands
-            // the user off to Chrome or another app on its own.
+            // else is blocked with a generic error — including tel:,
+            // which this app deliberately does NOT auto-dial (the old
+            // comment claimed tel: was "handled by the app itself"
+            // while the code blocked it like every other scheme; the
+            // comment now says what the code actually does). The
+            // browser never hands the user off to Chrome or another
+            // app on its own.
             if (scheme == "http" || scheme == "https") return false
             foregroundCallbacks?.onError("Blocked link (sirf http/https khulte hain): $target")
             return true
@@ -549,7 +758,28 @@ object JarvisBackgroundBrowser {
             val finishedUrl = url ?: webView.url ?: return
             foregroundCallbacks?.onUrlChanged(finishedUrl)
             val pending = pendingExtraction ?: return
+            // B-C4: extract ONLY when the finished URL IS the requested
+            // main-frame URL. onPageFinished also fires for sub-frames
+            // and for intermediate redirect hops — the old code took
+            // the FIRST finish and extracted whatever page happened to
+            // be showing, which could be an iframe or a redirect
+            // intermediate under the requested URL's name. A redirect
+            // whose final URL differs from the request therefore ends
+            // as a timeout FAILED, never as wrong-page text.
+            if (finishedUrl != pending.url) return
             startExtraction(webView, pending)
+        }
+
+        /** Completes the pending browse as FAILED, if still open. */
+        private fun failPending(pending: PendingExtraction?, message: String) {
+            if (pending == null) return
+            pending.deferred.complete(
+                BrowserPageResult(
+                    url = pending.url,
+                    status = BrowserBrowseStatus.FAILED,
+                    errorMessage = message
+                )
+            )
         }
 
         override fun onReceivedError(
@@ -558,16 +788,61 @@ object JarvisBackgroundBrowser {
             error: WebResourceError?
         ) {
             if (request?.isForMainFrame != true) return
-            val message = error?.description?.toString() ?: "Page load error"
+            val raw = error?.description?.toString() ?: "Page load error"
+            val pending = pendingExtraction
+            // B-L3: a real-http load blocked by the manifest's
+            // usesCleartextTraffic=false surfaces its specific cause
+            // (ERR_CLEARTEXT_NOT_PERMITTED), not a generic error. Any
+            // other error keeps its own message — it must not be
+            // mislabelled as a cleartext block.
+            val message = if (raw.contains("CLEARTEXT", ignoreCase = true)) {
+                cleartextBlockedMessage(pending?.url ?: "")
+            } else {
+                raw
+            }
             foregroundCallbacks?.onError(message)
-            val pending = pendingExtraction ?: return
-            pending.deferred.complete(
-                BrowserPageResult(
-                    url = pending.url,
-                    status = BrowserBrowseStatus.FAILED,
-                    errorMessage = message
-                )
-            )
+            failPending(pending, message)
+        }
+
+        // B-M4: an HTTP error status (404/500/...) is a FAILED browse
+        // with its status — the old code had no override, so a 404
+        // page could extract its "Not Found" body as a COMPLETED
+        // answer.
+        override fun onReceivedHttpError(
+            view: WebView?,
+            request: WebResourceRequest?,
+            errorResponse: WebResourceResponse?
+        ) {
+            if (request?.isForMainFrame != true) return
+            val code = errorResponse?.statusCode ?: 0
+            val message = "Page HTTP error ke saath fail hui (status $code) — content load nahi hua."
+            foregroundCallbacks?.onError(message)
+            failPending(pendingExtraction, message)
+        }
+
+        // B-M4: an SSL failure is FAILED with a clear message, and the
+        // load is cancelled — never proceeded past.
+        override fun onReceivedSslError(
+            view: WebView?,
+            handler: SslErrorHandler?,
+            error: android.net.http.SslError?
+        ) {
+            handler?.cancel()
+            val message = "SSL certificate error — ye page secure nahi hai, isliye load cancel kar diya gaya."
+            foregroundCallbacks?.onError(message)
+            failPending(pendingExtraction, message)
+        }
+
+        // B-M4: a dead renderer is FAILED, not a silent blank page.
+        // Returning true tells WebView the app handled the crash.
+        override fun onRenderProcessGone(
+            view: WebView?,
+            detail: RenderProcessGoneDetail?
+        ): Boolean {
+            val message = "Browser ka renderer crash ho gaya — page dobara load karo."
+            foregroundCallbacks?.onError(message)
+            failPending(pendingExtraction, message)
+            return true
         }
     }
 
@@ -580,6 +855,18 @@ object JarvisBackgroundBrowser {
             if (!title.isNullOrBlank()) {
                 foregroundCallbacks?.onTitle(title)
             }
+        }
+
+        // B-M4: console errors are wired to the foreground error
+        // channel (the old client swallowed them entirely, so a page
+        // whose JS died left a blank-looking result with no reason).
+        // Non-error console levels stay silent — they are noise.
+        override fun onConsoleMessage(message: ConsoleMessage?): Boolean {
+            val text = message?.message() ?: return super.onConsoleMessage(message)
+            if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                foregroundCallbacks?.onError("Page console error: $text")
+            }
+            return true
         }
 
         // File upload from the WebView is disabled: the chooser is
@@ -708,8 +995,22 @@ fun JarvisWebView(
         update = { webView ->
             holder[0] = webView
             onWebViewReady(webView)
-            if (targetUrl.isNotBlank() && webView.url != targetUrl) {
+            // B-M3: load only when the target really differs, ignoring
+            // the preview ?v= nonce — a nonce bump alone must not
+            // reload the Browser tab's page.
+            if (targetUrl.isNotBlank() && !urlsEqualIgnoringPreviewNonce(webView.url, targetUrl)) {
                 webView.loadUrl(targetUrl)
+            }
+            // B-L11: when no target is set (fresh tab) but the shared
+            // WebView already shows a page (e.g. a preview loaded
+            // before this tab opened), report it so the URL bar is
+            // never empty while a page is on screen. Posted (not
+            // called inline) so no state is written during
+            // composition; the callback sets the tab's target, so this
+            // fires once and converges.
+            if (targetUrl.isBlank() && !webView.url.isNullOrBlank()) {
+                val shown = webView.url!!
+                webView.post { onUrlChanged(shown) }
             }
         },
         onRelease = {
@@ -768,9 +1069,21 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
         currentUrl = normalized
         errorMessage = ""
         statusMessage = ""
+        // B-M3: a manual navigation is a tab navigation — the host
+        // records it (no tab switch; this tab is already showing).
+        host.reportDisplayedUrl(normalized)
         val existing = webViewHolder[0]
-        if (existing != null && existing.url != normalized) {
+        if (existing != null && !urlsEqualIgnoringPreviewNonce(existing.url, normalized)) {
             existing.loadUrl(normalized)
+        }
+    }
+
+    // B-M3: the Browser tab's visibility is host state the engine's
+    // background-browse guard reads (W1's part consumes it).
+    DisposableEffect(host) {
+        host.isBrowserTabVisible = true
+        onDispose {
+            host.isBrowserTabVisible = false
         }
     }
 
@@ -886,9 +1199,9 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
             ) { Text("Bahari browser", fontSize = 12.sp) }
         }
 
-        // Non-HTTPS warning banner (item 11): shown for EVERY http://
-        // load, including loopback — the rule is literal on purpose.
-        if (currentUrl.startsWith("http://")) {
+        // Non-HTTPS warning banner (item 11): shown for real http://
+        // loads only — B-L3 exempts the loopback preview explicitly.
+        if (shouldWarnNonHttps(currentUrl)) {
             Text(
                 text = "⚠️ Ye page secure nahi hai (http, https nahi) — is par password, OTP ya payment mat daalo.",
                 fontSize = 13.sp,
@@ -949,6 +1262,9 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
             onUrlChanged = { arrived ->
                 currentUrl = arrived
                 urlInput = arrived
+                // B-M3: link clicks, redirects, back/forward — every
+                // displayed-page change is recorded in the host.
+                host.reportDisplayedUrl(arrived)
                 val current = webViewHolder[0]
                 if (current != null) {
                     canGoBack = current.canGoBack()

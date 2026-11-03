@@ -84,8 +84,13 @@ object KokoroTtsClient {
     private const val FALLBACK_BUNDLED_BYTES = 190_000_000L
 
     private val engineLock = Mutex()
+    /** B-M1: ONE mutex guarding ensureAssetsReady across launch
+     * overlay, Settings retry and speak-triggered copy — concurrent
+     * copies used to collide on the same *.tmp files. */
+    private val copyMutex = Mutex()
     private var engine: OfflineTts? = null
     private var engineDir: File? = null
+    private var speakerCheckLogged: Boolean = false
 
     @Volatile
     private var currentTrack: AudioTrack? = null
@@ -96,23 +101,72 @@ object KokoroTtsClient {
         return File(base, "Kokoro")
     }
 
+    /**
+     * B-C1: the bundled model is verified by EXACT size, never by
+     * ">50MB" (a truncated 60MB copy used to pass). Sources, in
+     * order: (1) the sizes manifest written by [ensureAssetsReady]
+     * after a verified copy; (2) the bundled asset size via
+     * openFd when the asset is stored uncompressed. A legacy
+     * 1.3.0 download dir with neither source keeps the old
+     * >50MB check as a fallback — but a Sherpa init failure on
+     * such a dir deletes it and forces a fresh copy (see [speak]),
+     * so a corrupt legacy dir can never return false forever.
+     */
     fun isDownloaded(context: Context): Boolean {
         val dir = modelDir(context)
         val model = File(dir, MODEL_FILE)
         val voices = File(dir, VOICES_FILE)
         val tokens = File(dir, TOKENS_FILE)
         val espeak = File(dir, "espeak-ng-data")
-        if (!model.exists() || model.length() <= 50_000_000L) return false
+        if (!model.exists()) return false
+        val manifestSizes = readSizesManifest(dir)
+        if (manifestSizes != null) {
+            val expected = manifestSizes[MODEL_FILE] ?: return false
+            if (model.length() != expected) return false
+        } else {
+            val bundledSize = bundledFileBytes(context, MODEL_FILE)
+            if (bundledSize > 0) {
+                if (model.length() != bundledSize) return false
+            } else if (model.length() <= 50_000_000L) {
+                return false
+            }
+        }
         if (!voices.exists() || voices.length() == 0L) return false
         if (!tokens.exists() || tokens.length() == 0L) return false
         if (!espeak.isDirectory) return false
         return espeak.walkTopDown().any { it.isFile }
     }
 
+    /** Sizes manifest written by [ensureAssetsReady] (rel=size lines). */
+    private const val SIZES_MANIFEST_FILE = "kokoro-sizes.txt"
+
+    private fun readSizesManifest(dir: File): Map<String, Long>? {
+        val manifest = File(dir, SIZES_MANIFEST_FILE)
+        if (!manifest.exists()) return null
+        return runCatching {
+            manifest.readLines()
+                .mapNotNull { line ->
+                    val idx = line.lastIndexOf('=')
+                    if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1).toLong()
+                }.toMap().takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    private fun writeSizesManifest(dir: File, sizes: Map<String, Long>) {
+        runCatching {
+            File(dir, SIZES_MANIFEST_FILE).writeText(
+                sizes.entries.joinToString("\n") { "${it.key}=${it.value}" }
+            )
+        }
+    }
+
     fun bundledModelBytes(context: Context): Long {
         val dir = modelDir(context)
         if (!dir.exists()) return 0L
-        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        // B-M2: orphan *.tmp files never count toward the total.
+        return dir.walkTopDown()
+            .filter { it.isFile && !it.name.endsWith(".tmp") }
+            .sumOf { it.length() }
     }
 
     // ---------- Bundled-asset first run (1.4.0) ----------
@@ -170,6 +224,29 @@ object KokoroTtsClient {
     }
 
     /**
+     * B-M2: exact asset size by STREAMING (openFd returns -1 for
+     * compressed assets, so it is never relied on alone). Used
+     * for every file whose openFd size is unknown, before any
+     * copy/skip decision is made.
+     */
+    private fun countedAssetBytes(context: Context, relPath: String): Long {
+        return try {
+            var total = 0L
+            context.assets.open("$ASSET_DIR/$relPath").use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    total += n
+                }
+            }
+            total
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    /**
      * Ensures the model dir is ready, copying bundled assets on
      * first use. Idempotent: if [isDownloaded] is already true
      * (bundled copy done, or a 1.3.0 download), this returns
@@ -199,88 +276,142 @@ object KokoroTtsClient {
         context: Context,
         onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit = { _, _, _ -> }
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
-            if (isDownloaded(context)) {
-                val totalMB = bundledModelBytes(context) / 1_000_000L
-                onProgress("ready", totalMB, totalMB)
-                return@runCatching
-            }
-            if (!hasBundledAssets(context)) {
-                throw IllegalStateException(
-                    "Kokoro voice missing: this APK has no bundled Kokoro " +
-                        "model and no downloaded model exists. Reinstall the " +
-                        "bundled 1.4.0 APK — no other voice will be used."
-                )
-            }
-            onProgress("checking_space", 0L, 0L)
-            val dir = modelDir(context)
-            dir.mkdirs()
-            val files = listBundledFiles(context)
-            val sizes = files.associateWith { bundledFileBytes(context, it) }
-            val totalBytes = sizes.values.filter { it > 0 }.sum()
-                .takeIf { it > 0 } ?: FALLBACK_BUNDLED_BYTES
-            val totalMB = totalBytes / 1_000_000L
-            // Bytes still to copy (skip targets already present at full size).
-            var remainingBytes = 0L
-            for ((rel, size) in sizes) {
-                val target = File(dir, rel)
-                if (size > 0 && target.exists() && target.length() == size) continue
-                remainingBytes += if (size > 0) size else 0L
-            }
-            val alreadyPresent = dir.walkTopDown().any { it.isFile }
-            val requiredBytes = if (!alreadyPresent) {
-                REQUIRED_FREE_BYTES_FRESH_COPY
-            } else {
-                remainingBytes + COPY_RESUME_MARGIN_BYTES
-            }
-            val freeBytes = availableFreeBytes(context)
-            if (freeBytes < requiredBytes) {
-                val msg = "Kokoro setup needs ~${requiredBytes / 1_000_000L} MB free " +
-                    "space — only ${freeBytes / 1_000_000L} MB available. " +
-                    "Please free space and relaunch Jarvis."
-                JarvisStateRepository.addLog(msg)
-                throw IllegalStateException(msg)
-            }
-            var copiedBytes = totalBytes - remainingBytes
-            onProgress("copying", copiedBytes / 1_000_000L, totalMB)
-            for (rel in files) {
-                val target = File(dir, rel)
-                val size = sizes[rel] ?: -1L
-                if (size > 0 && target.exists() && target.length() == size) continue
-                target.parentFile?.mkdirs()
-                val tmp = File(target.parentFile, "${target.name}.tmp")
-                try {
-                    context.assets.open("$ASSET_DIR/$rel").use { input ->
-                        tmp.outputStream().use { output ->
-                            val buf = ByteArray(64 * 1024)
-                            while (true) {
-                                val n = input.read(buf)
-                                if (n < 0) break
-                                output.write(buf, 0, n)
-                                copiedBytes += n
+        // B-M1: serialised — launch overlay, Settings retry and
+        // speak-triggered copies queue here, never interleave.
+        copyMutex.withLock {
+            runCatching {
+                if (isDownloaded(context)) {
+                    val totalMB = bundledModelBytes(context) / 1_000_000L
+                    onProgress("ready", totalMB, totalMB)
+                    return@runCatching
+                }
+                if (!hasBundledAssets(context)) {
+                    throw IllegalStateException(
+                        "Kokoro voice missing: this APK has no bundled Kokoro " +
+                            "model and no downloaded model exists. Reinstall the " +
+                            "bundled 1.4.0 APK — no other voice will be used."
+                    )
+                }
+                onProgress("checking_space", 0L, 0L)
+                val dir = modelDir(context)
+                dir.mkdirs()
+                // B-M2: clean orphan *.tmp files BEFORE measuring
+                // or resuming — a stale tmp must never count as
+                // already-copied bytes or as "present" content.
+                dir.walkTopDown()
+                    .filter { it.isFile && it.name.endsWith(".tmp") }
+                    .forEach { runCatching { it.delete() } }
+                val files = listBundledFiles(context)
+                // B-M2: exact sizes via stream/manifest — openFd
+                // alone is never trusted (compressed assets -> -1).
+                val sizes = files.associateWith { rel ->
+                    val fdSize = bundledFileBytes(context, rel)
+                    if (fdSize > 0) fdSize else countedAssetBytes(context, rel)
+                }
+                val totalBytes = sizes.values.filter { it > 0 }.sum()
+                    .takeIf { it > 0 } ?: FALLBACK_BUNDLED_BYTES
+                val totalMB = totalBytes / 1_000_000L
+                // Bytes still to copy (skip targets already present at full size).
+                var remainingBytes = 0L
+                for ((rel, size) in sizes) {
+                    val target = File(dir, rel)
+                    if (size > 0 && target.exists() && target.length() == size) continue
+                    remainingBytes += if (size > 0) size else 0L
+                }
+                val alreadyPresent = dir.walkTopDown()
+                    .any { it.isFile && !it.name.endsWith(".tmp") }
+                val requiredBytes = if (!alreadyPresent) {
+                    REQUIRED_FREE_BYTES_FRESH_COPY
+                } else {
+                    remainingBytes + COPY_RESUME_MARGIN_BYTES
+                }
+                val freeBytes = availableFreeBytes(context)
+                if (freeBytes < requiredBytes) {
+                    val msg = "Kokoro setup needs ~${requiredBytes / 1_000_000L} MB free " +
+                        "space — only ${freeBytes / 1_000_000L} MB available. " +
+                        "Please free space and relaunch Jarvis."
+                    JarvisStateRepository.addLog(msg)
+                    throw IllegalStateException(msg)
+                }
+                var copiedBytes = totalBytes - remainingBytes
+                onProgress("copying", copiedBytes / 1_000_000L, totalMB)
+                for (rel in files) {
+                    val target = File(dir, rel)
+                    val size = sizes[rel] ?: -1L
+                    if (size > 0 && target.exists() && target.length() == size) continue
+                    // B-M2: per-file free-space re-check — disk
+                    // may fill mid-copy (downloads, other apps).
+                    val freeNow = availableFreeBytes(context)
+                    val needNow = if (size > 0) size + COPY_RESUME_MARGIN_BYTES
+                        else COPY_RESUME_MARGIN_BYTES
+                    if (freeNow < needNow) {
+                        val msg = "Kokoro setup needs ~${needNow / 1_000_000L} MB free " +
+                            "space for $rel — only ${freeNow / 1_000_000L} MB available. " +
+                            "Please free space and relaunch Jarvis."
+                        JarvisStateRepository.addLog(msg)
+                        throw IllegalStateException(msg)
+                    }
+                    target.parentFile?.mkdirs()
+                    val tmp = File(target.parentFile, "${target.name}.tmp")
+                    try {
+                        context.assets.open("$ASSET_DIR/$rel").use { input ->
+                            tmp.outputStream().use { output ->
+                                val buf = ByteArray(64 * 1024)
+                                while (true) {
+                                    val n = input.read(buf)
+                                    if (n < 0) break
+                                    output.write(buf, 0, n)
+                                    copiedBytes += n
+                                }
                             }
                         }
+                        if (target.exists()) target.delete()
+                        check(tmp.renameTo(target)) { "Save nahi hua: $rel" }
+                    } catch (e: Exception) {
+                        tmp.delete()
+                        throw e
                     }
-                    if (target.exists()) target.delete()
-                    check(tmp.renameTo(target)) { "Save nahi hua: $rel" }
-                } catch (e: Exception) {
-                    tmp.delete()
-                    throw e
+                    onProgress("copying", copiedBytes / 1_000_000L, totalMB)
                 }
-                onProgress("copying", copiedBytes / 1_000_000L, totalMB)
-            }
-            if (!isDownloaded(context)) {
-                throw IllegalStateException(
-                    "Kokoro copy finished but the model is still incomplete — " +
-                        "relaunch Jarvis to resume the copy."
+                // B-C1: record exact copied sizes so later
+                // isDownloaded() checks verify exact sizes.
+                writeSizesManifest(dir, sizes.filterValues { it > 0 })
+                if (!isDownloaded(context)) {
+                    throw IllegalStateException(
+                        "Kokoro copy finished but the model is still incomplete — " +
+                            "relaunch Jarvis to resume the copy."
+                    )
+                }
+                onProgress("ready", totalMB, totalMB)
+                JarvisStateRepository.addLog(
+                    "Kokoro bundled model ready (${bundledModelBytes(context) / 1_000_000L} MB, " +
+                        "copied from APK assets — no download needed)."
                 )
             }
-            onProgress("ready", totalMB, totalMB)
-            JarvisStateRepository.addLog(
-                "Kokoro bundled model ready (${bundledModelBytes(context) / 1_000_000L} MB, " +
-                    "copied from APK assets — no download needed)."
-            )
         }
+    }
+
+    /**
+     * B-C1 reset path, callable from the Settings retry button:
+     * releases the engine, deletes the whole model dir, then
+     * re-copies bundled assets fresh. A corrupt copy is never
+     * "repaired" by re-verifying it in place — it is replaced.
+     */
+    suspend fun resetAndCopy(
+        context: Context,
+        onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit = { _, _, _ -> }
+    ): Result<Unit> {
+        engineLock.withLock {
+            runCatching { engine?.release() }
+            engine = null
+            engineDir = null
+        }
+        stopPlayback()
+        withContext(Dispatchers.IO) {
+            runCatching { modelDir(context).deleteRecursively() }
+        }
+        JarvisStateRepository.addLog("Kokoro model reset — fresh bundled copy starting.")
+        return ensureAssetsReady(context, onProgress)
     }
 
     fun stopPlayback() {
@@ -317,9 +448,35 @@ object KokoroTtsClient {
             }
         }
         stopped.set(false)
+        // B-C1: engine-init failure is NOT terminal. A corrupt
+        // model dir is deleted and re-copied fresh, then the
+        // engine is retried once — speak() must never return
+        // false forever on a dir that a fresh copy would fix.
+        // Playback/generation failures below do NOT delete the
+        // model (they are not model-corruption evidence).
+        val tts = try {
+            getEngine(context)
+        } catch (e: Exception) {
+            JarvisStateRepository.addLog(
+                "Kokoro engine init failed (${e.message}) — deleting " +
+                    "model dir and forcing a fresh bundled copy."
+            )
+            val recoveredTts = if (resetAndCopy(context).isSuccess) {
+                runCatching { getEngine(context) }.getOrNull()
+            } else {
+                null
+            }
+            if (recoveredTts == null) {
+                JarvisStateRepository.addLog(
+                    "Kokoro still unavailable after fresh copy — no " +
+                        "fallback voice in the Kokoro-only build."
+                )
+                return false
+            }
+            recoveredTts
+        }
         return try {
             withContext(Dispatchers.IO) {
-                val tts = getEngine(context)
                 for (chunk in splitChunks(text, 600)) {
                     if (stopped.get()) return@withContext false
                     val audio = tts.generate(chunk, HF_ALPHA_SID, 1.0f)
@@ -342,6 +499,12 @@ object KokoroTtsClient {
         val cached = engine
         if (cached != null && engineDir == dir) return@withLock cached
         runCatching { cached?.release() }
+        // B-L12: verify HF_ALPHA_SID against a bundled voices
+        // manifest when one exists; a mismatch is LOGGED (never
+        // silently used). No manifest ships in the current bundle,
+        // so that case logs once that SID 31 rests on Sherpa's
+        // documented voice ordering, unverified by a manifest.
+        verifySpeakerId(dir)
         val lexicon = listOf("lexicon-us-en.txt", "lexicon-zh.txt")
             .filter { File(dir, it).exists() }
             .joinToString(",")
@@ -373,6 +536,50 @@ object KokoroTtsClient {
         created
     }
 
+    /**
+     * B-L12: looks for a voices manifest in the model dir
+     * (voices.json / voices.txt / speakers.json / manifest.json).
+     * If one names hf_alpha with an id other than
+     * [HF_ALPHA_SID], that mismatch is logged as a warning —
+     * the voice is never silently wrong. Without a manifest the
+     * SID is unverified and that is logged once, honestly.
+     */
+    private fun verifySpeakerId(dir: File) {
+        if (speakerCheckLogged) return
+        speakerCheckLogged = true
+        val manifest = listOf("voices.json", "voices.txt", "speakers.json", "manifest.json")
+            .map { File(dir, it) }
+            .firstOrNull { it.exists() }
+        if (manifest == null) {
+            JarvisStateRepository.addLog(
+                "Kokoro voice check: no voices manifest in the model " +
+                    "dir — HF_ALPHA_SID=$HF_ALPHA_SID is Sherpa's " +
+                    "documented ordering, not manifest-verified."
+            )
+            return
+        }
+        val content = runCatching { manifest.readText() }.getOrDefault("")
+        val idx = content.indexOf("hf_alpha")
+        if (idx < 0) {
+            JarvisStateRepository.addLog(
+                "Kokoro voice WARNING: voices manifest does not name " +
+                    "hf_alpha — SID $HF_ALPHA_SID is unverified."
+            )
+            return
+        }
+        val window = content.substring(
+            maxOf(0, idx - 120),
+            minOf(content.length, idx + 120)
+        )
+        if (!window.contains(HF_ALPHA_SID.toString())) {
+            JarvisStateRepository.addLog(
+                "Kokoro voice WARNING: voices manifest names hf_alpha " +
+                    "but not with SID $HF_ALPHA_SID near it — check " +
+                    "the bundled voices before trusting the voice."
+            )
+        }
+    }
+
     private fun splitChunks(text: String, maxChars: Int): List<String> {
         val sentences = text.split(Regex("(?<=[.!?\\u0964\\n])\\s+"))
             .map { it.trim() }.filter { it.isNotEmpty() }
@@ -384,15 +591,27 @@ object KokoroTtsClient {
                 current = StringBuilder()
             }
         }
+        // B-L12 word packing: a chunk boundary falls on a word
+        // boundary. A single unbreakable token longer than
+        // maxChars goes out WHOLE as its own chunk — it is never
+        // hard-cut mid-word.
+        fun packWords(sentence: String) {
+            for (word in sentence.split(" ").filter { it.isNotEmpty() }) {
+                if (current.isEmpty()) {
+                    current.append(word)
+                } else if (current.length + 1 + word.length <= maxChars) {
+                    current.append(" ").append(word)
+                } else {
+                    flush()
+                    current.append(word)
+                }
+            }
+        }
         for (sentence in sentences) {
             if (sentence.length > maxChars) {
                 flush()
-                var rest = sentence
-                while (rest.length > maxChars) {
-                    chunks.add(rest.substring(0, maxChars))
-                    rest = rest.substring(maxChars)
-                }
-                if (rest.isNotEmpty()) current.append(rest).append(" ")
+                packWords(sentence)
+                flush()
             } else if (current.length + sentence.length + 1 > maxChars) {
                 flush()
                 current.append(sentence).append(" ")
@@ -401,7 +620,25 @@ object KokoroTtsClient {
             }
         }
         flush()
-        return chunks.ifEmpty { listOf(text.take(maxChars)) }
+        if (chunks.isEmpty()) {
+            // No sentence boundaries at all: word-pack the whole
+            // text (a lone over-long token still goes out whole).
+            val packed = mutableListOf<String>()
+            var cur = StringBuilder()
+            for (word in text.split(" ").filter { it.isNotEmpty() }) {
+                if (cur.isEmpty()) {
+                    cur.append(word)
+                } else if (cur.length + 1 + word.length <= maxChars) {
+                    cur.append(" ").append(word)
+                } else {
+                    packed.add(cur.toString())
+                    cur = StringBuilder(word)
+                }
+            }
+            if (cur.isNotEmpty()) packed.add(cur.toString())
+            return packed.ifEmpty { listOf(text) }
+        }
+        return chunks
     }
 
     private suspend fun playAudio(audio: GeneratedAudio): Boolean =

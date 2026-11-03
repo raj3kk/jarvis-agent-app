@@ -1,5 +1,6 @@
 package com.jarvis.autonomous.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,10 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -27,6 +32,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -47,6 +53,12 @@ class JarvisForegroundService : Service() {
         const val EXTRA_NOTIF_TEXT = "extra_notif_text"
         const val ACTION_ANNOUNCE_CALL = "com.jarvis.autonomous.ACTION_ANNOUNCE_CALL"
         const val EXTRA_CALL_DISPLAY = "extra_call_display"
+
+        /** A-M8: wake-lock timeout + renewal before expiry. */
+        const val WAKE_LOCK_TIMEOUT_MS: Long = 4 * 60 * 60 * 1000L
+        const val WAKE_LOCK_RENEWAL_MS: Long = 3 * 60 * 60 * 1000L
+        /** A-M8: SharedPreferences key for the mic-enabled flag. */
+        const val KEY_MIC_LOOP_PERSISTED: String = "mic_loop_enabled_persisted"
     }
 
     private lateinit var prefs: JarvisPreferences
@@ -55,8 +67,24 @@ class JarvisForegroundService : Service() {
     private lateinit var micManager: AlwaysOnMicManager
     private var floatingOverlay: FloatingJarvisOverlay? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val wakeLockHandler = Handler(Looper.getMainLooper())
+    // A-M8 wake-lock renewal: re-acquires before the timeout
+    // expires, so the lock never silently lapses mid-session.
+    private val wakeLockRenewalRunnable = Runnable {
+        runCatching {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
+                wakeLockHandler.postDelayed(
+                    wakeLockRenewalRunnable, WAKE_LOCK_RENEWAL_MS
+                )
+            }
+        }
+    }
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
+    /** B-M13: serialises speakWrapped so setSpeaking(true/false)
+     * pairs never interleave across concurrent speaks. */
+    private val speakMutex = kotlinx.coroutines.sync.Mutex()
 
     /**
      * 1.4.0 echo gate: EVERY speak goes through here so the
@@ -64,17 +92,42 @@ class JarvisForegroundService : Service() {
      * true/false around playback), except the barge-in keywords
      * "ruk"/"bas" which still stop speech via the callback below.
      */
-    private suspend fun speakWrapped(text: String) {
-        if (::micManager.isInitialized) {
-            micManager.setSpeaking(true, text)
-            try {
+    private suspend fun speakWrapped(text: String): Boolean {
+        return speakMutex.withLock {
+            if (::micManager.isInitialized) {
+                micManager.setSpeaking(true, text)
+                try {
+                    voiceManager.speakAndWait(text)
+                } finally {
+                    micManager.setSpeaking(false)
+                }
+            } else {
                 voiceManager.speakAndWait(text)
-            } finally {
-                micManager.setSpeaking(false)
             }
-        } else {
-            voiceManager.speakAndWait(text)
         }
+    }
+
+    /**
+     * A-H8: cancel a pending mid-task voice reply (complete with
+     * null) so a stale reply never swallows the next command.
+     */
+    private fun cancelPendingVoiceReply() {
+        val pending = pendingVoiceReply
+        pendingVoiceReply = null
+        if (pending != null && !pending.isCompleted) {
+            pending.complete(null)
+        }
+    }
+
+    /** A-M8: persisted mic-loop flag (same prefs file, own key). */
+    private fun isMicLoopPersisted(): Boolean {
+        return getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
+            .getBoolean(KEY_MIC_LOOP_PERSISTED, false)
+    }
+
+    private fun setMicLoopPersisted(value: Boolean) {
+        getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_MIC_LOOP_PERSISTED, value).apply()
     }
 
     /**
@@ -147,7 +200,11 @@ class JarvisForegroundService : Service() {
             prefs = prefs,
             onSpeakAndAwait = { text -> speakWrapped(text) },
             onRequestUserVoiceReply = { awaitMicReply() },
-            onShowBrowserPage = { url -> JarvisBrowserHost.current?.showLoadedPage(url) }
+            onShowBrowserPage = { url -> JarvisBrowserHost.current?.showLoadedPage(url) },
+            // B-M3: engine background-browse guard reads live tab
+            // visibility via the shared browser host (null-safe:
+            // false when the Activity/host does not exist yet).
+            isBrowserTabVisible = { JarvisBrowserHost.current?.isBrowserTabVisible == true }
         )
 
         voiceManager = VoiceManager(
@@ -155,6 +212,13 @@ class JarvisForegroundService : Service() {
             prefs = prefs,
             onWakeCommandDetected = { spokenCommand ->
                 agentEngine.handleUserCommand(spokenCommand)
+            },
+            // A-H3 single-owner gate: the wake-word recognizer
+            // checks the mic loop before every start. The lambda
+            // is evaluated at start time (micManager is created
+            // below), so the construction order here is safe.
+            isMicLoopEnabled = {
+                if (::micManager.isInitialized) micManager.isEnabled() else false
             }
         )
 
@@ -185,6 +249,11 @@ class JarvisForegroundService : Service() {
 
             override fun onMicStoppedByUser() {
                 JarvisStateRepository.addLog("Mic stopped by user (mic band karo) — task untouched.")
+                // A-H8: a pending reply dies with the mic; A-M8:
+                // an explicit user stop clears the persisted flag
+                // (service recreation must NOT revive a stopped mic).
+                cancelPendingVoiceReply()
+                setMicLoopPersisted(false)
                 if (prefs.wakeWordEnabled) {
                     voiceManager.startWakeWordListening()
                 }
@@ -218,6 +287,29 @@ class JarvisForegroundService : Service() {
             voiceManager.startWakeWordListening()
         }
 
+        // A-M8: restore the mic loop across service recreation
+        // ONLY when the user-enabled flag persisted — a service
+        // restart alone never auto-starts the mic without it.
+        // Permission is re-checked here; a revoked grant clears
+        // the flag instead of erroring on every recreation.
+        if (isMicLoopPersisted()) {
+            val granted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                setMicLoopPersisted(false)
+                JarvisStateRepository.addLog(
+                    "Mic not restored: RECORD_AUDIO revoked since last run."
+                )
+            } else {
+                voiceManager.stopListeningInternal()
+                if (micManager.start()) {
+                    startVadMonitor()
+                    JarvisStateRepository.addLog("Mic loop restored after service recreation.")
+                }
+            }
+        }
+
         JarvisStateRepository.setForegroundRunning(true)
         JarvisStateRepository.addLog("Jarvis Foreground Service started.")
     }
@@ -231,8 +323,24 @@ class JarvisForegroundService : Service() {
                 // loop cannot start (no mic permission / no
                 // recognizer), fall back to the single-shot listen.
                 if (::micManager.isInitialized) {
+                    // A-M8: battery-exemption prompt at mic-enable
+                    // time (previously zero callers) — non-blocking:
+                    // the mic still starts even if the user
+                    // dismisses the prompt.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        runCatching {
+                            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                                micManager.buildBatteryExemptionIntent()
+                                    ?.apply {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }?.let { startActivity(it) }
+                            }
+                        }
+                    }
                     voiceManager.stopListeningInternal()
                     if (micManager.start()) {
+                        setMicLoopPersisted(true)
                         startVadMonitor()
                     } else {
                         voiceManager.triggerManualVoiceCommand()
@@ -301,8 +409,16 @@ class JarvisForegroundService : Service() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "JarvisAutonomous::BackgroundAgentWakeLock"
             ).apply {
-                acquire(4 * 60 * 60 * 1000L) // 4 hours renewable
+                // A-M8: non-reference-counted + timed acquire,
+                // renewed by wakeLockRenewalRunnable before expiry
+                // (re-acquire extends the timeout) — the old fixed
+                // 4h acquire silently lapsed after 4 hours.
+                isReferenceCounted = false
+                acquire(WAKE_LOCK_TIMEOUT_MS)
             }
+            wakeLockHandler.postDelayed(
+                wakeLockRenewalRunnable, WAKE_LOCK_RENEWAL_MS
+            )
         }
     }
 
@@ -359,6 +475,13 @@ class JarvisForegroundService : Service() {
 
     override fun onDestroy() {
         floatingOverlay?.hide()
+        // A-H8: destroy cancels a pending reply (a stale reply
+        // must never swallow the next command after recreation).
+        // NOTE: the persisted mic flag is deliberately NOT cleared
+        // here — recreation restores the mic from it (A-M8); only
+        // an explicit user stop clears it.
+        cancelPendingVoiceReply()
+        wakeLockHandler.removeCallbacks(wakeLockRenewalRunnable)
         if (::micManager.isInitialized) {
             micManager.shutdown()
         }

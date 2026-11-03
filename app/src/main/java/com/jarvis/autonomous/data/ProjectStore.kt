@@ -58,26 +58,44 @@ object ProjectStore {
     }
 
     /** Validation result for a built project (used by the engine's
-     *  build-summary step — see INTEGRATION_NOTES_Builder.md §6). */
+     *  build-summary step — see INTEGRATION_NOTES_Builder.md §6).
+     *  B-M7: [invalidRefs] are references that are ERRORS by form, not
+     *  by absence — leading-slash (absolute) references, which the old
+     *  code silently stripped to a relative name and then "found". */
     data class ProjectValidation(
         val ok: Boolean,
         val missingFiles: List<String>,
         val emptyFiles: List<String>,
-        val referencedFiles: List<String>
+        val referencedFiles: List<String>,
+        val invalidRefs: List<String> = emptyList()
     )
 
     fun rootDir(context: Context): File =
-        File(context.getExternalFilesDir(null), "JarvisProjects").apply { mkdirs() }
+        // C-B14: getExternalFilesDir() can return null (unmounted /
+        // adopted storage) — File(null, …) would NPE. Fall back to
+        // the app-private files dir instead of crashing.
+        File(context.getExternalFilesDir(null) ?: context.filesDir, "JarvisProjects").apply { mkdirs() }
 
     /** Canonical project-name form. Every caller (store, editor,
      *  LLM parsing, engine) MUST go through this one function — the
      *  old editor-side regex copy differed (no trailing-dash trim,
      *  no 60-char cap, no blank fallback), so the editor could select
      *  a name that matched no listed project and show only the
-     *  index.html chip. */
+     *  index.html chip.
+     *  B-M5: "." and ".." map to the fallback, never to themselves —
+     *  a project dir literally named "." would BE the projects root
+     *  and ".." would escape it. */
     fun sanitizeProjectName(name: String): String {
         val clean = name.trim().replace(Regex("[^A-Za-z0-9._-]+"), "-").trim('-')
+        if (clean == "." || clean == "..") return "jarvis-project"
         return clean.ifBlank { "jarvis-project" }.take(60)
+    }
+
+    /** B-M5: raw names the UI must refuse outright, before any
+     *  sanitising fallback could quietly rename them. */
+    fun isRejectedProjectName(rawName: String): Boolean {
+        val trimmed = rawName.trim()
+        return trimmed == "." || trimmed == ".."
     }
 
     /** Canonical file-name form, or null when the name is unsafe.
@@ -98,6 +116,35 @@ object ProjectStore {
 
     fun projectDir(context: Context, name: String): File =
         File(rootDir(context), sanitizeProjectName(name)).apply { mkdirs() }
+
+    /** B-S1: the same path WITHOUT mkdirs — for read paths (the
+     *  preview server) that must never create a phantom project just
+     *  because somebody requested its URL. */
+    fun projectDirNoCreate(context: Context, name: String): File =
+        File(rootDir(context), sanitizeProjectName(name))
+
+    /** True when a folder with this sanitised name already exists.
+     *  Uses the no-create path, so the check itself creates nothing. */
+    fun projectExists(context: Context, sanitizedName: String): Boolean =
+        projectDirNoCreate(context, sanitizedName).isDirectory
+
+    /** B-M5: when a raw name normalises onto an existing folder, the
+     *  caller must not overwrite that folder — this returns the first
+     *  free "<name>-2", "<name>-3", … form instead. */
+    fun uniqueProjectName(context: Context, rawName: String): String {
+        val base = sanitizeProjectName(rawName)
+        if (!projectExists(context, base)) return base
+        var suffix = 2
+        while (true) {
+            // Truncate the STEM, never the suffix — a 60-char base
+            // plus "-2" truncated to 60 chars would equal the base
+            // itself and loop forever.
+            val stemLength = (60 - suffix.toString().length - 1).coerceAtLeast(1)
+            val candidate = "${base.take(stemLength)}-$suffix"
+            if (!projectExists(context, candidate)) return candidate
+            suffix++
+        }
+    }
 
     /**
      * THE single read path. Returns the canonical working-copy file
@@ -177,33 +224,51 @@ object ProjectStore {
     fun fileExists(context: Context, project: String, fileName: String): Boolean =
         readFileStatus(context, project, fileName) is FileRead.Ok
 
+    /** Result of a write that keeps the working copy and the
+     *  Documents export distinct (B-M6): a working-copy success with a
+     *  failed export must NEVER be reported as "export ho gaya". */
+    data class WriteResult(
+        val workingOk: Boolean,
+        val exportOk: Boolean
+    )
+
     /**
      * Saves to the working copy (source of truth) AND exports to
      * Documents (write-only copy, best effort). Returns false when
      * the file name is unsafe or the working-copy write failed —
      * callers must surface that instead of claiming "Saved".
-     * An empty write is refused for the three template files: a blank
-     * LLM output must never silently wipe a good file (the engine's
-     * validation step is the second guard; this is the first).
+     * B-L6: a blank write is refused for EVERY file, not just the
+     * three template files — a blank LLM/editor output must never
+     * silently wipe a good file (validation is the second guard;
+     * this is the first). Callers that intentionally create a new
+     * empty file must write a placeholder comment instead.
      */
-    fun writeFile(context: Context, project: String, fileName: String, content: String): Boolean {
-        val safe = sanitizeFileName(fileName) ?: return false
-        if (content.isBlank() && safe in setOf("index.html", "style.css", "script.js")) {
-            return false
+    fun writeFile(context: Context, project: String, fileName: String, content: String): Boolean =
+        writeFileDetailed(context, project, fileName, content).workingOk
+
+    fun writeFileDetailed(context: Context, project: String, fileName: String, content: String): WriteResult {
+        val safe = sanitizeFileName(fileName) ?: return WriteResult(false, false)
+        if (content.isBlank()) {
+            return WriteResult(false, false)
         }
         val dir = projectDir(context, project)
         val file = File(dir, safe)
         file.parentFile?.mkdirs()
         val ok = runCatching { file.writeText(content) }.isSuccess
-        if (!ok) return false
-        exportToDocuments(context, dir.name, safe, content)
+        if (!ok) return WriteResult(false, false)
+        val exported = exportToDocuments(context, dir.name, safe, content)
         recordLastTouched(context, dir.name)
-        return true
+        return WriteResult(true, exported)
     }
 
     fun deleteProject(context: Context, project: String): Boolean {
         val name = sanitizeProjectName(project)
         val deleted = projectDir(context, name).deleteRecursively()
+        // B-M6: a failed working-copy delete must NOT claim success
+        // and must NOT delete the Documents copy — the UI checks this
+        // Boolean, and the Documents copy is the user's visible backup
+        // of a project that (per this return) still exists.
+        if (!deleted) return false
         // Best effort: remove the Documents copy too, otherwise the
         // user keeps seeing a deleted project in the Files app.
         runCatching {
@@ -261,7 +326,10 @@ object ProjectStore {
 
     /** Extracts same-folder asset references (href/src) from HTML,
      *  skipping absolute URLs, protocol-relative URLs, data: URIs
-     *  and pure anchors. */
+     *  and pure anchors. Kept for callers that need the raw list;
+     *  VALIDATION ([validateProject]) does NOT use this — it resolves
+     *  every reference relative to its own file's directory and
+     *  treats leading-slash references as errors (see B-M7). */
     fun referencedAssets(html: String): List<String> {
         val regex = Regex("""(?:href|src)\s*=\s*["']([^"']+)["']""")
         return regex.findAll(html)
@@ -275,29 +343,134 @@ object ProjectStore {
             .toList()
     }
 
+    /** CSS url(...) references, same skipping rules as HTML refs. */
+    private fun referencedCssUrls(css: String): List<String> {
+        val regex = Regex("""url\(\s*["']?([^"')]+)["']?\s*\)""")
+        return regex.findAll(css)
+            .map { it.groupValues[1].substringBefore("?").substringBefore("#").trim() }
+            .filter {
+                it.isNotBlank() && !it.startsWith("http://") && !it.startsWith("https://") &&
+                    !it.startsWith("//") && !it.startsWith("data:")
+            }
+            .distinct()
+            .toList()
+    }
+
+    /**
+     * Resolves one raw reference against the directory of the file
+     * that contains it. Returns the project-relative path, or null
+     * when the reference is invalid by form. B-M7 rules:
+     * - a leading "/" reference is an ERROR (absolute path — never
+     *   silently stripped to a relative name, which used to make a
+     *   broken link validate as "found");
+     * - ".." segments are resolved lexically and may climb to the
+     *   project root, but never above it (escaping the root is an
+     *   error, not a silent clamp);
+     * - backslashes are path separators, never escapes.
+     */
+    private fun resolveReference(fileDir: String, rawRef: String): String? {
+        if (rawRef.startsWith("/")) return null
+        val base = if (fileDir.isEmpty()) emptyList() else fileDir.split("/")
+        val out = base.toMutableList()
+        for (segment in rawRef.replace('\\', '/').split("/")) {
+            when (segment) {
+                "", "." -> Unit
+                ".." -> {
+                    if (out.isEmpty()) return null
+                    out.removeAt(out.lastIndex)
+                }
+                else -> {
+                    if (!segment.matches(Regex("[A-Za-z0-9._-]+"))) return null
+                    out.add(segment)
+                }
+            }
+        }
+        if (out.isEmpty()) return null
+        return out.joinToString("/")
+    }
+
     /** Validates a built project against the source of truth:
-     *  index.html exists and is non-empty, and every file it
-     *  references exists and is non-empty. */
+     *  index.html exists and is non-empty, and EVERY HTML file's
+     *  references (plus every CSS file's url() references) resolve
+     *  relative to THAT file's directory and point at an existing,
+     *  non-empty file. The old code checked only index.html's refs
+     *  and resolved them all against the project root, so a nested
+     *  page's "style.css" (really pages/style.css) validated against
+     *  the wrong file, and a missing nested asset passed silently. */
     fun validateProject(context: Context, project: String): ProjectValidation {
         val name = sanitizeProjectName(project)
         val missing = mutableListOf<String>()
         val empty = mutableListOf<String>()
+        val invalid = mutableListOf<String>()
+        val referenced = mutableListOf<String>()
         val index = readFileStatus(context, name, "index.html")
-        val referenced = if (index is FileRead.Ok) referencedAssets(index.content) else emptyList()
         if (index is FileRead.Missing) missing.add("index.html")
         if (index is FileRead.Empty) empty.add("index.html")
-        for (ref in referenced) {
-            when (readFileStatus(context, name, ref)) {
-                is FileRead.Missing -> missing.add(ref)
-                is FileRead.Empty -> empty.add(ref)
-                is FileRead.Ok -> Unit
+        // Every HTML file in the project, including nested pages.
+        val htmlFiles = listProjects(context)
+            .firstOrNull { it.name == name }?.files
+            ?.filter { it.lowercase().endsWith(".html") || it.lowercase().endsWith(".htm") }
+            ?: emptyList()
+        val htmlRegex = Regex("""(?:href|src)\s*=\s*["']([^"']+)["']""")
+        for (htmlFile in htmlFiles) {
+            val content = when (val read = readFileStatus(context, name, htmlFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            val fileDir = htmlFile.substringBeforeLast("/", "")
+                .takeIf { htmlFile.contains("/") } ?: ""
+            val refs = htmlRegex.findAll(content)
+                .map { it.groupValues[1].substringBefore("?").substringBefore("#").trim() }
+                .filter {
+                    it.isNotBlank() && !it.startsWith("http://") && !it.startsWith("https://") &&
+                        !it.startsWith("//") && !it.startsWith("data:")
+                }
+            for (raw in refs) {
+                val resolved = resolveReference(fileDir, raw)
+                if (resolved == null) {
+                    invalid.add("$htmlFile -> $raw (absolute ya project se bahar ka path)")
+                    continue
+                }
+                referenced.add(resolved)
+                when (readFileStatus(context, name, resolved)) {
+                    is FileRead.Missing -> missing.add("$htmlFile -> $resolved")
+                    is FileRead.Empty -> empty.add("$htmlFile -> $resolved")
+                    is FileRead.Ok -> Unit
+                }
+            }
+        }
+        // Every CSS file's url(...) references, same directory rule.
+        val cssFiles = listProjects(context)
+            .firstOrNull { it.name == name }?.files
+            ?.filter { it.lowercase().endsWith(".css") }
+            ?: emptyList()
+        for (cssFile in cssFiles) {
+            val content = when (val read = readFileStatus(context, name, cssFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            val fileDir = cssFile.substringBeforeLast("/", "")
+                .takeIf { cssFile.contains("/") } ?: ""
+            for (raw in referencedCssUrls(content)) {
+                val resolved = resolveReference(fileDir, raw)
+                if (resolved == null) {
+                    invalid.add("$cssFile -> $raw (absolute ya project se bahar ka path)")
+                    continue
+                }
+                referenced.add(resolved)
+                when (readFileStatus(context, name, resolved)) {
+                    is FileRead.Missing -> missing.add("$cssFile -> $resolved")
+                    is FileRead.Empty -> empty.add("$cssFile -> $resolved")
+                    is FileRead.Ok -> Unit
+                }
             }
         }
         return ProjectValidation(
-            ok = missing.isEmpty() && empty.isEmpty(),
-            missingFiles = missing,
-            emptyFiles = empty,
-            referencedFiles = referenced
+            ok = missing.isEmpty() && empty.isEmpty() && invalid.isEmpty(),
+            missingFiles = missing.distinct(),
+            emptyFiles = empty.distinct(),
+            referencedFiles = referenced.distinct(),
+            invalidRefs = invalid.distinct()
         )
     }
 
@@ -312,24 +485,38 @@ object ProjectStore {
 
     // ---- Documents export via MediaStore (user-visible folder, WRITE-ONLY) ----
 
+    /**
+     * B-M6: mirrors subdirectories — a working-copy file at
+     * "pages/about.html" exports to Documents/JarvisProjects/<project>/
+     * pages/ with DISPLAY_NAME "about.html" (leaf only). The old code
+     * put the whole "pages/about.html" string in DISPLAY_NAME under a
+     * flat folder, so nested files landed with a broken name and no
+     * subfolder. Returns true only when the export actually landed;
+     * callers surface a false here instead of claiming "export ho gaya".
+     */
     private fun exportToDocuments(
         context: Context,
         project: String,
         fileName: String,
         content: String
-    ) {
-        runCatching {
+    ): Boolean {
+        return runCatching {
+            val leaf = fileName.substringAfterLast("/")
+            val subDir = fileName.substringBeforeLast("/", "")
+                .takeIf { fileName.contains("/") } ?: ""
+            val relativePath =
+                "${Environment.DIRECTORY_DOCUMENTS}/JarvisProjects/${sanitizeProjectName(project)}/" +
+                    if (subDir.isNotEmpty()) "$subDir/" else ""
             val resolver = context.contentResolver
-            val relativePath = "${Environment.DIRECTORY_DOCUMENTS}/JarvisProjects/${sanitizeProjectName(project)}/"
             val collection =
                 MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            // Find an existing file with this name in this folder, if any.
+            // Find an existing file with this leaf name in this folder, if any.
             var existing: Uri? = null
             resolver.query(
                 collection,
                 arrayOf(BaseColumns._ID),
                 "${MediaColumns.DISPLAY_NAME}=? AND ${MediaColumns.RELATIVE_PATH}=?",
-                arrayOf(fileName, relativePath),
+                arrayOf(leaf, relativePath),
                 null
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
@@ -339,24 +526,40 @@ object ProjectStore {
             }
             val uri = existing ?: run {
                 val values = ContentValues().apply {
-                    put(MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaColumns.DISPLAY_NAME, leaf)
                     put(MediaColumns.MIME_TYPE, mimeFor(fileName))
                     put(MediaColumns.RELATIVE_PATH, relativePath)
                 }
                 resolver.insert(collection, values)
-            } ?: return
+            } ?: return false
+            var written = false
             resolver.openOutputStream(uri, "wt")?.use { out ->
                 out.write(content.toByteArray(Charsets.UTF_8))
+                written = true
             }
-        }
+            written
+        }.getOrDefault(false)
     }
 
-    private fun mimeFor(fileName: String): String = when {
-        fileName.endsWith(".html") -> "text/html"
-        fileName.endsWith(".css") -> "text/css"
-        fileName.endsWith(".js") -> "application/javascript"
-        fileName.endsWith(".json") -> "application/json"
-        else -> "text/plain"
+    private fun mimeFor(fileName: String): String {
+        // B-L11: case-insensitive, plus the types the old map missed.
+        val lower = fileName.lowercase()
+        return when {
+            lower.endsWith(".html") || lower.endsWith(".htm") -> "text/html"
+            lower.endsWith(".css") -> "text/css"
+            lower.endsWith(".js") || lower.endsWith(".mjs") -> "application/javascript"
+            lower.endsWith(".json") -> "application/json"
+            lower.endsWith(".png") -> "image/png"
+            lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
+            lower.endsWith(".gif") -> "image/gif"
+            lower.endsWith(".webp") -> "image/webp"
+            lower.endsWith(".avif") -> "image/avif"
+            lower.endsWith(".svg") -> "image/svg+xml"
+            lower.endsWith(".mp3") -> "audio/mpeg"
+            lower.endsWith(".wav") -> "audio/wav"
+            lower.endsWith(".pdf") -> "application/pdf"
+            else -> "text/plain"
+        }
     }
 
     // ---- Default website template (creamy, mobile-friendly, no build) ----

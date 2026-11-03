@@ -1,6 +1,8 @@
 package com.jarvis.autonomous.ui
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -28,7 +30,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -77,6 +82,20 @@ import org.json.JSONObject
  *   the user IS logged in) also still works. No path releases a
  *   licence bound to a different device.
  *
+ * 1.4.1 fixes in this file (C-B11/C-B3/C-B15):
+ *   - Session-token field is MASKED (PasswordVisualTransformation)
+ *     and is NEVER persisted: it lives only in composable state and
+ *     is never written to SharedPreferences (grep-verified).
+ *   - Licence-server calls use postLicence(): primary URL first,
+ *     fallback URL on network failure only, one retry per base.
+ *   - Activation writes use commit() + read-back verify: the key +
+ *     activated flag are read back and confirmed before "Activated"
+ *     is shown; a save failure is surfaced, never silently assumed.
+ *   - Recovery card (C-B3): explains the debug->release ANDROID_ID
+ *     change lockout honestly, links to the server dashboard for
+ *     owner-session release, and gives release + re-activate steps.
+ *     Grace stays WARN-ONLY — no enforcement/lockout UI was added.
+ *
  * Global-learning opt-out:
  *   SharedPreferences file "jarvis_agent_prefs" (the app's main prefs
  *   file), key "global_learning_opt_out", default false.
@@ -95,6 +114,21 @@ object LicencePrefs {
 
 const val LICENCE_SERVER_URL = "https://jarvis-server-webbuilder1.vercel.app"
 
+// 1.4.1 fix C-B11: the server URL is NOT a single hardcoded endpoint
+// any more. LICENCE_SERVER_URL (primary, kept under its old name
+// because JarvisAgentEngine.kt imports it) is tried first; on a
+// NETWORK failure only (never on an HTTP error code — a 404/409
+// from the primary is authoritative), the fallback deployment is
+// tried. Each base gets up to 2 attempts (initial + one retry) on
+// network failure before moving on. Change these two constants to
+// point the app at a new deployment; no other file needs editing
+// for the LicenceScreen's own calls.
+const val LICENCE_SERVER_FALLBACK_URL = "https://jarvis-server-seven-chi.vercel.app"
+private val LICENCE_SERVER_URLS = listOf(
+    LICENCE_SERVER_URL,
+    LICENCE_SERVER_FALLBACK_URL
+)
+
 private val licenceHttp = OkHttpClient()
 
 private fun deviceId(context: Context): String {
@@ -104,21 +138,35 @@ private fun deviceId(context: Context): String {
     ) ?: ""
 }
 
-private suspend fun postJson(
-    url: String,
+// One licence-server call with primary→fallback failover (C-B11).
+// Fallback triggers ONLY on network failure (exception / no
+// response). An HTTP response — success or error — is returned
+// immediately and is never retried on the other base, because
+// verify/release are not safe to blindly replay after an unknown
+// outcome, and a 409/404 from the primary is the true answer.
+private suspend fun postLicence(
+    path: String,
     json: JSONObject,
     bearerToken: String? = null
 ): Pair<Int, String> = withContext(Dispatchers.IO) {
-    val body = json.toString().toRequestBody("application/json".toMediaType())
-    val builder = Request.Builder().url(url).post(body)
-    if (!bearerToken.isNullOrBlank()) {
-        builder.header("Authorization", "Bearer ${bearerToken.trim()}")
-    }
-    runCatching {
-        licenceHttp.newCall(builder.build()).execute().use { resp ->
-            resp.code to (resp.body?.string() ?: "")
+    var lastError = "network error"
+    for (base in LICENCE_SERVER_URLS) {
+        for (attempt in 0 until 2) {
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val builder = Request.Builder().url("$base$path").post(body)
+            if (!bearerToken.isNullOrBlank()) {
+                builder.header("Authorization", "Bearer ${bearerToken.trim()}")
+            }
+            val result = runCatching {
+                licenceHttp.newCall(builder.build()).execute().use { resp ->
+                    resp.code to (resp.body?.string() ?: "")
+                }
+            }
+            if (result.isSuccess) return@withContext result.getOrThrow()
+            lastError = result.exceptionOrNull()?.message ?: "network error"
         }
-    }.getOrElse { -1 to (it.message ?: "network error") }
+    }
+    -1 to lastError
 }
 
 @Composable
@@ -208,6 +256,11 @@ fun LicenceScreen() {
                 )
                 Text(text = LICENCE_SERVER_URL, fontSize = 13.sp, color = Color(0xFFB85C38))
                 Text(
+                    text = "Fallback (primary se network fail hone par): $LICENCE_SERVER_FALLBACK_URL",
+                    fontSize = 12.sp,
+                    color = Color(0xFF8A7A70)
+                )
+                Text(
                     text = "1. Open the server link above (in your browser).\n" +
                         "2. Signup / Login on the server.\n" +
                         "3. Dashboard -> Generate licence -> Copy the key.\n" +
@@ -218,6 +271,67 @@ fun LicenceScreen() {
                     text = "One licence = one device at a time. " +
                         "Moving to a new phone? Tap Release below (or Release Device " +
                         "on the server dashboard), then Activate on the new phone.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF8A7A70)
+                )
+            }
+        }
+
+        // RECOVERY (C-B3) — debug->release ANDROID_ID lockout, honestly.
+        // ANDROID_ID is tied to the app's signing key: moving from a
+        // debug-signed build to a release-signed build (or a reinstall
+        // that resets it) can CHANGE the device id, so the licence
+        // stays bound to the OLD id and the new build gets
+        // device_mismatch (409) on Activate. That is not an app
+        // lockout and not a lost licence — it is the old binding,
+        // and it is fixed by releasing the old binding, then
+        // activating again. Grace mode still applies throughout:
+        // warn-only, nothing stops working while this is sorted out.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "Naye build / reinstall ke baad Activate fail ho raha hai?",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "Debug build se release build par jaane par phone ka " +
+                        "ANDROID_ID badal sakta hai. Licence purani id se bound " +
+                        "rehti hai, isliye naya build \"kisi aur device se bound hai\" " +
+                        "batayega. Licence khatam nahi hui hai — purani binding " +
+                        "release karo, phir wahi key dobara Activate karo. " +
+                        "Tab tak app grace mode me poora chalta rahega.",
+                    fontSize = 13.sp
+                )
+                Text(
+                    text = "Steps: 1. Neeche Dashboard kholo aur server par Login karo " +
+                        "(wahi email jisse licence bani thi). " +
+                        "2. Dashboard par Release Device dabao. " +
+                        "3. Is app me wahi licence key se dobara Activate karo.",
+                    fontSize = 13.sp
+                )
+                Button(
+                    onClick = {
+                        val intent = Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse("$LICENCE_SERVER_URL/dashboard")
+                        )
+                        context.startActivity(intent)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Open server dashboard")
+                }
+                Text(
+                    text = "Dashboard par Release Device ke liye server login chahiye — " +
+                        "ye button browser me dashboard kholta hai. " +
+                        "Agar is phone par hi Release karna hai to neeche Release section bhi hai.",
                     fontSize = 12.sp,
                     color = Color(0xFF8A7A70)
                 )
@@ -260,18 +374,35 @@ fun LicenceScreen() {
                                 put("key", key)
                                 put("device_id", id)
                             }
-                            val (code, bodyText) = postJson(
-                                "$LICENCE_SERVER_URL/api/licence/verify",
+                            val (code, bodyText) = postLicence(
+                                "/api/licence/verify",
                                 json
                             )
                             busy = false
                             if (code == 200) {
-                                prefs.edit()
-                                    .putString(LicencePrefs.KEY_LICENCE, key)
-                                    .putBoolean(LicencePrefs.KEY_ACTIVATED, true)
-                                    .apply()
-                                activated = true
-                                status = "Activated ✅ — licence is bound to this device."
+                                // C-B15: commit() + read-back verify.
+                                // apply() is fire-and-forget; a failed
+                                // or lost write used to show "Activated"
+                                // anyway. Now the key + flag are read
+                                // back and confirmed on IO first, and
+                                // a save failure is shown as a failure.
+                                val saved = withContext(Dispatchers.IO) {
+                                    val ok = prefs.edit()
+                                        .putString(LicencePrefs.KEY_LICENCE, key)
+                                        .putBoolean(LicencePrefs.KEY_ACTIVATED, true)
+                                        .commit()
+                                    ok &&
+                                        prefs.getString(LicencePrefs.KEY_LICENCE, "") == key &&
+                                        prefs.getBoolean(LicencePrefs.KEY_ACTIVATED, false)
+                                }
+                                if (saved) {
+                                    activated = true
+                                    status = "Activated ✅ — licence is bound to this device."
+                                } else {
+                                    activated = false
+                                    status = "Server ne activate kar diya, par is phone par " +
+                                        "licence save nahi hui — dobara Activate dabao."
+                                }
                             } else if (code == 409) {
                                 status = "Ye licence kisi aur device se bound hai. " +
                                     "Pehle us device se Release karo, ya dashboard se Release Device karo."
@@ -310,7 +441,12 @@ fun LicenceScreen() {
                     onValueChange = { sessionToken = it },
                     label = { Text("Server session token (optional — khali chhodo to key se release hoga)") },
                     modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+                    singleLine = true,
+                    // C-B11: masked, and NEVER persisted — this value
+                    // lives only in composable state and is never
+                    // written to SharedPreferences.
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
                 )
                 Text(
                     text = "Khali chhodne par release licence key + is device se hota hai " +
@@ -340,18 +476,29 @@ fun LicenceScreen() {
                                 put("device_id", id)
                             }
                             val token = sessionToken.trim().ifBlank { null }
-                            val (code, bodyText) = postJson(
-                                "$LICENCE_SERVER_URL/api/licence/release",
+                            val (code, bodyText) = postLicence(
+                                "/api/licence/release",
                                 json,
                                 bearerToken = token
                             )
                             busy = false
                             if (code == 200) {
-                                prefs.edit()
-                                    .putBoolean(LicencePrefs.KEY_ACTIVATED, false)
-                                    .apply()
-                                activated = false
-                                status = "Released ✅ — ye licence ab naye device par activate ho sakti hai."
+                                // Same commit() + read-back rule as
+                                // Activate (C-B15): confirm the flag
+                                // really cleared before showing success.
+                                val cleared = withContext(Dispatchers.IO) {
+                                    val ok = prefs.edit()
+                                        .putBoolean(LicencePrefs.KEY_ACTIVATED, false)
+                                        .commit()
+                                    ok && !prefs.getBoolean(LicencePrefs.KEY_ACTIVATED, true)
+                                }
+                                if (cleared) {
+                                    activated = false
+                                    status = "Released ✅ — ye licence ab naye device par activate ho sakti hai."
+                                } else {
+                                    status = "Server par release ho gaya, par is phone par " +
+                                        "flag save nahi hua — app dobara kholo ya dobara Release dabao."
+                                }
                             } else if (code == 401) {
                                 status = "Release fail: session token ya key/device match nahi hua."
                             } else if (code == 409) {

@@ -33,21 +33,47 @@ class JarvisNotificationService : NotificationListenerService() {
          * Replies directly to a WhatsApp / Instagram / Telegram / SMS notification in the background
          * using Android's RemoteInput API without even opening the target app.
          */
+        /**
+         * A-C3 retargeting: FAIL (do not send) on no exact/unique
+         * match. The old code fell back to the most-recent sender
+         * when nothing matched — a reply could go to the wrong
+         * person. Rules: exact sender/package match wins; otherwise
+         * a substring match counts only when UNIQUE; zero or two+
+         * matches both fail. An empty filter fails too.
+         */
         fun sendDirectReply(senderOrAppFilter: String, message: String): Boolean {
             val svc = instance ?: return false
             if (message.isBlank() || replyHandles.isEmpty()) return false
 
             val filter = senderOrAppFilter.trim().lowercase()
-            val matchedHandle = if (filter.isEmpty()) {
-                replyHandles.values.maxByOrNull { it.timestamp }
-            } else {
-                replyHandles.values
-                    .sortedByDescending { it.timestamp }
-                    .firstOrNull {
+            if (filter.isEmpty()) {
+                JarvisStateRepository.addLog("Direct reply refused: empty sender filter (no most-recent fallback)")
+                return false
+            }
+            val exact = replyHandles.values.filter {
+                it.senderTitle.lowercase() == filter ||
+                    it.packageName.lowercase() == filter
+            }
+            val matchedHandle = when {
+                exact.size == 1 -> exact[0]
+                exact.size > 1 -> {
+                    JarvisStateRepository.addLog("Direct reply refused: ambiguous sender '$senderOrAppFilter' (${exact.size} matches)")
+                    return false
+                }
+                else -> {
+                    val partial = replyHandles.values.filter {
                         it.senderTitle.lowercase().contains(filter) ||
                             it.packageName.lowercase().contains(filter)
-                    } ?: replyHandles.values.maxByOrNull { it.timestamp }
-            } ?: return false
+                    }
+                    if (partial.size != 1) {
+                        JarvisStateRepository.addLog(
+                            "Direct reply refused: no unique match for '$senderOrAppFilter' (${partial.size} matches)"
+                        )
+                        return false
+                    }
+                    partial[0]
+                }
+            }
 
             return runCatching {
                 val fillInIntent = Intent()

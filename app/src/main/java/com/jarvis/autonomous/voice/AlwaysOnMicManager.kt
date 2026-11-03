@@ -136,9 +136,20 @@ class AlwaysOnMicManager(
     private var listeningActive: Boolean = false
     private var currentSessionId: Int = 0
     private var lastPartialSessionId: Int = -1
-    private var restartCountInWindow: Int = 0
-    private var restartWindowStartMs: Long = 0L
     private var restartPending: Boolean = false
+    /** A-H6: the single cancellable restart handle (cancelled in [stop]). */
+    private var restartRunnable: Runnable? = null
+    /** A-H6: last successful recognizer start, for the 150ms double-start guard. */
+    private var lastStartMs: Long = 0L
+    /** A-H4/A-H5: consecutive counted (non-transient) errors; reset
+     * on any recognizer progress, never reset by wall-clock time. */
+    private var consecutiveErrorCount: Int = 0
+    /** B-C3: transcripts that arrived while speaking, held until
+     * post-TTS silence instead of feeding the turn mid-speech. */
+    private var quarantinedWhileSpeaking: MutableList<QuarantinedTranscript> = mutableListOf()
+    /** B-M13: nested setSpeaking(true) calls must not be undone by
+     * a single setSpeaking(false) while another speak is playing. */
+    private var speakingDepth: Int = 0
 
     /** Current recognizer locale; hi-IN primary, en-IN fallback. */
     private var currentLanguage: String = LANGUAGE_PRIMARY_HI_IN
@@ -163,9 +174,17 @@ class AlwaysOnMicManager(
 
     // Turn-check loop: polls TurnDetector; emits Complete / the
     // single Incomplete per turn; never touches the recognizer.
+    // B-C3: while Jarvis is speaking, the turn check is PAUSED
+    // (re-posted, no check) — a turn must never complete mid-TTS
+    // and quarantined transcripts are only flushed on silence
+    // after speech ends (see [setSpeaking]).
     private val turnCheckRunnable = object : Runnable {
         override fun run() {
             if (!enabled) return
+            if (isSpeaking) {
+                mainHandler.postDelayed(this, TurnThresholds.TURN_CHECK_INTERVAL_MS)
+                return
+            }
             val nowMs = System.currentTimeMillis()
             when (val outcome = turnDetector.check(nowMs)) {
                 is TurnOutcome.Complete -> {
@@ -200,6 +219,7 @@ class AlwaysOnMicManager(
     private val recognitionListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
             listeningActive = true
+            consecutiveErrorCount = 0
             listener.onListeningStateChanged(true)
         }
 
@@ -208,13 +228,16 @@ class AlwaysOnMicManager(
         }
 
         override fun onRmsChanged(rmsdB: Float) {
+            // A-M3: FREEZE RMS while speaking — recognizer RMS
+            // during TTS is playback-dominated and must never feed
+            // the barge-in loud gate. Baseline is tracked only
+            // while NOT speaking, as before.
+            if (isSpeaking) return
             lastRmsDb = rmsdB
-            if (!isSpeaking) {
-                rmsBaselineDb = if (rmsBaselineDb == null) {
-                    rmsdB
-                } else {
-                    rmsBaselineDb!! * 0.9f + rmsdB * 0.1f
-                }
+            rmsBaselineDb = if (rmsBaselineDb == null) {
+                rmsdB
+            } else {
+                rmsBaselineDb!! * 0.9f + rmsdB * 0.1f
             }
         }
 
@@ -234,11 +257,26 @@ class AlwaysOnMicManager(
             listeningActive = false
             listener.onListeningStateChanged(false)
             if (!enabled) return
-            // Empty-session language fallback: the primary locale
-            // heard nothing at all — retry the next session in
-            // en-IN once, then stay there until a turn completes
-            // (which resets to hi-IN).
-            if (turnDetector.currentText().isBlank() &&
+            // A-H4: terminal errors stop the loop and surface
+            // onMicError — they are never silently retried.
+            if (error in TERMINAL_RECOGNIZER_ERRORS) {
+                stopWithError("Recognizer error $error (terminal) — mic loop stopped.")
+                return
+            }
+            // A-H4: RECORD_AUDIO may have been revoked mid-loop;
+            // every restart path re-checks it (see
+            // [startRecognizerSession]), and a revoked grant stops
+            // here too instead of spinning.
+            if (!isRecordAudioGranted()) {
+                stopWithError("RECORD_AUDIO revoked — mic loop stopped.")
+                return
+            }
+            // A-M6: locale flip ONLY after a session that DID
+            // transcribe something then failed — an empty session
+            // (heard nothing) is not a locale failure and must
+            // not flip. Any successful transcript resets the
+            // locale (see [handleTranscript]).
+            if (turnDetector.currentText().isNotBlank() &&
                 (error == SpeechRecognizer.ERROR_NO_MATCH ||
                     error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) &&
                 !emptySessionFallbackUsed
@@ -246,16 +284,22 @@ class AlwaysOnMicManager(
                 currentLanguage = LANGUAGE_FALLBACK_EN_IN
                 emptySessionFallbackUsed = true
             }
-            val delayMs = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-                RESTART_BUSY_DELAY_MS
+            // Transient silence endings (NO_MATCH / SPEECH_TIMEOUT)
+            // restart immediately and never count toward escalation;
+            // every other error (incl. RECOGNIZER_BUSY, A-H5) goes
+            // through the same counted, escalating backoff.
+            if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+            ) {
+                scheduleRestart(RESTART_DELAY_MS)
             } else {
-                restartDelayWithBackoff()
+                scheduleRestart(countedBackoffDelay())
             }
-            scheduleRestart(delayMs)
         }
 
         override fun onResults(results: Bundle?) {
             listeningActive = false
+            consecutiveErrorCount = 0
             listener.onListeningStateChanged(false)
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val finalText = matches?.firstOrNull()?.trim() ?: ""
@@ -316,6 +360,9 @@ class AlwaysOnMicManager(
             return false
         }
         enabled = true
+        consecutiveErrorCount = 0
+        lastStartMs = 0L
+        quarantinedWhileSpeaking.clear()
         turnDetector.reset()
         resetLanguageToPrimary()
         mainHandler.post {
@@ -334,7 +381,16 @@ class AlwaysOnMicManager(
     fun stop() {
         if (!enabled) return
         enabled = false
+        // A-H6: cancel the held restart handle — a posted restart
+        // must never fire after stop().
         restartPending = false
+        restartRunnable?.let { mainHandler.removeCallbacks(it) }
+        restartRunnable = null
+        consecutiveErrorCount = 0
+        quarantinedWhileSpeaking.clear()
+        speakingDepth = 0
+        isSpeaking = false
+        currentSpokenText = ""
         mainHandler.removeCallbacks(turnCheckRunnable)
         mainHandler.post {
             runCatching { speechRecognizer?.cancel() }
@@ -345,6 +401,27 @@ class AlwaysOnMicManager(
         }
         stopVadMonitor()
         turnDetector.reset()
+    }
+
+    /**
+     * A-H4: terminal stop — tears the loop down and surfaces
+     * [AlwaysOnMicListener.onMicError] instead of silently
+     * restarting. Called from the main thread (onError path).
+     */
+    private fun stopWithError(reason: String) {
+        enabled = false
+        restartPending = false
+        restartRunnable?.let { mainHandler.removeCallbacks(it) }
+        restartRunnable = null
+        mainHandler.removeCallbacks(turnCheckRunnable)
+        runCatching { speechRecognizer?.cancel() }
+        runCatching { speechRecognizer?.destroy() }
+        speechRecognizer = null
+        listeningActive = false
+        listener.onListeningStateChanged(false)
+        stopVadMonitor()
+        turnDetector.reset()
+        listener.onMicError(reason)
     }
 
     /** Releases everything; call from the owning service's onDestroy. */
@@ -368,13 +445,36 @@ class AlwaysOnMicManager(
      * and segmenting resumes on fresh user audio only.
      */
     fun setSpeaking(speaking: Boolean, spokenText: String = "") {
-        isSpeaking = speaking
+        // B-M13: depth-counted — setSpeaking(false) from one
+        // finished utterance must NOT reopen the echo gate while
+        // another speak is still playing.
         if (speaking) {
+            speakingDepth++
+            isSpeaking = true
             currentSpokenText = spokenText
             vadMonitor?.pauseForSpeech()
         } else {
+            if (speakingDepth > 0) speakingDepth--
+            if (speakingDepth > 0) return
+            isSpeaking = false
             currentSpokenText = ""
             vadMonitor?.resumeAfterSpeech()
+            // B-C3: flush quarantined transcripts now, stamped
+            // with post-TTS time, so they form a turn only after
+            // post-TTS silence — never mid-speech.
+            if (enabled && quarantinedWhileSpeaking.isNotEmpty()) {
+                val held = quarantinedWhileSpeaking.toList()
+                quarantinedWhileSpeaking.clear()
+                val nowMs = System.currentTimeMillis()
+                for (item in held) {
+                    if (item.isFinal) {
+                        turnDetector.onFinal(item.text, nowMs, true)
+                    } else {
+                        turnDetector.onPartial(item.text, nowMs, true)
+                    }
+                }
+                listener.onPartialTranscript(turnDetector.currentText())
+            }
         }
     }
 
@@ -428,17 +528,18 @@ class AlwaysOnMicManager(
 
     private fun handleTranscript(text: String, isFinal: Boolean) {
         if (text.isBlank()) {
-            // Empty final with an empty buffer = empty session:
-            // try the fallback locale on the next restart, once.
-            if (isFinal && turnDetector.currentText().isBlank() && !emptySessionFallbackUsed) {
-                currentLanguage = LANGUAGE_FALLBACK_EN_IN
-                emptySessionFallbackUsed = true
-            }
+            // A-M6: an empty session flips NOTHING — heard-nothing
+            // is not a locale failure. The fallback fires only
+            // after a transcribed session fails (see onError).
             return
         }
-        // Barge-in check FIRST, while speaking: a leading stop
-        // keyword interrupts TTS and never becomes a turn by itself.
-        if (BargeInDetector.isBargeIn(
+        // A-M6: ANY successful (non-empty) transcript resets the
+        // locale to primary — not just completed turns.
+        resetLanguageToPrimary()
+        // B-C3: barge-in is FINAL transcripts only, checked
+        // first while speaking; a leading stop keyword interrupts
+        // TTS and never becomes a turn by itself.
+        if (isFinal && BargeInDetector.isBargeIn(
                 transcript = text,
                 isSpeaking = isSpeaking,
                 spokenText = currentSpokenText,
@@ -460,6 +561,18 @@ class AlwaysOnMicManager(
             }
             return
         }
+        // B-C3: ordinary transcripts timestamped while speaking
+        // are QUARANTINED (held, never fed to the turn detector
+        // mid-TTS) and flushed by setSpeaking(false) on post-TTS
+        // silence. Echo of Jarvis's own voice therefore never
+        // becomes a turn while it is still speaking.
+        if (isSpeaking) {
+            if (quarantinedWhileSpeaking.size >= MAX_QUARANTINED) {
+                quarantinedWhileSpeaking.removeAt(0)
+            }
+            quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
+            return
+        }
         val nowMs = System.currentTimeMillis()
         val isNewSession = lastPartialSessionId != currentSessionId
         if (isFinal) {
@@ -473,61 +586,81 @@ class AlwaysOnMicManager(
 
     private fun startRecognizerSession() {
         if (!enabled) return
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
-            listener.onMicError("SpeechRecognizer became unavailable; mic loop stopping.")
-            enabled = false
+        // A-H4: RECORD_AUDIO is re-checked on EVERY restart — a
+        // revoked grant stops the loop instead of spinning.
+        if (!isRecordAudioGranted()) {
+            stopWithError("RECORD_AUDIO revoked — mic loop stopped.")
             return
         }
-        if (speechRecognizer == null) {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(appContext)
+        // A-H6: never double-start — a live session, or a start
+        // less than ~150ms ago, means a restart already fired.
+        val nowMs = System.currentTimeMillis()
+        if (listeningActive) return
+        if (nowMs - lastStartMs < RESTART_GUARD_MS) return
+        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
+            stopWithError("SpeechRecognizer became unavailable; mic loop stopping.")
+            return
         }
-        speechRecognizer?.setRecognitionListener(recognitionListener)
-        currentSessionId++
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLanguage)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
         }
-        runCatching {
+        // A-H7: creation + listener + startListening in ONE
+        // guarded block — a creation/start failure degrades to
+        // onMicError, never a main-thread crash.
+        try {
+            if (speechRecognizer == null) {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(appContext)
+            }
+            speechRecognizer?.setRecognitionListener(recognitionListener)
+            currentSessionId++
             speechRecognizer?.startListening(intent)
-        }.onFailure {
-            // startListening threw (e.g. recognizer busy): retry via
-            // the normal restart path instead of crashing the loop.
-            scheduleRestart(RESTART_BUSY_DELAY_MS)
+            lastStartMs = System.currentTimeMillis()
+        } catch (e: Exception) {
+            runCatching { speechRecognizer?.destroy() }
+            speechRecognizer = null
+            listeningActive = false
+            stopWithError("Recognizer start failed (${e.message}) — mic loop stopped.")
         }
     }
 
+    // A-H6: ONE held restart runnable — stop() removes it, so a
+    // restart can never fire after the loop stopped.
     private fun scheduleRestart(delayMs: Long) {
         if (!enabled || restartPending) return
         restartPending = true
-        mainHandler.postDelayed(
-            {
-                restartPending = false
-                if (enabled) startRecognizerSession()
-            },
-            delayMs
-        )
+        val runnable = Runnable {
+            restartPending = false
+            restartRunnable = null
+            if (enabled) startRecognizerSession()
+        }
+        restartRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
     }
 
     /**
-     * Immediate restart in the normal case, with backoff if the
-     * recognizer is flapping (>10 restarts in 10s): 1000ms instead
-     * of 150ms. A hot restart loop would otherwise spin the CPU
-     * and the recognizer service for nothing.
+     * A-H4/A-H5: escalating backoff for counted (non-transient)
+     * errors, RECOGNIZER_BUSY included — no fixed-delay bypass.
+     * Delay doubles per consecutive error (150ms, 300ms, 600ms…
+     * capped at ~4.8s) and, past [MAX_CONSECUTIVE_ERRORS], the
+     * loop STOPS with onMicError instead of looping silently
+     * forever. The count resets ONLY on recognizer progress
+     * (onReady / onResults) — never on a wall-clock window, so a
+     * flapping recognizer cannot defeat escalation by waiting
+     * out a window.
      */
-    private fun restartDelayWithBackoff(): Long {
-        val nowMs = System.currentTimeMillis()
-        if (nowMs - restartWindowStartMs > RESTART_WINDOW_MS) {
-            restartWindowStartMs = nowMs
-            restartCountInWindow = 0
+    private fun countedBackoffDelay(): Long {
+        consecutiveErrorCount++
+        if (consecutiveErrorCount > MAX_CONSECUTIVE_ERRORS) {
+            stopWithError(
+                "Recognizer failed $consecutiveErrorCount times in a row — mic loop stopped."
+            )
+            return RESTART_DELAY_MS
         }
-        restartCountInWindow++
-        return if (restartCountInWindow > MAX_RESTARTS_PER_WINDOW) {
-            RESTART_BACKOFF_DELAY_MS
-        } else {
-            RESTART_DELAY_MS
-        }
+        val shift = (consecutiveErrorCount - 1).coerceAtMost(5)
+        return RESTART_DELAY_MS * (1L shl shift)
     }
 
     private fun resetLanguageToPrimary() {
@@ -548,12 +681,26 @@ class AlwaysOnMicManager(
 
         /** Normal restart gap: effectively immediate, not a spin. */
         const val RESTART_DELAY_MS: Long = 150L
-        const val RESTART_BUSY_DELAY_MS: Long = 500L
-        const val RESTART_BACKOFF_DELAY_MS: Long = 1_000L
-        const val RESTART_WINDOW_MS: Long = 10_000L
-        const val MAX_RESTARTS_PER_WINDOW: Int = 10
+        /** A-H6 double-start guard window. */
+        const val RESTART_GUARD_MS: Long = 150L
+        /** A-H4/A-H5: counted errors before the loop stops itself. */
+        const val MAX_CONSECUTIVE_ERRORS: Int = 10
+        /** B-C3: cap on transcripts held while speaking. */
+        const val MAX_QUARANTINED: Int = 20
+
+        /** A-H4: terminal recognizer errors — stop, never retry. */
+        val TERMINAL_RECOGNIZER_ERRORS: Set<Int> = setOf(
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
+            SpeechRecognizer.ERROR_CLIENT,
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_AUDIO
+        )
     }
 }
+
+/** B-C3: one transcript held while Jarvis was speaking. */
+private data class QuarantinedTranscript(val text: String, val isFinal: Boolean)
 
 /** Callbacks from [AlwaysOnMicManager] to the coordinator. All arrive on the main thread. */
 interface AlwaysOnMicListener {
@@ -646,11 +793,20 @@ class SherpaVadMonitor(
 ) {
 
     private val appContext: Context = context.applicationContext
+    // A-H10: EVERY Vad touch (feed, front/pop, reset, release)
+    // goes through this lock, so release() can never race the
+    // inference loop's acceptWaveform/front/pop.
+    private val vadLock = Any()
     private var vad: Vad? = null
+    // AudioRecord lifecycle is owned ONLY by runLoop's IO thread
+    // (create/start/stop/release there, incl. the finally block);
+    // release() below never touches it from the main thread.
     private var audioRecord: AudioRecord? = null
+    @Volatile
     private var running: Boolean = false
     private var pausedForSpeech: Boolean = false
 
+    @Volatile
     private var available: Boolean = false
 
     init {
@@ -674,8 +830,10 @@ class SherpaVadMonitor(
             true
         }.getOrDefault(false)
         if (!available) {
-            runCatching { vad?.release() }
-            vad = null
+            synchronized(vadLock) {
+                runCatching { vad?.release() }
+                vad = null
+            }
         }
     }
 
@@ -691,7 +849,9 @@ class SherpaVadMonitor(
     /** Called by the manager when TTS stops: fresh state, fresh audio only. */
     fun resumeAfterSpeech() {
         pausedForSpeech = false
-        runCatching { vad?.reset() }
+        synchronized(vadLock) {
+            runCatching { vad?.reset() }
+        }
     }
 
     /**
@@ -765,15 +925,23 @@ class SherpaVadMonitor(
                         for (i in 0 until VAD_WINDOW_SIZE) {
                             floatBuffer[i] = shortBuffer[offset + i] / 32768.0f
                         }
-                        val currentVad = vad ?: break
-                        runCatching { currentVad.acceptWaveform(floatBuffer) }
-                        runCatching {
-                            while (!currentVad.empty()) {
-                                val segment = currentVad.front()
-                                currentVad.pop()
-                                withContext(Dispatchers.Main) {
-                                    onSegment(segment)
+                        // A-H10: feed + drain under the lock; the
+                        // main-thread dispatch happens OUTSIDE it
+                        // (never hold the lock across a suspend).
+                        val segments = mutableListOf<SpeechSegment>()
+                        synchronized(vadLock) {
+                            val currentVad = vad ?: return@synchronized
+                            runCatching { currentVad.acceptWaveform(floatBuffer) }
+                            runCatching {
+                                while (!currentVad.empty()) {
+                                    segments.add(currentVad.front())
+                                    currentVad.pop()
                                 }
+                            }
+                        }
+                        for (segment in segments) {
+                            withContext(Dispatchers.Main) {
+                                onSegment(segment)
                             }
                         }
                     }
@@ -793,14 +961,21 @@ class SherpaVadMonitor(
         }
     }
 
-    /** Stops the loop (idempotent) and releases native state. */
+    /**
+     * Stops the loop (idempotent) and releases native state.
+     * A-H10: Vad release happens under [vadLock]; AudioRecord is
+     * deliberately NOT touched here — the runLoop thread owns it
+     * and releases it in its finally block (or the loop never
+     * started, so there is nothing to release). Releasing an
+     * AudioRecord from the main thread while the IO loop still
+     * reads it was the race this removes.
+     */
     fun release() {
         running = false
-        runCatching { audioRecord?.stop() }
-        runCatching { audioRecord?.release() }
-        audioRecord = null
-        runCatching { vad?.release() }
-        vad = null
+        synchronized(vadLock) {
+            runCatching { vad?.release() }
+            vad = null
+        }
         available = false
     }
 

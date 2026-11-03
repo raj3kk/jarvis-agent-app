@@ -32,6 +32,13 @@ object TurnThresholds {
     const val TURN_END_SILENCE_MS: Long = 1_750L
     const val INCOMPLETE_EXTRA_WAIT_MS: Long = 5_000L
     const val TURN_CHECK_INTERVAL_MS: Long = 250L
+    /** A-M5: a turn never runs longer than this, whatever its state. */
+    const val MAX_TURN_DURATION_MS: Long = 60_000L
+    /** A-M5: buffered transcript cap (head kept, tail dropped). */
+    const val MAX_BUFFER_CHARS: Int = 2_000
+    /** A-M5: long silence completes a turn even while an Incomplete
+     * prompt is pending (replaces the old 15s wall-clock stall). */
+    const val INCOMPLETE_LONG_SILENCE_MS: Long = 5_000L
 }
 
 /** Result of [TurnDetector.check]. Only one value per check call. */
@@ -61,6 +68,7 @@ class TurnDetector {
     private var continuationDeadlineMs: Long = 0L
     private var incompleteEmitted: Boolean = false
     private var incompleteEmittedAtMs: Long = 0L
+    private var turnStartedAtMs: Long = 0L
 
     /** Current buffered transcript (trimmed), even mid-turn. */
     fun currentText(): String = buffer.trim()
@@ -79,12 +87,20 @@ class TurnDetector {
     fun onPartial(text: String, nowMs: Long, isNewSession: Boolean) {
         val incoming = text.trim()
         if (incoming.isEmpty()) return
+        if (!turnActive) {
+            turnStartedAtMs = nowMs
+        }
         buffer = if (!turnActive || buffer.isBlank()) {
             incoming
         } else if (isNewSession && !incoming.startsWith(buffer)) {
             "$buffer $incoming"
         } else {
             incoming
+        }
+        // A-M5 buffer cap: keep the head of the utterance, drop the
+        // tail past the cap — never grow unbounded on a long ramble.
+        if (buffer.length > TurnThresholds.MAX_BUFFER_CHARS) {
+            buffer = buffer.take(TurnThresholds.MAX_BUFFER_CHARS)
         }
         lastPartialAtMs = nowMs
         turnActive = true
@@ -94,6 +110,7 @@ class TurnDetector {
     fun onSpeechStarted(nowMs: Long) {
         if (!turnActive) {
             lastPartialAtMs = nowMs
+            turnStartedAtMs = nowMs
         }
         turnActive = true
     }
@@ -124,21 +141,30 @@ class TurnDetector {
         if (isMicStopCommand(text)) {
             return TurnOutcome.Complete(text)
         }
-        // Safety net: if Incomplete was emitted but the caller
-        // never called markIncompletePromptSent (e.g. it spoke the
-        // prompt through another path), do not wait forever — the
-        // buffered text completes 15s after the Incomplete signal.
-        if (incompleteEmitted && !incompletePromptSent &&
-            nowMs - incompleteEmittedAtMs >= INCOMPLETE_EMITTED_SAFETY_MS
+        // A-M5 max turn duration: complete the buffered text
+        // whatever the turn state — a turn never stalls forever.
+        if (turnStartedAtMs > 0L &&
+            nowMs - turnStartedAtMs >= TurnThresholds.MAX_TURN_DURATION_MS
         ) {
             return TurnOutcome.Complete(text)
         }
+        // A-M5: if Incomplete was emitted but the caller never
+        // called markIncompletePromptSent, complete on LONG
+        // SILENCE (not a 15s wall-clock stall) — the user has
+        // stopped talking, so the buffered text is the turn.
         if (incompleteEmitted && !incompletePromptSent) {
-            // Incomplete already delivered once; wait for the
-            // caller to speak the prompt and mark it sent.
+            if (silenceMs >= TurnThresholds.INCOMPLETE_LONG_SILENCE_MS) {
+                return TurnOutcome.Complete(text)
+            }
             return TurnOutcome.Waiting
         }
         if (incompletePromptSent) {
+            // A-M5: long silence completes even while the
+            // Incomplete prompt is pending and the text still
+            // looks like a fragment — the user is not continuing.
+            if (silenceMs >= TurnThresholds.INCOMPLETE_LONG_SILENCE_MS) {
+                return TurnOutcome.Complete(text)
+            }
             // After the "aur bolo" prompt: if the continuation now
             // looks complete and has had its own TURN_END silence,
             // end immediately — do not make the user wait out the
@@ -184,6 +210,7 @@ class TurnDetector {
         continuationDeadlineMs = 0L
         incompleteEmitted = false
         incompleteEmittedAtMs = 0L
+        turnStartedAtMs = 0L
     }
 
     /**
@@ -223,9 +250,6 @@ class TurnDetector {
     }
 
     companion object {
-        /** Safety net when the caller never marks the prompt sent. */
-        const val INCOMPLETE_EMITTED_SAFETY_MS: Long = 15_000L
-
         /**
          * The ONLY phrases that switch the mic loop itself off.
          * Checked against the final transcript BEFORE it is emitted
@@ -243,13 +267,45 @@ class TurnDetector {
             "mic stop karo"
         )
 
+        /**
+         * A-M4: mic-stop phrases, normalised — punctuation stripped,
+         * filler words dropped, trailing "kar do" / "karo" allowed,
+         * so "mic band kar do please", "please mic band karo" and
+         * "mic band, yaar" all stop the mic. A phrase only counts
+         * when the whole (normalised) utterance is the phrase plus
+         * at most trailing action words — never a substring of a
+         * longer command.
+         */
         fun isMicStopCommand(text: String): Boolean {
-            val normalized = text.trim().lowercase()
-                .replace("?", "")
-                .replace("।", "")
-                .trim()
-            return normalized in MIC_STOP_PHRASES
+            val tokens = normalizeTokens(text)
+            if (tokens.isEmpty()) return false
+            val joined = tokens.joinToString(" ")
+            if (joined in MIC_STOP_PHRASES) return true
+            for (phrase in MIC_STOP_PHRASES) {
+                if (joined.startsWith("$phrase ")) {
+                    val rest = tokens.drop(phrase.split(" ").size)
+                    if (rest.all { it in ALLOWED_STOP_TRAILING }) return true
+                }
+            }
+            return false
         }
+
+        /** Lowercase, punctuation -> space, fillers dropped. */
+        fun normalizeTokens(text: String): List<String> {
+            return text.lowercase()
+                .replace(Regex("[.,!?;:'\"()\\[\\]।]+"), " ")
+                .split(" ")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && it !in STOP_FILLERS }
+        }
+
+        private val STOP_FILLERS: Set<String> = setOf(
+            "please", "pls", "yaar", "bhai", "zara", "kripya", "thoda"
+        )
+
+        private val ALLOWED_STOP_TRAILING: Set<String> = setOf(
+            "kar", "do", "karo", "karna"
+        )
 
         private val TRAILING_TOKENS: Set<String> = setOf(
             // Hindi conjunctions / postpositions / subordinators
@@ -303,10 +359,11 @@ class TurnDetector {
  *   keyword (e.g. Jarvis saying "ruk gaya"), the transcript must
  *   start with the keyword while the spoken text does NOT — otherwise
  *   Jarvis would interrupt himself on his own echo;
- * - when RMS levels are available, the keyword must also be louder
- *   than the listening baseline by [LOUD_MARGIN_DB]; when RMS is
- *   unavailable (some recognizer paths), the keyword + echo guard
- *   alone decides. This is a best-effort heuristic, not a guarantee:
+ * - the keyword must also be louder than the listening baseline by
+ *   [LOUD_MARGIN_DB] on KNOWN RMS values; unknown RMS never passes
+ *   (B-C3) — the manager freezes RMS while speaking, so playback
+ *   can never inflate the compared level. This is a best-effort
+ *   heuristic, not a guarantee:
  *   a quiet user on a loud speaker can still be missed, and a loud
  *   echo that starts with "ruk" can still false-trigger. The
  *   remainder after the keyword is kept, so "ruk, youtube band karo"
@@ -320,6 +377,18 @@ object BargeInDetector {
         "ruk", "ruko", "bas", "chup", "stop"
     )
 
+    /**
+     * A-M3 + B-C3: a barge-in is ONLY a FINAL transcript (the
+     * caller must never pass partials here) that starts with a
+     * stop keyword, passes the echo guard against the FULL spoken
+     * text, and passes a KNOWN loud gate. Unknown RMS never
+     * passes: the old "keyword alone decides when RMS is
+     * unknown" path let Jarvis's own playback barge-in on itself.
+     * The manager freezes RMS while speaking (see
+     * AlwaysOnMicManager.onRmsChanged), so a playback-dominated
+     * RMS can never satisfy this gate — only the pre-TTS user
+     * level is ever compared.
+     */
     fun isBargeIn(
         transcript: String,
         isSpeaking: Boolean,
@@ -328,38 +397,45 @@ object BargeInDetector {
         rmsBaselineDb: Float?
     ): Boolean {
         if (!isSpeaking) return false
-        val trimmed = transcript.trim().lowercase()
-        if (trimmed.isEmpty()) return false
-        val startsWithKeyword = LEADING_KEYWORDS.any { trimmed == it || trimmed.startsWith("$it ") } ||
-            trimmed.startsWith("ruk ja ") || trimmed == "ruk ja"
-        if (!startsWithKeyword) return false
-        // Echo guard: if Jarvis's own current text contains a stop
-        // keyword, only accept when Jarvis did NOT start with one.
-        val spoken = spokenText.trim().lowercase()
-        val spokenStartsWithKeyword = LEADING_KEYWORDS.any { spoken == it || spoken.startsWith("$it ") } ||
-            spoken.startsWith("ruk ja ")
-        if (spokenStartsWithKeyword) return false
-        // Loud gate, only when both levels are known.
-        if (rmsDb != null && rmsBaselineDb != null) {
-            if (rmsDb < rmsBaselineDb + LOUD_MARGIN_DB) return false
+        val tokens = TurnDetector.normalizeTokens(transcript)
+        if (tokens.isEmpty()) return false
+        val first = tokens[0]
+        val keywordLen = when {
+            first in LEADING_KEYWORDS -> 1
+            first == "ruk" && tokens.size > 1 && tokens[1] == "ja" -> 2
+            else -> return false
         }
+        val keyword = tokens.take(keywordLen).joinToString(" ")
+        val remainderTokens = tokens.drop(keywordLen)
+        // Echo guard against the FULL spoken text (not just its
+        // start): if Jarvis's own words contain this transcript,
+        // it is echo, not the user. A bare keyword is also echo
+        // when Jarvis's text contains that keyword anywhere as a
+        // token ("ruk gaya" echo must not barge-in). A keyword +
+        // follow-up command is only echo when the whole
+        // transcript sits inside Jarvis's spoken text.
+        val spokenTokens = TurnDetector.normalizeTokens(spokenText)
+        val spokenJoined = spokenTokens.joinToString(" ")
+        val transcriptJoined = tokens.joinToString(" ")
+        if (spokenJoined.isNotEmpty() && spokenJoined.contains(transcriptJoined)) return false
+        if (remainderTokens.isEmpty() && keyword in spokenTokens) return false
+        // Loud gate: KNOWN values only, never skipped on unknown.
+        if (rmsDb == null || rmsBaselineDb == null) return false
+        if (rmsDb < rmsBaselineDb + LOUD_MARGIN_DB) return false
         return true
     }
 
     /** Text after the leading stop keyword(s), or "" if none. */
     fun remainderAfterKeyword(transcript: String): String {
-        val trimmed = transcript.trim()
-        if (trimmed.isEmpty()) return ""
-        val tokens = trimmed.split(" ").filter { it.isNotEmpty() }
+        val tokens = TurnDetector.normalizeTokens(transcript)
         if (tokens.isEmpty()) return ""
-        val first = tokens[0].lowercase()
+        val first = tokens[0]
         if (first in LEADING_KEYWORDS) {
-            // "ruk ja ..." is a two-token keyword.
-            if (first == "ruk" && tokens.size > 1 && tokens[1].lowercase() == "ja") {
-                return tokens.drop(2).joinToString(" ").trim()
-            }
             return tokens.drop(1).joinToString(" ").trim()
         }
-        return trimmed
+        if (first == "ruk" && tokens.size > 1 && tokens[1] == "ja") {
+            return tokens.drop(2).joinToString(" ").trim()
+        }
+        return tokens.joinToString(" ").trim()
     }
 }
