@@ -1749,6 +1749,10 @@ fun AiBrainSettingsScreen(
             }
             var kokoroProgress by remember { mutableStateOf("") }
             var kokoroWorking by remember { mutableStateOf(false) }
+            // 1.4.10 (Step 1): latch banner state — visible while
+            // the bounded-recovery latch is tripped (system voice
+            // is speaking instead of Kokoro). Test Voice reopens it.
+            val kokoroLatched by JarvisStateRepository.kokoroLatched.collectAsState()
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
@@ -1758,12 +1762,12 @@ fun AiBrainSettingsScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Kokoro Voice — hf_alpha (Offline, Kokoro-only)",
+                        text = "Kokoro Voice — hf_alpha (Offline primary)",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
                     Text(
-                        text = "Jarvis ki ek hi awaaz: Kokoro hf_alpha Hindi female, phone par hi chalti hai — bina key, bina quota, bina internet. Model APK ke andar bundled hai, isliye koi download nahi hota; pehli baar sirf ~190 MB assets se copy hote hain.",
+                        text = "Jarvis ki ek hi awaaz: Kokoro hf_alpha Hindi female, phone par hi chalti hai — bina key, bina quota, bina internet. Model APK ke andar bundled hai, isliye koi download nahi hota; pehli baar sirf ~190 MB assets se copy hote hain. Agar Kokoro 3 baar lagatar fail ho to system voice bolti hai (alag awaaz) — Test Voice se Kokoro dobara try hota hai.",
                         fontSize = 12.sp
                     )
                     Text(
@@ -1775,6 +1779,14 @@ fun AiBrainSettingsScreen(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
+                    if (kokoroLatched) {
+                        Text(
+                            text = "Kokoro bol nahi pa raha — 3 baar lagatar fail hone par system voice bol rahi hai (ye awaaz hf_alpha nahi hai). Test Voice dabao — Kokoro dobara try hoga.",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFB85C38)
+                        )
+                    }
                     if (kokoroProgress.isNotBlank()) {
                         Text(kokoroProgress, fontSize = 12.sp)
                     }
@@ -1875,6 +1887,10 @@ fun AiBrainSettingsScreen(
                             // a throw is caught + marked — a Test
                             // Voice report can always name the
                             // stage it reached.
+                            // 1.4.10 (Step 1): Test Voice is a
+                            // latch reopen — a tap retries Kokoro
+                            // even while latched (no-op if not).
+                            TtsProcessClient.clearLatch("test-voice")
                             JarvisStateRepository.addDiagnostic(
                                 "tts", "TEST_VOICE_START",
                                 "Test Voice tapped in AI Brain Kokoro card."
@@ -2102,6 +2118,9 @@ fun AiBrainSettingsScreen(
                 // 1.4.5 (item 6): the OFF card reads this flow —
                 // Save must publish it, or the card stays stale.
                 JarvisStateRepository.setKokoroEnabled(kokoroOn)
+                // 1.4.10 (Step 1): Kokoro toggle-on reopens the
+                // latch (no-op when not latched or when OFF).
+                if (kokoroOn) TtsProcessClient.clearLatch("kokoro-toggle-on")
                 // 1.4.5 (item 4): key-change restart — only when the
                 // key actually changed AND the loop is live (the
                 // repository flag is the live-loop signal). RETRY

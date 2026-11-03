@@ -86,7 +86,13 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
-        <!-- Background Voice & Agent Foreground Service -->
+        <!-- Background Voice & Agent Foreground Service
+             1.4.10 (Step 5): the manifest is the UPPER BOUND
+             (microphone|specialUse); the runtime call picks a
+             subset — microphone ONLY while the mic is live
+             (loop / wake session / one-shot), specialUse-only
+             otherwise (no silent microphone service when wake
+             is OFF). See qualifiedForegroundTypes(). -->
         <service
             android:name=".service.JarvisForegroundService"
             android:enabled="true"
@@ -94,7 +100,7 @@
             android:foregroundServiceType="microphone|specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Autonomous voice assistant and multi-step accessibility agent" />
+                android:value="Autonomous voice assistant and multi-step agent (microphone FGS type only while listening)" />
         </service>
 
         <!-- 1.4.5: Kokoro TTS in an ISOLATED process (:tts). A
@@ -153,9 +159,11 @@
             </intent-filter>
         </service>
 
-        <!-- Incoming-call announcer: speaks caller name/number on RINGING.
-             It never answers the call — Android does not allow a normal
-             app to inject voice into call audio. -->
+        <!-- Incoming-call announcer: speaks a GENERIC call
+             announcement on RINGING (1.4.8 generic-only: never a
+             name/number). It never answers the call — Android
+             does not allow a normal app to inject voice into
+             call audio. -->
         <receiver
             android:name=".service.JarvisCallReceiver"
             android:enabled="true"

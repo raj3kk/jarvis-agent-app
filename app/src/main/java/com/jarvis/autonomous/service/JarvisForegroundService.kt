@@ -98,6 +98,9 @@ class JarvisForegroundService : Service() {
         }
     }
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    /** 1.4.10: last FGS type set applied via refreshForegroundTypes
+     * (change-only marker — see there). */
+    private var lastFgsTypes: Int? = null
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
     /**
      * 1.4.3 startup greeting: spoken ONCE per service lifetime
@@ -139,7 +142,7 @@ class JarvisForegroundService : Service() {
      * true/false around playback), except the barge-in keywords
      * "ruk"/"bas" which still stop speech via the callback below.
      */
-    private suspend fun speakWrapped(text: String): Boolean {
+    private suspend fun speakWrapped(text: String, origin: String = "reply"): Boolean {
         // 1.4.3 SPEAKING->HOME shield + decisive speak window:
         // EVERY speak logs SPK_START then SPK_END (unconditional
         // — no throttle, so a first-step repro is decidable).
@@ -157,7 +160,7 @@ class JarvisForegroundService : Service() {
         val startMs = System.currentTimeMillis()
         JarvisStateRepository.addDiagnostic(
             "tts", "SPK_START",
-            "Speak started (chars=${text.length})."
+            "Speak started (origin=$origin, chars=${text.length})."
         )
         val ok = speakMutex.withLock {
             if (::micManager.isInitialized) {
@@ -249,7 +252,7 @@ class JarvisForegroundService : Service() {
         )
         greetingSpeakInProgress = true
         serviceScope.launch {
-            val ok = runCatching { speakWrapped(full) }.getOrDefault(false)
+            val ok = runCatching { speakWrapped(full, "greeting") }.getOrDefault(false)
             greetingSpeakInProgress = false
             // Deferred VAD init (see startVadMonitor /
             // deferVadUntilGreeting): run it now that greeting
@@ -509,7 +512,7 @@ class JarvisForegroundService : Service() {
         agentEngine = JarvisAgentEngine(
             context = this,
             prefs = prefs,
-            onSpeakAndAwait = { text -> speakWrapped(text) },
+            onSpeakAndAwait = { text, origin -> speakWrapped(text, origin) },
             onRequestUserVoiceReply = { awaitMicReply() },
             // 1.4.5 (item 5): voice "stop" commands actually stop
             // speech now (the engine branch previously only
@@ -540,21 +543,36 @@ class JarvisForegroundService : Service() {
             // micManager, but these lambdas run later, so the
             // construction order is safe — same pattern as the
             // isMicLoopEnabled gate above).
+            // 1.4.10 (Step 5): every mic transition refreshes
+            // the FGS type set (level-triggered: the final state
+            // is always recomputed, so a transient ordering —
+            // e.g. refresh before an async wake start lands —
+            // self-corrects on the next transition).
             startWakeSession = { cb ->
-                if (::micManager.isInitialized) micManager.startWakeListening(cb) else false
+                if (::micManager.isInitialized) {
+                    micManager.startWakeListening(cb)
+                    refreshForegroundTypes()
+                }
             },
             stopWakeSession = {
-                if (::micManager.isInitialized) micManager.stopWakeListening()
+                if (::micManager.isInitialized) {
+                    micManager.stopWakeListening()
+                    refreshForegroundTypes()
+                }
             },
             listenOnceSession = { cb ->
                 if (::micManager.isInitialized) {
                     micManager.listenOnceAsync(12_000L, cb)
+                    refreshForegroundTypes()
                 } else {
                     cb(null)
                 }
             },
             cancelListenOnceSession = {
-                if (::micManager.isInitialized) micManager.cancelListenOnce()
+                if (::micManager.isInitialized) {
+                    micManager.cancelListenOnce()
+                    refreshForegroundTypes()
+                }
             }
         )
 
@@ -578,7 +596,7 @@ class JarvisForegroundService : Service() {
 
             override fun onTurnIncomplete(text: String, reason: String) {
                 serviceScope.launch {
-                    speakWrapped("Aur bolo, poora sun raha hoon.")
+                    speakWrapped("Aur bolo, poora sun raha hoon.", "incomplete")
                     micManager.continueAfterIncompletePrompt()
                 }
             }
@@ -597,6 +615,10 @@ class JarvisForegroundService : Service() {
                 if (prefs.wakeWordEnabled) {
                     voiceManager.startWakeWordListening()
                 }
+                // 1.4.10 (Step 5): user stop — re-apply the type
+                // set (downgrade unless wake restarted above;
+                // level-triggered, so ordering self-corrects).
+                refreshForegroundTypes()
             }
 
             override fun onPartialTranscript(text: String) {
@@ -657,8 +679,11 @@ class JarvisForegroundService : Service() {
                 )
                 JarvisStateRepository.setMicLoopEnabled(false)
                 JarvisStateRepository.setMicListening(false)
+                // 1.4.10 (Step 5): permanent mic error — the loop
+                // is dead; downgrade unless wake/one-shot is live.
+                refreshForegroundTypes()
                 serviceScope.launch {
-                    runCatching { speakWrapped(spoken) }
+                    runCatching { speakWrapped(spoken, "mic-error") }
                 }
             }
         })
@@ -844,7 +869,7 @@ class JarvisForegroundService : Service() {
             ACTION_SPEAK_TEST -> {
                 serviceScope.launch {
                     runCatching {
-                        speakWrapped("Namaste, main Jarvis hoon. Awaaz test safal raha.")
+                        speakWrapped("Namaste, main Jarvis hoon. Awaaz test safal raha.", "test")
                     }
                 }
             }
@@ -911,6 +936,10 @@ class JarvisForegroundService : Service() {
                 JarvisStateRepository.setMicLoopEnabled(false)
                 JarvisStateRepository.setMicListening(false)
                 JarvisStateRepository.addLog("Mic stopped from UI (mic off button).")
+                // 1.4.10 (Step 5): full mic stop — downgrade to
+                // specialUse-only unless wake/one-shot is live
+                // (refresh recomputes from live state).
+                refreshForegroundTypes()
             }
 
             ACTION_RETRY_MIC -> {
@@ -1055,11 +1084,31 @@ class JarvisForegroundService : Service() {
      * startForeground on this service MUST go through
      * [startForegroundSafe], never the raw 2-arg call.
      */
+    /**
+     * 1.4.10 (Step 5): mic-in-use qualification. 1.4.9 qualified
+     * on permission alone, so onCreate applied the microphone
+     * type whenever RECORD_AUDIO was granted — even with the
+     * loop OFF and wake-word OFF — which is a silent
+     * microphone service (user brief: wake OFF = no mic
+     * service) and Play-policy surface. Now the microphone
+     * type applies ONLY when RECORD_AUDIO is granted AND the
+     * mic is live (loop / wake session / one-shot, read live
+     * from the manager, never from prefs). Every mic
+     * transition refreshes (see refreshForegroundTypes), so
+     * the type set always reflects live state.
+     */
+    private fun isMicInUse(): Boolean {
+        if (!::micManager.isInitialized) return false
+        return micManager.isEnabled() ||
+            micManager.isWakeActive() ||
+            micManager.isOneShotActive()
+    }
+
     private fun qualifiedForegroundTypes(): Int {
         var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         if (ContextCompat.checkSelfPermission(
                 this, Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
+            ) == PackageManager.PERMISSION_GRANTED && isMicInUse()
         ) {
             types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         }
@@ -1109,12 +1158,31 @@ class JarvisForegroundService : Service() {
      * only now does the service qualify for microphone.
      * Called only after micManager.start() returned true
      * (permission necessarily granted at that point).
-     * Mic stop does NOT downgrade the type: wake-word
-     * listening may recapture immediately after a user stop,
-     * and keeping the type while permission is held is
-     * harmless.
+     * 1.4.10 (Step 5): mic stop DOES downgrade now — a full
+     * stop (loop off + wake off + no one-shot) drops to
+     * specialUse-only on the next refresh. If wake restarts
+     * after the stop, its start transition re-upgrades. The
+     * type set is level-triggered, not edge-triggered: every
+     * mic transition refreshes, so transient orderings
+     * self-correct.
      */
     private fun refreshForegroundTypes() {
+        // 1.4.10 (Step 5): change-only marker — refresh runs on
+        // EVERY mic transition, so an every-call marker would
+        // flood diagnostics. Only a changed type set is logged
+        // (FGS_TYPES_APPLIED), which is what a phone report
+        // needs to prove the mic-in-use rule.
+        val types = qualifiedForegroundTypes()
+        if (types != lastFgsTypes) {
+            lastFgsTypes = types
+            val micLive = types and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0
+            JarvisStateRepository.addDiagnostic(
+                "nav", "FGS_TYPES_APPLIED",
+                "Foreground types now: " +
+                    if (micLive) "microphone|specialUse (mic live)"
+                    else "specialUse-only (mic idle)"
+            )
+        }
         startForegroundSafe(buildNotification("JARVIS Active — Listening in background"))
     }
 

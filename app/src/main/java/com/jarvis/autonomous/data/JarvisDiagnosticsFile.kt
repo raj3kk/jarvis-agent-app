@@ -54,14 +54,13 @@ object JarvisDiagnosticsFile {
     }
 
     private fun sanitize(raw: String): String {
-        var out = raw
-        out = out.replace(Regex("[?&]key=[^&\\s]*"), "")
-        out = out.replace(Regex("https?://[^\\s]*\\?[^\\s]*"), "[url-with-query-stripped]")
-        // 1.4.3: Deepgram auth header / token values must never
-        // reach the persisted file, same as ?key= values.
-        out = out.replace(Regex("(?i)Authorization:\\s*Token\\s+[^\\s]+"), "Authorization: Token [redacted]")
-        out = out.replace(Regex("(?i)Token\\s+[A-Za-z0-9._\\-]{16,}"), "Token [redacted]")
-        return out.take(500)
+        // 1.4.10 (Step 6): SINGLE implementation — this file used
+        // to carry a second copy of the sanitizer that drifted
+        // (it missed Bearer values, licence-shaped keys,
+        // field/value pairs and path tokens). The one rule lives
+        // in JarvisStateRepository (same package); both the
+        // in-memory mirror and this file call it.
+        return JarvisStateRepository.sanitizeDiagnosticMessage(raw)
     }
 
     /**

@@ -135,6 +135,43 @@ object KokoroTtsClient {
     private val copyMutex = Mutex()
     private var engine: OfflineTts? = null
     private var engineDir: File? = null
+    /**
+     * 1.4.10 (Step 4) — engine state machine. The audit found the
+     * discipline was split: generate-during-release was stopped
+     * ONLY by the service's speakBusy gate, and engineLock alone
+     * could not stop it (generate does not hold engineLock, by
+     * design — holding it across native generate would invite a
+     * deadlock with tryReleaseEngine). Now the state is explicit
+     * and enforced HERE, in the engine owner:
+     * UNINITIALIZED -> LOADING -> READY -> RELEASING -> RELEASED
+     * (reset+recopy ends back at UNINITIALIZED: fresh dir, no
+     * engine). Transitions are marked (TTS_ENGINE_STATE). The
+     * enforcement: [generating] is true across the generate+play
+     * loop, and [tryReleaseEngine]/[resetAndCopy] refuse while
+     * it is true — release NEVER runs under a running generate,
+     * and no speak runs during load/release (load holds
+     * engineLock; release paths hold it too or refuse via
+     * tryLock/generating). A native death mid-generate still
+     * cannot be caught — the state machine prevents the
+     * use-after-release class, it does not make native code safe.
+     */
+    enum class EngineState { UNINITIALIZED, LOADING, READY, RELEASING, RELEASED }
+
+    @Volatile
+    private var engineState: EngineState = EngineState.UNINITIALIZED
+
+    private fun setEngineState(next: EngineState) {
+        val prev = engineState
+        if (prev == next) return
+        engineState = next
+        JarvisStateRepository.addDiagnosticSync(
+            "tts", "TTS_ENGINE_STATE",
+            "Kokoro engine state: $prev -> $next."
+        )
+    }
+
+    /** True across the generate+play loop in [speak]. */
+    private val generating = AtomicBoolean(false)
     private var speakerCheckLogged: Boolean = false
     private var firstGenerateLogged: Boolean = false
 
@@ -542,10 +579,21 @@ object KokoroTtsClient {
         onProgress: (stage: String, copiedMB: Long, totalMB: Long) -> Unit = { _, _, _ -> }
     ): Result<Unit> {
         engineLock.withLock {
+            // 1.4.10 (Step 4): defensive — the service gates
+            // reset behind speakBusy, but the engine owner must
+            // not release under a running generate even if a
+            // future caller forgets the gate.
+            if (generating.get()) {
+                return Result.failure(
+                    IllegalStateException("Kokoro engine is generating — reset refused (retry after speech ends).")
+                )
+            }
+            setEngineState(EngineState.RELEASING)
             runCatching { engine?.release() }
             engine = null
             engineDir = null
             firstGenerateLogged = false
+            setEngineState(EngineState.RELEASED)
         }
         stopPlayback()
         // 1.4.5 (item 1a): the old code deleted the dir OUTSIDE
@@ -559,6 +607,10 @@ object KokoroTtsClient {
                 JarvisStateRepository.addLog("Kokoro model reset — fresh bundled copy starting.")
                 ensureAssetsReadyInner(context, onProgress)
             }
+        }.also {
+            // Fresh dir, no engine: back to UNINITIALIZED whether
+            // the copy succeeded or not.
+            setEngineState(EngineState.UNINITIALIZED)
         }
     }
 
@@ -571,16 +623,26 @@ object KokoroTtsClient {
      * The next speak reloads (FIRST_ENGINE_LOAD appears again).
      */
     fun tryReleaseEngine(reason: String): Boolean {
+        // 1.4.10 (Step 4): NEVER release under a running generate
+        // — the old code relied only on the service's speakBusy
+        // gate; the engine owner now refuses itself. Callers
+        // that get false defer and retry after the speak.
+        if (generating.get()) return false
         if (!engineLock.tryLock()) return false
         try {
+            val hadEngine = engine != null
+            if (hadEngine) setEngineState(EngineState.RELEASING)
             runCatching { engine?.release() }
             engine = null
             engineDir = null
             firstGenerateLogged = false
-            JarvisStateRepository.addDiagnostic(
-                "tts", "ENGINE_RELEASED",
-                "Kokoro engine released (reason=$reason) — next speak reloads."
-            )
+            if (hadEngine) {
+                setEngineState(EngineState.RELEASED)
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "ENGINE_RELEASED",
+                    "Kokoro engine released (reason=$reason) — next speak reloads."
+                )
+            }
             return true
         } finally {
             engineLock.unlock()
@@ -615,7 +677,7 @@ object KokoroTtsClient {
             if (ready.isFailure) {
                 JarvisStateRepository.addLog(
                     "Kokoro unavailable: ${ready.exceptionOrNull()?.message} " +
-                        "— no fallback voice in the Kokoro-only build."
+                        "— main-process fallback may still apply (see VoiceManager)."
                 )
                 // 1.4.9 (Step 1b): this failure was log-only, so
                 // a phone report could not tell a speak that died
@@ -626,7 +688,7 @@ object KokoroTtsClient {
                     "tts", "TTS_ENSURE_FAILED",
                     "Kokoro speak-triggered asset ensure failed: " +
                         "${ready.exceptionOrNull()?.javaClass?.simpleName}: " +
-                        "${ready.exceptionOrNull()?.message ?: ""} — no fallback voice."
+                        "${ready.exceptionOrNull()?.message ?: ""} — main-process fallback may still apply."
                 )
                 return false
             }
@@ -679,8 +741,8 @@ object KokoroTtsClient {
                 }
                 if (recoveredTts == null) {
                     JarvisStateRepository.addLog(
-                        "Kokoro still unavailable after recopy — no " +
-                            "fallback voice in the Kokoro-only build."
+                        "Kokoro still unavailable after recopy — " +
+                            "main-process fallback may still apply (see VoiceManager)."
                     )
                     JarvisStateRepository.addDiagnosticSync(
                         "tts", "SPK_ENGINE_END",
@@ -706,6 +768,11 @@ object KokoroTtsClient {
             "tts", "SPK_ENGINE_END",
             "Kokoro engine ready (cached or freshly loaded)."
         )
+        // 1.4.10 (Step 4): generating covers the whole chunk
+        // loop (generate + play) — release paths refuse while
+        // it is true. It is cleared in finally even on early
+        // return@withContext (chunk-loop exits) or throw.
+        generating.set(true)
         return try {
             withContext(Dispatchers.IO) {
                 val chunks = splitChunks(text, 600)
@@ -743,18 +810,24 @@ object KokoroTtsClient {
             }
         } catch (e: Exception) {
             JarvisStateRepository.addLog(
-                "Kokoro TTS failed (${e.message}) — no fallback voice " +
-                    "in the Kokoro-only build."
+                "Kokoro TTS failed (${e.message}) — main-process " +
+                    "fallback may still apply (see VoiceManager)."
             )
             false
+        } finally {
+            generating.set(false)
         }
     }
 
     private suspend fun getEngine(context: Context): OfflineTts = engineLock.withLock {
         val dir = modelDir(context)
         val cached = engine
-        if (cached != null && engineDir == dir) return@withLock cached
+        if (cached != null && engineDir == dir) {
+            setEngineState(EngineState.READY)
+            return@withLock cached
+        }
         runCatching { cached?.release() }
+        setEngineState(EngineState.LOADING)
         // B-L12: verify HF_ALPHA_SID against a bundled voices
         // manifest when one exists; a mismatch is LOGGED (never
         // silently used). No manifest ships in the current bundle,
@@ -809,6 +882,7 @@ object KokoroTtsClient {
                         "tts", "HASH_MISMATCH",
                         "Engine load refused: $rel failed hash verification — run Settings Kokoro reset (recopy via :tts)."
                     )
+                    setEngineState(EngineState.UNINITIALIZED)
                     throw IllegalStateException(
                         "Kokoro asset $rel failed hash verification before engine load."
                     )
@@ -821,9 +895,15 @@ object KokoroTtsClient {
         // assets are only the SOURCE that ensureAssetsReady copies
         // from on first run — which is also why no aapt noCompress
         // rule is needed (AssetManager streams decompress on copy).
-        val created = OfflineTts(null, config)
+        val created = try {
+            OfflineTts(null, config)
+        } catch (e: Exception) {
+            setEngineState(EngineState.UNINITIALIZED)
+            throw e
+        }
         engine = created
         engineDir = dir
+        setEngineState(EngineState.READY)
         created
     }
 

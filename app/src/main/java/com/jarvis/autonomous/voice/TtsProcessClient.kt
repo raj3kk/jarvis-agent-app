@@ -63,6 +63,8 @@ object TtsProcessClient {
     const val FAIL_BIND = "TTS_BIND_FAILED"
     const val FAIL_TIMEOUT = "TTS_PROCESS_TIMEOUT"
     const val FAIL_BUSY = "TTS_BUSY"
+    /** 1.4.10: speak refused without rebinding — latch active. */
+    const val FAIL_LATCHED = "KOKORO_LATCHED"
 
     private const val BIND_TIMEOUT_MS = 15_000L
     private const val SPEAK_TIMEOUT_MS = 300_000L
@@ -109,6 +111,114 @@ object TtsProcessClient {
     private var deathEpisodeActive: Boolean = false
     private var deathEpisodeCount: Int = 0
     private var deathEpisodeFirstMarker: String = "none"
+
+    /**
+     * 1.4.10 (Step 1) — BOUNDED recovery + latch. The 1.4.8/1.4.9
+     * behaviour was UNBOUNDED recovery: every new speak rebound
+     * :tts, reloaded the 114 MB engine, and died again — a
+     * crash-restart amplifier. Now consecutive failed SPEAK
+     * attempts are counted (native-death episodes, bind
+     * failures, speak timeouts); at the bound the latch trips
+     * and speak() refuses WITHOUT rebinding. The latch opens
+     * only on a user action (Test Voice tap, Settings reset,
+     * Kokoro toggle-on) or a 10-minute cooldown expiry — never
+     * silently. Engine-level failures (init fail, hash
+     * mismatch, playback fail, busy, toggle OFF) do NOT count:
+     * they already fail fast visibly without restarting the
+     * process, and latching on them would suppress Kokoro for
+     * problems the user can fix with reset. A successful speak
+     * resets the count. Bound justification: 1 failure can be
+     * a fluke (transient LMK), 2 is a pattern, 3 is a latch —
+     * and 3 is also the smallest count that survives one
+     * double-death episode (death + rebind death) without
+     * latching on a single bad launch.
+     */
+    private const val LATCH_BOUND = 3
+    private const val LATCH_COOLDOWN_MS = 10L * 60L * 1000L
+    private var consecutiveSpeakFailures = 0
+    private var kokoroLatched = false
+    private var latchedAtMs = 0L
+
+    /** True while the latch is active. A 10-minute cooldown
+     * expiry clears it (marked, not silent). */
+    fun isKokoroLatched(): Boolean {
+        var expired = false
+        val latched = synchronized(lock) {
+            if (!kokoroLatched) {
+                false
+            } else if (System.currentTimeMillis() - latchedAtMs >= LATCH_COOLDOWN_MS) {
+                kokoroLatched = false
+                consecutiveSpeakFailures = 0
+                expired = true
+                false
+            } else {
+                true
+            }
+        }
+        if (expired) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "KOKORO_LATCH_EXPIRED",
+                "Kokoro latch expired after 10 min cooldown — Kokoro retries on the next speak."
+            )
+            JarvisStateRepository.setKokoroLatched(false)
+        }
+        return latched
+    }
+
+    /** User-action reopen (Test Voice tap, Settings reset,
+     * Kokoro toggle-on). Silent no-op when not latched. */
+    fun clearLatch(reason: String) {
+        var wasLatched = false
+        synchronized(lock) {
+            wasLatched = kokoroLatched
+            kokoroLatched = false
+            consecutiveSpeakFailures = 0
+        }
+        if (wasLatched) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "KOKORO_LATCH_CLEARED",
+                "Kokoro latch cleared by user action ($reason) — Kokoro retries on the next speak."
+            )
+            JarvisStateRepository.setKokoroLatched(false)
+        }
+    }
+
+    /** Count one failed speak attempt. At the bound the latch
+     * trips (marker + card flow); below it the running count
+     * is logged so every futile attempt is visible — the
+     * "har auto-rebind ka count" requirement. Callers must NOT
+     * call this for a death already counted at episode-start
+     * (see onTtsProcessDied) or the same death counts twice. */
+    private fun recordSpeakFailure(kind: String) {
+        var tripped = false
+        var count = 0
+        synchronized(lock) {
+            consecutiveSpeakFailures++
+            count = consecutiveSpeakFailures
+            if (!kokoroLatched && count >= LATCH_BOUND) {
+                kokoroLatched = true
+                latchedAtMs = System.currentTimeMillis()
+                tripped = true
+            }
+        }
+        if (tripped) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "KOKORO_UNAVAILABLE_LATCHED",
+                "Kokoro failed $count consecutive speaks — auto-rebind STOPPED, system-voice fallback active. " +
+                    "Latch opens on Test Voice / Settings reset / Kokoro toggle-on / 10-min cooldown."
+            )
+            JarvisStateRepository.setKokoroLatched(true)
+        } else {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "KOKORO_FAIL_COUNT",
+                "Consecutive failed speaks: $count/$LATCH_BOUND (kind=$kind) — latch trips at $LATCH_BOUND."
+            )
+        }
+    }
+
+    private fun recordSpeakSuccess() {
+        synchronized(lock) { consecutiveSpeakFailures = 0 }
+    }
 
     private val replyMessenger = Messenger(
         Handler(Looper.getMainLooper(), Handler.Callback { msg ->
@@ -229,6 +339,10 @@ object TtsProcessClient {
                     "Last :tts marker before death: $firstMarker. " +
                     "Further deaths before the next successful bind are counted, not logged."
             )
+            // 1.4.10: every death EPISODE counts toward the latch
+            // (duplicates inside one episode do not — see above).
+            // The speak() died-outcome path must NOT count again.
+            recordSpeakFailure("death")
         }
     }
 
@@ -323,6 +437,17 @@ object TtsProcessClient {
     suspend fun speak(context: Context, text: String): Boolean {
         lastFailure = null
         if (text.isBlank()) return false
+        // 1.4.10: latched = auto-rebind BAND — refuse WITHOUT
+        // binding (VoiceManager checks first and falls back;
+        // this is defense-in-depth for direct callers).
+        if (isKokoroLatched()) {
+            lastFailure = FAIL_LATCHED
+            JarvisStateRepository.addDiagnostic(
+                "tts", "KOKORO_LATCHED_REFUSED",
+                "Kokoro speak refused: latch active — no rebind attempted (caller may use system-voice fallback)."
+            )
+            return false
+        }
         val appContext = context.applicationContext
         if (!ensureBound(appContext)) {
             lastFailure = FAIL_BIND
@@ -331,6 +456,7 @@ object TtsProcessClient {
                 "Could not bind the isolated TTS process — speech " +
                     "unavailable, app stays open (visible failure)."
             )
+            recordSpeakFailure("bind")
             return false
         }
         val deferred = CompletableDeferred<Outcome>()
@@ -438,6 +564,8 @@ object TtsProcessClient {
                     "TTS service messenger gone while sending speak."
                 )
             }
+            // Death already counted at episode-start — do not count twice.
+            if (lastFailure != FAIL_NATIVE_DIED) recordSpeakFailure("bind")
             return false
         }
         val outcome = withTimeoutOrNull(SPEAK_TIMEOUT_MS) { deferred.await() }
@@ -463,12 +591,15 @@ object TtsProcessClient {
                 "No TTS reply in ${SPEAK_TIMEOUT_MS / 1000}s — stopped " +
                     "and unbound; next speak rebinds fresh."
             )
+            recordSpeakFailure("timeout")
             return false
         }
         if (outcome.died) {
+            // Already counted at episode-start — do not count twice.
             lastFailure = FAIL_NATIVE_DIED
             return false
         }
+        if (outcome.ok) recordSpeakSuccess()
         return outcome.ok
     }
 
@@ -574,6 +705,9 @@ object TtsProcessClient {
             lastFailure = FAIL_NATIVE_DIED
             return false
         }
+        // 1.4.10: a successful reset is a user-action retry —
+        // it reopens the latch (no-op when not latched).
+        if (outcome.ok) clearLatch("settings-reset")
         return outcome.ok
     }
 

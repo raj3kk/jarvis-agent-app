@@ -141,6 +141,20 @@ object JarvisStateRepository {
     private val _kokoroEnabled = MutableStateFlow(true)
     val kokoroEnabled: StateFlow<Boolean> = _kokoroEnabled.asStateFlow()
 
+    /**
+     * 1.4.10 (Step 1): Kokoro latch state for the AI Brain card.
+     * True while the bounded-recovery latch is tripped (3
+     * consecutive failed speaks) — the card shows the fallback
+     * banner until Test Voice / reset / toggle-on / cooldown
+     * reopens it. Set ONLY by TtsProcessClient.
+     */
+    private val _kokoroLatched = MutableStateFlow(false)
+    val kokoroLatched: StateFlow<Boolean> = _kokoroLatched.asStateFlow()
+
+    fun setKokoroLatched(value: Boolean) {
+        _kokoroLatched.value = value
+    }
+
     fun setKokoroEnabled(value: Boolean) {
         _kokoroEnabled.value = value
     }
@@ -195,13 +209,24 @@ object JarvisStateRepository {
      *  params and full URLs with query strings are reduced to the
      *  path, so a request URL can never leak a key into a report.
      *  1.4.3: also strips "Authorization: Token ..." header values
-     *  (Deepgram) and any token-like value after the word Token. */
+     *  (Deepgram) and any token-like value after the word Token.
+     *  1.4.10 (Step 6): SINGLE implementation — JarvisDiagnosticsFile
+     *  delegates here (its old second copy drifted and missed these).
+     *  Added coverage: Bearer values, licence-shaped JARVIS-XXXX-…
+     *  keys, field-name/value pairs (apiKey=/password:/secret=…),
+     *  and /token/… / /key/… / /auth/… path segments. Honest limit:
+     *  opaque path segments that are not recognisably tokens are
+     *  NOT redacted (indistinguishable from IDs). */
     fun sanitizeDiagnosticMessage(raw: String): String {
         var out = raw
         out = out.replace(Regex("[?&]key=[^&\\s]*"), "")
         out = out.replace(Regex("https?://[^\\s]*\\?[^\\s]*"), "[url-with-query-stripped]")
         out = out.replace(Regex("(?i)Authorization:\\s*Token\\s+[^\\s]+"), "Authorization: Token [redacted]")
         out = out.replace(Regex("(?i)Token\\s+[A-Za-z0-9._\\-]{16,}"), "Token [redacted]")
+        out = out.replace(Regex("(?i)Authorization:\\s*Bearer\\s+[^\\s]+"), "Authorization: Bearer [redacted]")
+        out = out.replace(Regex("JARVIS-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}"), "[licence-redacted]")
+        out = out.replace(Regex("(?i)(api[_-]?key|deepgram[_-]?key|password|passwd|secret|auth[_-]?token)\\s*[:=]\\s*[^\\s,;]+"), "$1=[redacted]")
+        out = out.replace(Regex("(?i)(/(?:token|key|auth)/)[^/\\s]+"), "$1[redacted]")
         return out.take(500)
     }
 

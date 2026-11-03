@@ -13,22 +13,27 @@ import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
- * VoiceManager — Kokoro ONLY (1.4.0).
+ * VoiceManager — Kokoro PRIMARY + system-TTS fallback (1.4.10).
  *
- * SPEECH (output) is Kokoro hf_alpha, on-device via Sherpa-ONNX, and
- * nothing else. The 1.3.0 chain is gone, deliberately:
+ * SPEECH (output) is Kokoro hf_alpha, on-device via Sherpa-ONNX,
+ * first. The 1.3.0 chain is gone, deliberately:
  *  - Deepgram TTS (cloud, user key) — REMOVED.
  *  - Gemini TTS Sulafat (cloud, user key, tiny free quota) — REMOVED.
- *  - Android system TextToSpeech (incl. its init, language setup and
- *    female-voice selection) — REMOVED as a voice.
+ *  - Android system TextToSpeech as a PRIMARY voice — REMOVED.
+ * 1.4.10 hybrid (Phase 1 audit verdict): system TextToSpeech
+ * returns ONLY as a fallback when Kokoro is latched (3
+ * consecutive failed speaks) or the failing speak trips the
+ * latch — never for toggle-OFF, never for a first/second
+ * failure, never silently (TTS_FALLBACK_USED + latch card name
+ * the voice that spoke; the fallback voice is NOT hf_alpha).
  * 1.4.5 FINAL MIC POLICY (user order 2026-11-03 ~19:36 IST):
  * system SpeechRecognizer is REMOVED ENTIRELY — loop, one-shot,
  * wake-word, everywhere. Listening is Deepgram ONLY, via the
@@ -38,13 +43,16 @@ import kotlin.coroutines.resume
  * UNTOUCHED" note is DEAD: there is no system STT left here.
  *
  * If Kokoro is unavailable, [speakAndWait] returns false and logs a
- * clear message. It NEVER silently falls back to another voice, and
- * it never leaves the caller guessing: false means "nothing was
- * spoken". Callers that only need fire-and-forget speech can ignore
- * the return value — the service lambda
- * `onSpeakAndAwait = { text -> voiceManager.speakAndWait(text) }`
+ * clear message — UNLESS the Kokoro latch is active (or this
+ * speak trips it), in which case the system-TTS fallback speaks
+ * instead (1.4.10 hybrid, see above) and true means "spoken by
+ * the fallback". It never leaves the caller guessing: false
+ * means "nothing was spoken". Callers that only need
+ * fire-and-forget speech can ignore the return value — the
+ * service lambda
+ * `onSpeakAndAwait = { text, origin -> speakWrapped(text, origin) }`
  * still compiles unchanged, because a Boolean result is coerced to
- * Unit for a `suspend (String) -> Unit` function type.
+ * Unit for a `suspend (String, String) -> Unit` function type.
  *
  * Signature change (documented, see INTEGRATION_NOTES_Kokoro.md):
  *  - 1.3.0: `suspend fun speakAndWait(text: String)` (Unit)
@@ -93,6 +101,16 @@ class VoiceManager(
     private var pendingSingleReplyCallback: ((String?) -> Unit)? = null
     /** B-M13: ALL speaks serialise through this mutex. */
     private val speakMutex = Mutex()
+    // 1.4.10 (Step 3): bounded-queue bookkeeping, guarded by
+    // queueGuard (never held across suspension). The mutex
+    // serialises; this bookkeeping bounds, coalesces and drains.
+    private val queueGuard = Any()
+    private var queueWaiters = 0
+    private var queueEpoch = 0L
+    private val queuedTexts = mutableSetOf<String>()
+    private var currentSpeakText: String? = null
+
+    private enum class SpeakSlot { ACQUIRED, COALESCED, FULL, TIMEOUT, DRAINED }
     /**
      * 1.4.3: true while a Kokoro utterance is playing. Mic-tap
      * paths read this to QUEUE listening until TTS ends instead
@@ -108,38 +126,150 @@ class VoiceManager(
     private var lastAbortMs: Long = 0L
 
     /**
-     * Speaks [text] with Kokoro only. Returns true if the full text
-     * was spoken, false if nothing (or only part) was spoken — e.g.
-     * Kokoro disabled in prefs, bundled model missing, free space
-     * too low for the first-run copy, or playback interrupted by
-     * [stopSpeaking]. On false, the reason is in the app log.
+     * Speaks [text] with Kokoro primary + system-TTS fallback
+     * (1.4.10 hybrid). Returns true if the full text was spoken
+     * (by either voice), false if nothing (or only part) was
+     * spoken — e.g. Kokoro disabled in prefs, bundled model
+     * missing, free space too low for the first-run copy,
+     * playback interrupted by [stopSpeaking], or both voices
+     * failed. On false, the reason is in the app log. The
+     * fallback runs ONLY when Kokoro is latched (see
+     * [speakLocked]) — never for toggle-OFF, never for a
+     * first/second failure, never silently: the latch card +
+     * TTS_FALLBACK_USED say which voice spoke.
      */
     suspend fun speakAndWait(text: String): Boolean {
         if (text.isBlank()) return false
-        // B-M13: serialised — concurrent speaks queue here instead
-        // of racing Kokoro's shared track/stop flag. Signature
-        // unchanged (suspend fun speakAndWait(String): Boolean).
-        // 1.4.9 (Step 1e): the queue was unbounded AND unmarked —
-        // a speak stuck behind a long utterance looked exactly
-        // like a dead speak (SPK_START written upstream, then
-        // silence). Now a wait over 5 s is marked with its
-        // duration; the queue itself is unchanged (bounding it
-        // would refuse queued speaks, a behaviour change).
-        val queuedAtMs = System.currentTimeMillis()
-        return speakMutex.withLock {
-            val waitedMs = System.currentTimeMillis() - queuedAtMs
-            if (waitedMs > 5_000L) {
+        // 1.4.10 (Step 3): BOUNDED single-consumer queue. The old
+        // speakMutex queue was unbounded: rapid taps / repeated
+        // engine replies could stack speaks indefinitely behind
+        // one long utterance, and a stop only cut the playing
+        // one. Now: capacity 5 waiters (TTS_QUEUE_FULL refusal),
+        // identical consecutive texts coalesce (TTS_QUEUE_COALESCE
+        // — returns true, the twin speaks it), a 120 s
+        // acquisition timeout (TTS_QUEUE_TIMEOUT), and an
+        // explicit stop drains the whole queue (epoch bump —
+        // waiters drop with TTS_QUEUE_DRAINED). A wait over 5 s
+        // is still marked (TTS_SPEAK_QUEUED, 1.4.9). The slot
+        // holder runs speakLocked(); the slot is released in
+        // finally so a throw can never wedge the queue.
+        when (acquireSpeakSlot(text)) {
+            SpeakSlot.ACQUIRED -> { /* fall through to speakLocked */ }
+            SpeakSlot.COALESCED -> {
                 JarvisStateRepository.addDiagnostic(
-                    "tts", "TTS_SPEAK_QUEUED",
-                    "Speak waited ${waitedMs}ms on speakMutex before starting (concurrent speaks queue)."
+                    "tts", "TTS_QUEUE_COALESCE",
+                    "Speak coalesced: identical text already playing or queued — twin speaks it (no duplicate)."
                 )
+                return true
             }
-            stopListeningInternal()
+            SpeakSlot.FULL -> {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_QUEUE_FULL",
+                    "Speak refused: queue full ($QUEUE_CAPACITY waiters) — caller degrades visibly, retry on next command."
+                )
+                return false
+            }
+            SpeakSlot.TIMEOUT -> {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_QUEUE_TIMEOUT",
+                    "Speak dropped: waited ${QUEUE_WAIT_TIMEOUT_MS}ms for the speech slot — caller degrades visibly."
+                )
+                return false
+            }
+            SpeakSlot.DRAINED -> {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_QUEUE_DRAINED",
+                    "Queued speak dropped by an explicit stop (queue drained) — caller degrades visibly."
+                )
+                return false
+            }
+        }
+        try {
+            return speakLocked(text)
+        } finally {
+            releaseSpeakSlot()
+        }
+    }
+
+    /** Bounded-queue admission (Step 3). Never holds queueGuard
+     * across suspension; the tryLock loop polls every 100 ms so
+     * the wait can observe a drain (epoch bump) or a timeout
+     * without cancelling the holder's speak (withTimeoutOrNull
+     * around a lock would cancel a legitimate long speak).
+     * Polling is not strictly FIFO — the 120 s timeout bounds
+     * any barging cost to a visible drop. Cancellation of the
+     * waiter itself undoes its bookkeeping and rethrows. */
+    private suspend fun acquireSpeakSlot(text: String): SpeakSlot {
+        val epochAtEntry: Long
+        synchronized(queueGuard) {
+            if (queuedTexts.contains(text) || currentSpeakText == text) {
+                return SpeakSlot.COALESCED
+            }
+            if (queueWaiters >= QUEUE_CAPACITY) return SpeakSlot.FULL
+            queueWaiters++
+            queuedTexts.add(text)
+            epochAtEntry = queueEpoch
+        }
+        var waitedMs = 0L
+        var queuedMarked = false
+        try {
+            while (true) {
+                if (speakMutex.tryLock()) {
+                    synchronized(queueGuard) {
+                        queueWaiters--
+                        queuedTexts.remove(text)
+                        currentSpeakText = text
+                    }
+                    return SpeakSlot.ACQUIRED
+                }
+                if (queueEpoch != epochAtEntry) {
+                    synchronized(queueGuard) {
+                        queueWaiters--
+                        queuedTexts.remove(text)
+                    }
+                    return SpeakSlot.DRAINED
+                }
+                if (waitedMs >= QUEUE_WAIT_TIMEOUT_MS) {
+                    synchronized(queueGuard) {
+                        queueWaiters--
+                        queuedTexts.remove(text)
+                    }
+                    return SpeakSlot.TIMEOUT
+                }
+                if (!queuedMarked && waitedMs >= 5_000L) {
+                    queuedMarked = true
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "TTS_SPEAK_QUEUED",
+                        "Speak waited ${waitedMs}ms for the speech slot (concurrent speaks queue)."
+                    )
+                }
+                delay(100L)
+                waitedMs += 100L
+            }
+        } catch (e: CancellationException) {
+            synchronized(queueGuard) {
+                queueWaiters--
+                queuedTexts.remove(text)
+            }
+            throw e
+        }
+    }
+
+    private fun releaseSpeakSlot() {
+        synchronized(queueGuard) { currentSpeakText = null }
+        speakMutex.unlock()
+    }
+
+    /** The slot holder's speak: Kokoro primary, system-TTS
+     * fallback only when latched (Step 2). Runs with the queue
+     * slot held — never call directly without a slot. */
+    private suspend fun speakLocked(text: String): Boolean {
+        stopListeningInternal()
 
             if (!prefs.kokoroEnabled) {
                 JarvisStateRepository.addLog(
                     "Kokoro voice OFF in settings — nothing spoken " +
-                        "(Kokoro-only build: no other voice is used)."
+                        "(toggle OFF: no voice is used, not even the fallback)."
                 )
                 // 1.4.6: toggle-OFF used to leave NO diagnostic —
                 // only a log line — so a phone report with
@@ -153,7 +283,20 @@ class VoiceManager(
                     "Speak refused: Kokoro voice OFF in settings — " +
                         "nothing spoken (toggle ON in AI Brain to speak)."
                 )
-                return@withLock false
+                return false
+            }
+
+            // 1.4.10 hybrid (Step 2): latched Kokoro is NOT
+            // retried — the latch means auto-rebind is band, so
+            // go straight to the system-voice fallback (visible:
+            // TTS_FALLBACK_USED + latch card). Toggle-OFF never
+            // reaches here (above).
+            if (TtsProcessClient.isKokoroLatched()) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_FALLBACK_USED",
+                    "Kokoro latched — system-voice fallback (reason=latched; fallback voice is NOT hf_alpha)."
+                )
+                return speakViaFallback(text)
             }
 
             // 1.4.5: synthesis runs in the ISOLATED :tts process
@@ -170,24 +313,52 @@ class VoiceManager(
                 speakInProgress = false
                 abandonFocus(focus)
             }
-            if (!ok) {
-                JarvisStateRepository.addLog(
-                    "Kokoro unavailable — nothing spoken " +
-                        "(Kokoro-only build: no Deepgram / Gemini / " +
-                        "system-TTS fallback exists any more)."
+            if (ok) {
+                restartWakeIfNeeded()
+                return true
+            }
+            // Kokoro failed: fall back ONLY if this failure
+            // tripped the latch (Step 2 trigger ii). First/second
+            // failures stay visible failures — falling back on
+            // every failure would mask transient faults and make
+            // the fallback the de-facto voice.
+            if (TtsProcessClient.isKokoroLatched()) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_FALLBACK_USED",
+                    "Kokoro speak failed and latch tripped (lastFailure=${TtsProcessClient.lastFailure}) — system-voice fallback (fallback voice is NOT hf_alpha)."
                 )
-                return@withLock false
+                return speakViaFallback(text)
             }
+            JarvisStateRepository.addLog(
+                "Kokoro unavailable — nothing spoken " +
+                    "(latch not tripped: fallback runs only when Kokoro is latched)."
+            )
+            return false
+    }
 
-            // A-H3 speak-resume leak fix: a speak that ends while
-            // the mic loop is enabled must NOT restart wake-word
-            // listening — the loop already owns the mic. A-H9:
-            // when wake-word mode is on and the loop is off, the
-            // restart no longer depends on the agent being IDLE.
-            if (prefs.wakeWordEnabled && !isMicLoopEnabled()) {
-                startWakeWordListening()
-            }
-            true
+    /** System-voice fallback speak (Step 2). Same focus +
+     * wake-restart discipline as the Kokoro path. */
+    private suspend fun speakViaFallback(text: String): Boolean {
+        val focus = requestTransientFocus()
+        speakInProgress = true
+        val ok = try {
+            SystemTtsFallbackSpeaker.speak(context, text)
+        } finally {
+            speakInProgress = false
+            abandonFocus(focus)
+        }
+        if (ok) restartWakeIfNeeded()
+        return ok
+    }
+
+    /** A-H3 speak-resume leak fix (kept): a speak that ends
+     * while the mic loop is enabled must NOT restart wake-word
+     * listening — the loop already owns the mic. A-H9: when
+     * wake-word mode is on and the loop is off, the restart no
+     * longer depends on the agent being IDLE. */
+    private fun restartWakeIfNeeded() {
+        if (prefs.wakeWordEnabled && !isMicLoopEnabled()) {
+            startWakeWordListening()
         }
     }
 
@@ -203,9 +374,20 @@ class VoiceManager(
      * triggerManualVoiceCommand / listenForSingleReply).
      */
     fun stopSpeaking(reason: String) {
+        // 1.4.10 (Step 3): an explicit stop drains the WHOLE
+        // queue — the old comment ("Stop never cancels the whole
+        // queue") is dead. Bumping the epoch makes every waiter
+        // drop with TTS_QUEUE_DRAINED; the playing utterance is
+        // stopped below; speaks arriving AFTER the stop take the
+        // new epoch and proceed normally.
+        synchronized(queueGuard) { queueEpoch++ }
+        JarvisStateRepository.addDiagnostic(
+            "tts", "TTS_QUEUE_DRAIN",
+            "Speech stop drains the queue (epoch bump) — queued speaks drop: $reason"
+        )
         // B-M13: stops only the utterance currently playing.
-        // Queued speaks (waiting on speakMutex) are untouched —
-        // Stop never cancels the whole queue.
+        // Queued speaks (waiting for the slot) are dropped by
+        // the epoch bump above — Stop now cancels the whole queue.
         // 1.4.5 (item 5): dedupe — one barge-in used to log TWO
         // SPEAK_ABORT entries (handleTranscript + this call).
         // The STOP still fires every time; only the repeat log
@@ -472,5 +654,11 @@ class VoiceManager(
         private val WAKE_OBJECT_MARKERS: Set<String> = setOf(
             "ko", "ka", "ki", "ke", "se", "mein", "me", "par", "tak"
         )
+        /** 1.4.10 (Step 3): bounded-queue capacity (waiters) +
+         * acquisition timeout. 5 absorbs greeting + reply +
+         * prompt bursts; 120 s covers a multi-chunk reply
+         * without hanging behind a stuck holder forever. */
+        const val QUEUE_CAPACITY = 5
+        const val QUEUE_WAIT_TIMEOUT_MS = 120_000L
     }
 }

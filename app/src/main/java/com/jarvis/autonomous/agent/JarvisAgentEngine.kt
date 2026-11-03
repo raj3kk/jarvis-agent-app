@@ -44,7 +44,7 @@ class JarvisAgentEngine(
     // false instead of waiting for an answer to an unspoken question.
     // NOTE (coordinator-owned): JarvisForegroundService's lambda
     // must return Boolean after this change — it is NOT edited here.
-    private val onSpeakAndAwait: suspend (String) -> Boolean,
+    private val onSpeakAndAwait: suspend (String, String) -> Boolean,
     private val onRequestUserVoiceReply: suspend () -> String?,
     private val onShowBrowserPage: ((String) -> Unit)? = null,
     // B-M3 (1.4.1, coordinator-wired): true when the Browser tab is
@@ -162,9 +162,12 @@ class JarvisAgentEngine(
     }
 
     /** B-M8: speak, falling back to a VISIBLE chat prompt when TTS
-     *  reports failure. Returns the spoken flag. */
-    private suspend fun speak(text: String): Boolean {
-        val spoken = onSpeakAndAwait(text)
+     *  reports failure. Returns the spoken flag. Origin tags the
+     *  SPK_START line (1.4.10 Step 3): engine replies default to
+     *  "reply"; announces pass their own origin so the next
+     *  report can tell a reply from an announcement. */
+    private suspend fun speak(text: String, origin: String = "reply"): Boolean {
+        val spoken = onSpeakAndAwait(text, origin)
         if (!spoken) {
             JarvisStateRepository.addChatMessage("Jarvis", text)
         }
@@ -314,7 +317,7 @@ class JarvisAgentEngine(
         scope.launch {
             val announcement = "Bhai, $sender ka message aaya hai: ${message.take(90)}"
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            speak(announcement)
+            speak(announcement, "announce-notification")
         }
     }
 
@@ -339,7 +342,7 @@ class JarvisAgentEngine(
             // speech from this path.
             val announcement = "Bhai, call aa rahi hai."
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            speak(announcement)
+            speak(announcement, "announce-call")
         }
     }
 

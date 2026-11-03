@@ -406,6 +406,14 @@ class AlwaysOnMicManager(
     /** True while the loop is enabled (between [start] and [stop]). */
     fun isEnabled(): Boolean = enabled
 
+    /** 1.4.10 (Step 5): live mic-in-use signals for the FGS
+     * type qualification (the service reads these, never prefs).
+     * Wake counts as in-use across its restart backoff (the
+     * session is live and will recapture); one-shot counts
+     * only while its job is active. */
+    fun isWakeActive(): Boolean = wakeActive
+    fun isOneShotActive(): Boolean = oneShotJob?.isActive == true
+
     /** Current recognizer locale ("hi-IN" or "en-IN"). */
     fun currentLanguage(): String = currentLanguage
 
@@ -1411,6 +1419,18 @@ class AlwaysOnMicManager(
      */
     fun listenOnceAsync(timeoutMs: Long, callback: (String?) -> Unit) {
         if (enabled) {
+            callback(null)
+            return
+        }
+        // 1.4.10 (Step 6): the old code checked only the key —
+        // a missing RECORD_AUDIO grant fell through to a silent
+        // null (AudioRecord init failure). Now it has its own
+        // diagnostic (graceful still, never a crash).
+        if (!isRecordAudioGranted()) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "ONE_SHOT_NO_PERMISSION",
+                "One-shot refused: RECORD_AUDIO not granted."
+            )
             callback(null)
             return
         }

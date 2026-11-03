@@ -287,20 +287,31 @@ class KokoroTtsService : Service() {
             MSG_ENSURE -> {
                 // 1.4.5 (item 1a): single-writer asset ensure for
                 // main-process callers (launch copy, AI Brain setup
-                // button). No busy refusal: copyMutex inside :tts
-                // serialises this with speak-triggered copies and
-                // with reset (resetAndCopy holds the same lock for
-                // delete + copy). Progress streams with the req id.
+                // button). 1.4.10 (Step 4): BUSY REFUSAL, symmetric
+                // with MSG_RESET — the audit found ensure had NO
+                // busy check while reset refused, so a launch/setup
+                // copy could run UNDER a loaded engine (copyMutex
+                // inside :tts serialises ensure with speak-triggered
+                // copies and with reset, but NOT with generate —
+                // generate holds no copyMutex). A refused ensure
+                // is retried by the caller after speech ends.
+                // Speak-triggered ensure inside KokoroTtsClient
+                // .speak() is unaffected: it runs under the speak
+                // itself, not via this message.
                 val replyTo = msg.replyTo
                 val reqId = msg.data?.getLong(TtsProcessClient.KEY_REQ, -1L) ?: -1L
-                scope.launch {
-                    try {
-                        val result = KokoroTtsClient.ensureAssetsReady(applicationContext) { stage, copied, total ->
-                            sendProgress(replyTo, stage, copied, total, reqId)
+                if (speakBusy.get()) {
+                    replyTo?.let { sendDone(it, false, STAGE_BUSY, reqId) }
+                } else {
+                    scope.launch {
+                        try {
+                            val result = KokoroTtsClient.ensureAssetsReady(applicationContext) { stage, copied, total ->
+                                sendProgress(replyTo, stage, copied, total, reqId)
+                            }
+                            replyTo?.let { sendDone(it, result.isSuccess, STAGE_DONE, reqId) }
+                        } catch (t: Throwable) {
+                            replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
                         }
-                        replyTo?.let { sendDone(it, result.isSuccess, STAGE_DONE, reqId) }
-                    } catch (t: Throwable) {
-                        replyTo?.let { sendDone(it, false, STAGE_DONE, reqId) }
                     }
                 }
                 true
