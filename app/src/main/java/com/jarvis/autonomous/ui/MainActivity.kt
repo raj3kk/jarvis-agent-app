@@ -2328,7 +2328,7 @@ fun MemoryRoutinesLogsScreen(
                     )
                     Text(
                         text = "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
-                            "last error code=${if (micFatalState == null || micFatalState.code < 0) "none" else micFatalState.code.toString()}",
+                            "last error code=${run { val f = micFatalState; if (f == null || f.code < 0) "none" else f.code.toString() }}",
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace
                     )

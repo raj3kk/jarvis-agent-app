@@ -1261,6 +1261,15 @@ class AlwaysOnMicManager(
         emptySessionFallbackUsed = false
     }
 
+    // Cancels the standalone VAD loop job only, keeping the
+    // vadMonitor itself alive: the Deepgram pump taps the same
+    // monitor for segments, so a full stopVadMonitor() here would
+    // kill segment detection while streaming continues.
+    private fun stopVadLoopOnly() {
+        vadJob?.cancel()
+        vadJob = null
+    }
+
     private fun stopVadMonitor() {
         vadJob?.cancel()
         vadJob = null
