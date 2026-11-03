@@ -26,6 +26,7 @@ import com.jarvis.autonomous.ui.MainActivity
 import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
+import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.VoiceManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -48,6 +49,7 @@ class JarvisForegroundService : Service() {
         const val ACTION_STOP_LISTENING = "com.jarvis.autonomous.ACTION_STOP_LISTENING"
         const val ACTION_RETRY_MIC = "com.jarvis.autonomous.ACTION_RETRY_MIC"
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
+        const val ACTION_GREET = "com.jarvis.autonomous.ACTION_GREET"
         const val ACTION_TEXT_COMMAND = "com.jarvis.autonomous.ACTION_TEXT_COMMAND"
         const val EXTRA_COMMAND_TEXT = "extra_command_text"
         const val ACTION_REFRESH_OVERLAY = "com.jarvis.autonomous.ACTION_REFRESH_OVERLAY"
@@ -85,6 +87,16 @@ class JarvisForegroundService : Service() {
     }
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
+    /**
+     * 1.4.3 startup greeting: spoken ONCE per service lifetime
+     * (not on every Activity rotation or service restart —
+     * MainActivity sends ACTION_GREET on launch; a second send
+     * is a no-op). If the greet arrives before init finishes
+     * (defensive — onCreate always precedes onStartCommand),
+     * [pendingGreet] replays it after init.
+     */
+    private var greetingDone: Boolean = false
+    private var pendingGreet: Boolean = false
     /** B-M13: serialises speakWrapped so setSpeaking(true/false)
      * pairs never interleave across concurrent speaks. */
     private val speakMutex = kotlinx.coroutines.sync.Mutex()
@@ -96,16 +108,80 @@ class JarvisForegroundService : Service() {
      * "ruk"/"bas" which still stop speech via the callback below.
      */
     private suspend fun speakWrapped(text: String): Boolean {
-        return speakMutex.withLock {
+        // 1.4.3 SPEAKING->HOME shield + decisive speak window:
+        // EVERY speak logs SPK_START then SPK_END (unconditional
+        // — no throttle, so a first-step repro is decidable).
+        // A speak-TIME throw used to propagate and kill the app
+        // right after the UI showed "speaking" (onCreate's
+        // runCatching cannot catch it — it fires later, per
+        // utterance). Now Java throws are recorded (tts/SPK_START,
+        // exact class + message, never the spoken text) and
+        // degrade to "not spoken" (chat fallback) instead of a
+        // crash. What this CANNOT catch: a native crash inside
+        // Sherpa/ONNX or a system battery-kill — those leave NO
+        // Java crash entry, which is itself the diagnostic signal
+        // (SPK_START present + no SPK_END + no crash entry =
+        // native crash or system kill during speak).
+        val startMs = System.currentTimeMillis()
+        JarvisStateRepository.addDiagnostic(
+            "tts", "SPK_START",
+            "Speak started (chars=${text.length})."
+        )
+        val ok = speakMutex.withLock {
             if (::micManager.isInitialized) {
                 micManager.setSpeaking(true, text)
                 try {
-                    voiceManager.speakAndWait(text)
+                    runCatching { voiceManager.speakAndWait(text) }.getOrElse { t ->
+                        JarvisStateRepository.addDiagnostic(
+                            "tts", "SPK_START",
+                            "Speak failed at start: ${t.javaClass.simpleName}: ${t.message ?: ""}"
+                        )
+                        false
+                    }
                 } finally {
                     micManager.setSpeaking(false)
                 }
             } else {
-                voiceManager.speakAndWait(text)
+                runCatching { voiceManager.speakAndWait(text) }.getOrElse { t ->
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_START",
+                        "Speak failed at start: ${t.javaClass.simpleName}: ${t.message ?: ""}"
+                    )
+                    false
+                }
+            }
+        }
+        JarvisStateRepository.addDiagnostic(
+            "tts", "SPK_END",
+            "Speak finished: ok=$ok, ms=${System.currentTimeMillis() - startMs}."
+        )
+        return ok
+    }
+
+    /**
+     * 1.4.3 startup greeting (FIXED local lines, LLM bypassed —
+     * no network, no key, no LLM failure can swallow it). The
+     * chat line is ALWAYS posted (visible even with Kokoro OFF);
+     * speech is best-effort and its failure is logged. The
+     * key-prompt appends ONLY when no API key is saved.
+     */
+    private fun speakGreeting() {
+        if (greetingDone) return
+        greetingDone = true
+        val base = "Namaste, main Jarvis hoon. Main sun raha hoon — bolo, kya karna hai?"
+        val full = if (prefs.apiKey.isBlank()) {
+            "$base Baat karne ke liye AI Brain me apni API key daalo aur Save dabao."
+        } else {
+            base
+        }
+        JarvisStateRepository.addChatMessage("Jarvis", full)
+        serviceScope.launch {
+            val ok = runCatching { speakWrapped(full) }.getOrDefault(false)
+            if (!ok) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "GREET_FAIL",
+                    "Startup greeting could not be spoken (Kokoro OFF or TTS failed) — text shown in chat."
+                )
             }
         }
     }
@@ -209,6 +285,16 @@ class JarvisForegroundService : Service() {
                 if (pendingVoiceReply === deferred) pendingVoiceReply = null
             }
         }
+        // 1.4.3: loop OFF — Deepgram one-shot FIRST (key present),
+        // system single-reply second (key missing or Deepgram
+        // timeout/failure). Speaking stays Kokoro either way.
+        val dgKey = prefs.deepgramApiKey
+        if (dgKey.isNotBlank()) {
+            val heard = runCatching {
+                DeepgramSttClient(dgKey).listenOnce()
+            }.getOrNull()
+            if (!heard.isNullOrBlank()) return heard
+        }
         return voiceManager.listenForSingleReply()
     }
 
@@ -303,6 +389,21 @@ class JarvisForegroundService : Service() {
                 JarvisStateRepository.setMicListening(listening)
             }
 
+            override fun onSttPathChanged(path: String, reason: String) {
+                // 1.4.3 VISIBLE fallback switch: the manager
+                // already logs the Diagnostic; the chat line makes
+                // the switch visible to the user in the Command tab.
+                JarvisStateRepository.setSttPath(path, reason)
+                JarvisStateRepository.addChatMessage(
+                    "Jarvis",
+                    if (path == "deepgram") {
+                        "Sun raha hoon — Deepgram se. $reason"
+                    } else {
+                        "Deepgram se sun nahi pa raha — system mic se sun raha hoon. $reason"
+                    }
+                )
+            }
+
             override fun onMicError(reason: String) {
                 // 1.4.2: terminal mic death used to end in this
                 // log line ONLY — no banner, no speech, no retry —
@@ -327,7 +428,7 @@ class JarvisForegroundService : Service() {
                 }
             }
         })
-        micManager.setStopSpeakingCallback { voiceManager.stopSpeaking() }
+        micManager.setStopSpeakingCallback { voiceManager.stopSpeaking("barge-in keyword") }
 
         floatingOverlay = FloatingJarvisOverlay(
             context = this,
@@ -368,6 +469,14 @@ class JarvisForegroundService : Service() {
 
         JarvisStateRepository.setForegroundRunning(true)
         JarvisStateRepository.addLog("Jarvis Foreground Service started.")
+        // 1.4.3 home-redirect gate: service lifecycle marker
+        // (persisted — survives process death like all markers).
+        JarvisStateRepository.addDiagnostic("nav", "SVC_CREATE", "Foreground service created.")
+        // 1.4.3: replay a greeting that arrived before init.
+        if (pendingGreet) {
+            pendingGreet = false
+            speakGreeting()
+        }
         } catch (e: Exception) {
             runCatching {
                 com.jarvis.autonomous.data.JarvisDiagnosticsFile.appendCrash("main", e)
@@ -453,8 +562,17 @@ class JarvisForegroundService : Service() {
             }
 
             ACTION_STOP_TASK -> {
-                voiceManager.stopSpeaking()
+                voiceManager.stopSpeaking("user STOP_TASK")
                 agentEngine.cancelActiveTask("Stopped by user.")
+            }
+
+            ACTION_GREET -> {
+                // 1.4.3: MainActivity sends this once on launch.
+                if (::voiceManager.isInitialized) {
+                    speakGreeting()
+                } else {
+                    pendingGreet = true
+                }
             }
 
             ACTION_TEXT_COMMAND -> {
@@ -579,6 +697,11 @@ class JarvisForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        // 1.4.3 home-redirect gate: a clean service destroy
+        // writes this marker; a battery/process kill writes
+        // NOTHING after the last marker — that absence is the
+        // kill-vs-crash signal in the next report.
+        JarvisStateRepository.addDiagnostic("nav", "SVC_DESTROY", "Foreground service destroyed.")
         floatingOverlay?.hide()
         // A-H8: destroy cancels a pending reply (a stale reply
         // must never swallow the next command after recreation).

@@ -314,7 +314,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             - "LONG_PRESS_XY": Long-press screen coordinates `(x, y)`. Fill `x` and `y`.
             - "TYPE_TEXT": Type text into an input box. Fill `nodeId` (or -1 for focused field), `text`, and `pressEnter` (true/false).
             - "SCROLL": Scroll the screen. Fill `direction` ("DOWN", "UP", "LEFT", "RIGHT").
-            - "NAVIGATE": System navigation. Fill `navTarget` ("BACK", "HOME", "RECENTS", "NOTIFICATIONS", "QUICK_SETTINGS", "SCREENSHOT").
+            - "NAVIGATE": System navigation. Fill `navTarget` ("BACK", "HOME", "RECENTS", "NOTIFICATIONS", "QUICK_SETTINGS", "SCREENSHOT"). HOME ONLY when the user explicitly asked to go home or the plan genuinely needs the launcher — NEVER as a generic first step before opening an app (use OPEN_APP directly to launch apps). A HOME press backgrounds Jarvis, so it must never appear in a plan unless the user asked for it.
             - "MEDIA_CONTROL": Control music/video playback in background. Fill `text` ("PLAY_PAUSE", "NEXT", "PREVIOUS").
             - "COPY_CLIPBOARD": Copy text to system clipboard. Fill `text`.
             - "WAIT": Wait 2 seconds for screen/app loading.

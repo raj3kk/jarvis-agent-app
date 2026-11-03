@@ -383,17 +383,38 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     /**
      * Global system navigation actions.
+     * 1.4.3 home-redirect hardening: (a) the action is recorded
+     * to PERSISTED Diagnostics BEFORE it fires, so a "speaking
+     * dikhte hi home" repro is decidable (NAV_EXEC present =
+     * the agent pressed HOME on purpose, NOT a crash); (b) an
+     * unknown target FAILS CLOSED (returns false + diagnostic)
+     * instead of pressing BACK — the old else->BACK turned any
+     * garbage target into a backgrounding press; (c) pre-P
+     * LOCK_SCREEN/SCREENSHOT fallbacks to HOME are removed for
+     * the same reason (a substitute HOME press is never what
+     * the caller asked for).
      */
     fun performSystemNavigation(navAction: String): Boolean {
-        val code = when (navAction.uppercase()) {
+        val target = navAction.uppercase()
+        JarvisStateRepository.addDiagnostic(
+            "nav", "NAV_EXEC", "System navigation requested: $target"
+        )
+        val code = when (target) {
             "BACK" -> GLOBAL_ACTION_BACK
             "HOME" -> GLOBAL_ACTION_HOME
             "RECENTS" -> GLOBAL_ACTION_RECENTS
             "NOTIFICATIONS" -> GLOBAL_ACTION_NOTIFICATIONS
             "QUICK_SETTINGS" -> GLOBAL_ACTION_QUICK_SETTINGS
-            "LOCK_SCREEN" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) GLOBAL_ACTION_LOCK_SCREEN else GLOBAL_ACTION_HOME
-            "SCREENSHOT" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) GLOBAL_ACTION_TAKE_SCREENSHOT else GLOBAL_ACTION_HOME
-            else -> GLOBAL_ACTION_BACK
+            "LOCK_SCREEN" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) GLOBAL_ACTION_LOCK_SCREEN else -1
+            "SCREENSHOT" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) GLOBAL_ACTION_TAKE_SCREENSHOT else -1
+            else -> -1
+        }
+        if (code == -1) {
+            JarvisStateRepository.addDiagnostic(
+                "nav", "NAV_REJECTED",
+                "Unknown or unsupported navigation target: $target — nothing pressed."
+            )
+            return false
         }
         val ok = performGlobalAction(code)
         JarvisStateRepository.addLog("Executed Global Action: $navAction (ok=$ok)")

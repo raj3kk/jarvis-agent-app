@@ -290,14 +290,106 @@ class TurnDetector {
             return false
         }
 
-        /** Lowercase, punctuation -> space, fillers dropped. */
+        /** Lowercase, punctuation -> space, fillers dropped.
+         *  1.4.3: Devanagari tokens are transliterated to Latin
+         *  BEFORE keyword matching (see DEVANAGARI_KEYWORDS) — a
+         *  Deepgram transcript in Devanagari script ("रुक",
+         *  "दिखाओ") must hit the same keyword lists as the Latin
+         *  form, or mic-stop / barge-in / wake / completeness
+         *  checks silently break. Display text is never changed
+         *  here; only the matching tokens are mapped. */
         fun normalizeTokens(text: String): List<String> {
             return text.lowercase()
                 .replace(Regex("[.,!?;:'\"()\\[\\]।]+"), " ")
                 .split(" ")
                 .map { it.trim() }
+                .map { DEVANAGARI_KEYWORDS[it] ?: it }
                 .filter { it.isNotEmpty() && it !in STOP_FILLERS }
         }
+
+        /**
+         * Word-level Devanagari -> Latin map for COMMAND and STOP
+         * keywords only (not a general transliterator). Unknown
+         * Devanagari words pass through unchanged. Used by
+         * [normalizeTokens] and by the engine's fast-path matcher
+         * so a Devanagari transcript matches Latin keyword lists.
+         */
+        fun transliterateDevanagariKeywords(text: String): String {
+            if (text.isEmpty()) return text
+            return text.split(" ").joinToString(" ") { raw ->
+                val token = raw.trim().trim('.', ',', '!', '?', ';', ':', '।')
+                if (token.isEmpty()) raw else (DEVANAGARI_KEYWORDS[token] ?: raw)
+            }
+        }
+
+        /** Devanagari / Latin / mixed, for Diagnostics verification. */
+        fun scriptOf(text: String): String {
+            var dev = false
+            var lat = false
+            for (ch in text) {
+                if (ch in '\u0900'..'\u097F') dev = true
+                if (ch in 'a'..'z' || ch in 'A'..'Z') lat = true
+            }
+            return when {
+                dev && lat -> "mixed"
+                dev -> "devanagari"
+                else -> "latin"
+            }
+        }
+
+        private val DEVANAGARI_KEYWORDS: Map<String, String> = mapOf(
+            // Stop / barge-in keywords
+            "रुक" to "ruk", "रुको" to "ruko", "रुकजा" to "ruk ja",
+            "जा" to "ja", "जाओ" to "jao", "बस" to "bas",
+            "चुप" to "chup", "रोको" to "roko", "रोक" to "rok",
+            "बंद" to "band", "स्टॉप" to "stop", "स्टार्ट" to "start",
+            // Mic
+            "माइक" to "mic", "माइक्रोफोन" to "microphone",
+            // Commands / verbs
+            "दिखाओ" to "dikhao", "दिखा" to "dikh",
+            "भेजो" to "bhejo", "भेज" to "bhej", "भेजदो" to "bhejdo",
+            "मत" to "mat", "नहीं" to "nahi", "नही" to "nahi",
+            "करो" to "karo", "कर" to "kar", "करना" to "karna",
+            "चलाओ" to "chalao", "चला" to "chala", "चालू" to "chalu",
+            "बजाओ" to "bajao", "बज" to "baj", "सुनाओ" to "sunao",
+            "खोलो" to "kholo", "खोल" to "khol",
+            "बताओ" to "batao", "बता" to "bata",
+            "लगाओ" to "lagao", "लगा" to "laga",
+            "देखो" to "dekho", "देख" to "dekh",
+            "लिखो" to "likho", "बनाओ" to "banao",
+            "ढूंढो" to "dhoondho", "खेलो" to "khelo",
+            "उठाओ" to "uthao", "गाओ" to "gao", "आओ" to "aao",
+            "जलाओ" to "jalao", "बुझाओ" to "bujhao",
+            "सर्च" to "search", "प्ले" to "play",
+            // Nouns / apps / media
+            "गाना" to "gaana", "गाने" to "gaane",
+            "यूट्यूब" to "youtube", "व्हाट्सऐप" to "whatsapp",
+            "मेसेज" to "message", "कॉल" to "call", "फोन" to "phone",
+            "टॉर्च" to "torch", "फ्लैशलाइट" to "flashlight",
+            "अगला" to "agla", "अगली" to "agli",
+            "समय" to "samay", "तारीख" to "date", "बजे" to "baje",
+            "मौसम" to "mausam",
+            // Questions / replies
+            "क्या" to "kya", "कितने" to "kitne", "कितना" to "kitna",
+            "कब" to "kab", "कहाँ" to "kahan", "कहां" to "kahan",
+            "कौन" to "kaun", "क्यों" to "kyun", "कैसे" to "kaise",
+            "कौनसा" to "konsa", "कौनसी" to "kaunsi",
+            "हाँ" to "haan", "हां" to "haan",
+            "ठीक" to "theek", "अच्छा" to "acha",
+            "शुक्रिया" to "shukriya", "धन्यवाद" to "shukriya",
+            "हेलो" to "hello", "हाय" to "hi",
+            // Conjunctions / postpositions (TRAILING_TOKENS)
+            "और" to "aur", "लेकिन" to "lekin", "पर" to "par",
+            "से" to "se", "का" to "ka", "की" to "ki",
+            "के" to "ke", "को" to "ko", "तक" to "tak",
+            "जब" to "jab", "अगर" to "agar", "फिर" to "phir",
+            "इसलिए" to "isliye", "या" to "ya",
+            "तो" to "to", "तोह" to "toh", "में" to "mein",
+            "मे" to "me", "आज" to "aaj",
+            // Fillers (dropped by normalizeTokens)
+            "कृपया" to "", "यार" to "", "भाई" to "",
+            "ज़रा" to "", "थोड़ा" to ""
+        )
 
         private val STOP_FILLERS: Set<String> = setOf(
             "please", "pls", "yaar", "bhai", "zara", "kripya", "thoda"
@@ -418,11 +510,33 @@ object BargeInDetector {
         val spokenJoined = spokenTokens.joinToString(" ")
         val transcriptJoined = tokens.joinToString(" ")
         if (spokenJoined.isNotEmpty() && spokenJoined.contains(transcriptJoined)) return false
+        // 1.4.3 fuzzy echo: a MISTRANSCRIBED echo ("bus karo"
+        // for spoken "bas karo") still sits inside Jarvis's words
+        // IN ORDER, even when the strings differ — a token
+        // subsequence check catches it where contains() cannot.
+        if (spokenTokens.isNotEmpty() && isTokenSubsequence(tokens, spokenTokens)) return false
         if (remainderTokens.isEmpty() && keyword in spokenTokens) return false
         // Loud gate: KNOWN values only, never skipped on unknown.
         if (rmsDb == null || rmsBaselineDb == null) return false
         if (rmsDb < rmsBaselineDb + LOUD_MARGIN_DB) return false
         return true
+    }
+
+    /** True when [needle] appears inside [haystack] in order
+     *  (not necessarily adjacent) — the 1.4.3 fuzzy echo check. */
+    private fun isTokenSubsequence(
+        needle: List<String>,
+        haystack: List<String>
+    ): Boolean {
+        if (needle.isEmpty()) return false
+        var j = 0
+        for (token in haystack) {
+            if (token == needle[j]) {
+                j++
+                if (j == needle.size) return true
+            }
+        }
+        return false
     }
 
     /** Text after the leading stop keyword(s), or "" if none. */

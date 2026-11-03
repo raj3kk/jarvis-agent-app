@@ -38,7 +38,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -67,8 +66,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
@@ -116,6 +113,7 @@ import com.jarvis.autonomous.agent.LlmClient
 import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
+import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.KokoroTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -146,6 +144,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         startJarvisBackgroundService()
+        // 1.4.3: startup greeting — the service speaks it once
+        // per service lifetime (ACTION_GREET is a no-op on
+        // repeat); spoken from fixed local lines, LLM bypassed.
+        sendServiceAction(JarvisForegroundService.ACTION_GREET)
+        // 1.4.3 home-redirect gate: lifecycle markers are
+        // PERSISTED (addDiagnostic appends to diagnostics.jsonl),
+        // so a post-death report still shows whether the activity
+        // was paused/destroyed or the process just died.
+        JarvisStateRepository.addDiagnostic("nav", "LIFE_CREATE", "MainActivity created.")
 
         setContent {
             MaterialTheme(colorScheme = JarvisColorScheme) {
@@ -172,6 +179,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // 1.4.3 home-redirect gates: lifecycle markers are PERSISTED
+    // (addDiagnostic appends to diagnostics.jsonl), so a
+    // post-death report still shows whether the activity was
+    // paused/destroyed or the process just died.
+    override fun onResume() {
+        super.onResume()
+        JarvisStateRepository.addDiagnostic("nav", "LIFE_RESUME", "MainActivity resumed.")
+    }
+
+    override fun onPause() {
+        JarvisStateRepository.addDiagnostic("nav", "LIFE_PAUSE", "MainActivity paused.")
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        JarvisStateRepository.addDiagnostic(
+            "nav", "LIFE_DESTROY",
+            "MainActivity destroyed (isFinishing=$isFinishing)."
+        )
+        super.onDestroy()
     }
 
     private fun startJarvisBackgroundService() {
@@ -287,63 +316,99 @@ fun JarvisMainApp(
     Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFFFFFFFF)) {
-                NavigationBarItem(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Default.Home, contentDescription = null) },
-                    label = { Text("Command") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.Security, contentDescription = null) },
-                    label = { Text("Permissions") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 2,
-                    onClick = { selectedTab = 2 },
-                    icon = { Icon(Icons.Default.Settings, contentDescription = null) },
-                    label = { Text("AI Brain") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 3,
-                    onClick = { selectedTab = 3 },
-                    icon = { Icon(Icons.Default.List, contentDescription = null) },
-                    label = { Text("Memory & Logs") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 4,
-                    onClick = { selectedTab = 4 },
-                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
-                    label = { Text("Projects") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 5,
-                    onClick = { selectedTab = 5 },
-                    icon = { Icon(Icons.Default.Send, contentDescription = null) },
-                    label = { Text("Browser") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 6,
-                    onClick = { selectedTab = 6 },
-                    icon = { Icon(Icons.Default.Security, contentDescription = null) },
-                    label = { Text("Licence") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 7,
-                    onClick = { selectedTab = 7 },
-                    icon = { Icon(Icons.Default.Edit, contentDescription = null) },
-                    label = { Text("Whiteboard") }
-                )
+            // 1.4.3: 8 tabs in a stock NavigationBar squeeze every
+            // label on small screens ("Memory & Logs" truncated to
+            // unreadable). A horizontally scrollable row keeps ALL
+            // tabs with their FULL labels at readable size and a
+            // clear selected pill — no tab or function removed.
+            Surface(color = Color(0xFFFFFFFF)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val tabs = listOf(
+                        Triple(0, Icons.Default.Home, "Command"),
+                        Triple(1, Icons.Default.Security, "Permissions"),
+                        Triple(2, Icons.Default.Settings, "AI Brain"),
+                        Triple(3, Icons.Default.List, "Memory & Logs"),
+                        Triple(4, Icons.Default.Build, "Projects"),
+                        Triple(5, Icons.Default.Send, "Browser"),
+                        Triple(6, Icons.Default.Security, "Licence"),
+                        Triple(7, Icons.Default.Edit, "Whiteboard")
+                    )
+                    tabs.forEach { (index, icon, label) ->
+                        val selected = selectedTab == index
+                        Column(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    if (selected) Color(0xFFFFF1DC)
+                                    else Color.Transparent
+                                )
+                                .clickable { selectedTab = index }
+                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                icon,
+                                contentDescription = null,
+                                tint = if (selected) Color(0xFFB85C38)
+                                else Color(0xFF8A7A70),
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Text(
+                                label,
+                                fontSize = 11.sp,
+                                fontWeight = if (selected) FontWeight.Bold
+                                else FontWeight.Normal,
+                                color = if (selected) Color(0xFFB85C38)
+                                else Color(0xFF8A7A70),
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
+                    }
+                }
             }
         }
     ) { innerPadding ->
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            // 1.4.3 Kokoro-OFF launch warning: speakAndWait
+            // returns false silently when the toggle is off, and
+            // the engine's chat-only fallback made "bolti hi nahi"
+            // look like a bug. Now the OFF state is visible.
+            if (!prefs.kokoroEnabled) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = Color(0xFFFFEBEE)
+                    )
+                ) {
+                    Text(
+                        "Kokoro OFF hai — Jarvis bolega nahi. Bolna " +
+                            "wapas chahiye to AI Brain me Kokoro ON karo.",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFD32F2F),
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
             when (selectedTab) {
                 0 -> CommandCenterScreen(
                     onStartVoice = onStartVoice,
@@ -378,6 +443,7 @@ fun JarvisMainApp(
 
                 7 -> WhiteboardScreen()
             }
+        }
         }
     }
         // C-B13 mic-permission explainer banner (above content,
@@ -535,6 +601,16 @@ fun CommandCenterScreen(
             .fillMaxSize()
             .padding(16.dp)
     ) {
+        // 1.4.3: the whole content above the input bar scrolls as
+        // ONE column — previously only the chat LazyColumn scrolled
+        // (weight 1f) while the fixed header/avatar/cards squeezed
+        // it to zero height on small screens and the tab looked
+        // unscrollable. The input bar stays pinned below it.
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+        ) {
         // Top Header Bar
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -782,16 +858,15 @@ fun CommandCenterScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         // Conversation & Action Transcript
-        LazyColumn(
+        Column(
             modifier = Modifier
-                .weight(1f)
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
                 .background(Color(0xFFFFF1DC))
                 .padding(10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(chatHistory, key = { it.id }) { item ->
+            chatHistory.forEach { item ->
                 val isUser = item.sender == "You"
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -831,9 +906,11 @@ fun CommandCenterScreen(
             }
         }
 
+        } // end scrollable content column
+
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Bottom Command Input Bar
+        // Bottom Command Input Bar (pinned below the scroll area)
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -1195,6 +1272,11 @@ fun AiBrainSettingsScreen(
     var selectedProvider by remember { mutableStateOf(prefs.provider) }
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
+    // 1.4.3: Deepgram STT key (listening only — speaking stays
+    // Kokoro). Saved by the same SAVE button; empty = system
+    // fallback. Never displayed, never logged.
+    var deepgramKey by remember { mutableStateOf(prefs.deepgramApiKey) }
+    var showDeepgramKey by remember { mutableStateOf(false) }
     var modelName by remember { mutableStateOf(prefs.modelName) }
     var hfToken by remember { mutableStateOf(prefs.hfToken) }
     var languageMode by remember { mutableStateOf(prefs.languageMode) }
@@ -1464,6 +1546,29 @@ fun AiBrainSettingsScreen(
             singleLine = true
         )
 
+        // 1.4.3: Deepgram STT key — SUNNE ke liye (transcription),
+        // bolne ke liye NAHI (bolna hamesha Kokoro). Key khaali
+        // ho to mic system recognizer se chalega (fallback).
+        OutlinedTextField(
+            value = deepgramKey,
+            onValueChange = { deepgramKey = it },
+            label = { Text("Deepgram API Key (sunne ke liye, STT only)") },
+            placeholder = { Text("Paste Deepgram key here — bina iske system mic chalega") },
+            visualTransformation = if (showDeepgramKey) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                Text(
+                    text = if (showDeepgramKey) "HIDE" else "SHOW",
+                    fontSize = 11.sp,
+                    color = Color(0xFFB85C38),
+                    modifier = Modifier
+                        .padding(end = 10.dp)
+                        .clickable { showDeepgramKey = !showDeepgramKey }
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
         // Model Input
         OutlinedTextField(
             value = modelName,
@@ -1585,6 +1690,7 @@ fun AiBrainSettingsScreen(
                 prefs.provider = selectedProvider
                 prefs.hfToken = hfToken
                 prefs.apiKey = apiKey
+                prefs.deepgramApiKey = deepgramKey
                 prefs.modelName = modelName
                 prefs.languageMode = languageMode
                 prefs.personaPrompt = personaPrompt
@@ -1675,6 +1781,56 @@ fun AiBrainSettingsScreen(
                 }
             }
         }
+
+        // 1.4.3: Deepgram key test — Gemini Test-key pattern par:
+        // ek cheap WS handshake, result VERBATIM (HTTP code +
+        // message). Key kabhi dikhayi nahi jaati. Bina Save ke
+        // test purani saved key par chalega (upar wala note).
+        run {
+            val testContext = LocalContext.current
+            val testScope = rememberCoroutineScope()
+            var dgResult by remember { mutableStateOf("") }
+            var dgBusy by remember { mutableStateOf(false) }
+            val sttPath by JarvisStateRepository.sttPath.collectAsState()
+            val sttReason by JarvisStateRepository.sttPathReason.collectAsState()
+            val lastScript by JarvisStateRepository.lastTranscriptScript.collectAsState()
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Deepgram STT (sunna) — saved state", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(
+                        text = "STT path: $sttPath · $sttReason · Last transcript script: $lastScript · " +
+                            "Key saved: ${if (prefs.deepgramApiKey.isNotBlank()) "yes" else "NO — system mic chalega"}",
+                        fontSize = 12.sp
+                    )
+                    Button(
+                        enabled = !dgBusy,
+                        onClick = {
+                            dgBusy = true
+                            dgResult = "Testing…"
+                            testScope.launch(Dispatchers.IO) {
+                                val key = prefs.deepgramApiKey
+                                dgResult = if (key.isBlank()) {
+                                    "Deepgram key saved nahi hai — pehle key daalo aur SAVE dabao."
+                                } else {
+                                    DeepgramSttClient(key).testAuth()
+                                }
+                                dgBusy = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Test Deepgram key", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (dgResult.isNotBlank()) {
+                        Text(dgResult, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1725,6 +1881,98 @@ fun MemoryRoutinesLogsScreen(
             fontWeight = FontWeight.Bold,
             color = Color(0xFFB85C38)
         )
+
+        // Diagnostics FIRST (1.4.3): moved to the TOP of this tab —
+        // it was Section 4 and users never scrolled far enough to
+        // see it. INSIDE this
+        // tab on purpose, NOT a new bottom-bar tab (8 already crowd
+        // small screens). Nothing here auto-uploads or phones home:
+        // the user copies the report manually and pastes it back.
+        run {
+            val diagContext = LocalContext.current
+            val diagnostics by JarvisStateRepository.diagnostics.collectAsState()
+            val micFatalState by JarvisStateRepository.micFatal.collectAsState()
+            val micLoopOn by JarvisStateRepository.micLoopEnabled.collectAsState()
+            val micLive by JarvisStateRepository.micListening.collectAsState()
+            var copiedNote by remember { mutableStateOf("") }
+            var lastCrash by remember {
+                mutableStateOf(JarvisDiagnosticsFile.readLastCrash())
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Diagnostics / Bug report", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFFB85C38))
+                    Text(
+                        text = "Kuch gadbad ho to COPY dabao aur report mujhe bhej do. " +
+                            "Isme kabhi key, token, poori licence key, contact, message " +
+                            "ya photo nahi aata — sirf states, codes aur last lines.",
+                        fontSize = 12.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                    Text(
+                        text = "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
+                            "last error code=${micFatalState?.code?.toString() ?: "none"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Overlay now: ${if (diagContext.let {
+                            android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M ||
+                                android.provider.Settings.canDrawOverlays(it)
+                        }) "GRANTED" else "NOT GRANTED"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Diagnostics lines: ${diagnostics.size} · Last crash: ${lastCrash?.take(160) ?: "none"}",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val report = buildDiagnosticsReport(
+                                    diagContext, prefs, diagnostics,
+                                    micFatalState, micLoopOn, micLive, lastCrash
+                                )
+                                val cm = diagContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as ClipboardManager
+                                cm.setPrimaryClip(
+                                    ClipData.newPlainText("Jarvis diagnostics", report)
+                                )
+                                copiedNote = "Copied — ab mujhe paste kar do."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                        ) {
+                            Text("Copy bug report", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                JarvisStateRepository.clearDiagnostics()
+                                lastCrash = null
+                                copiedNote = "Diagnostics cleared."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("Clear", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                    if (copiedNote.isNotBlank()) {
+                        Text(copiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                    diagnostics.takeLast(20).reversed().forEach { entry ->
+                        Text(
+                            text = "[${entry.time}] ${entry.area}/${entry.code}: ${entry.message}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF8A7A70)
+                        )
+                    }
+                }
+            }
+        }
 
         // Section 1: Custom Voice Routines (Macros)
         Card(
@@ -1866,95 +2114,7 @@ fun MemoryRoutinesLogsScreen(
             }
         }
 
-        // Section 4 (1.4.2): Diagnostics / Bug report — INSIDE this
-        // tab on purpose, NOT a new bottom-bar tab (8 already crowd
-        // small screens). Nothing here auto-uploads or phones home:
-        // the user copies the report manually and pastes it back.
-        run {
-            val diagContext = LocalContext.current
-            val diagnostics by JarvisStateRepository.diagnostics.collectAsState()
-            val micFatalState by JarvisStateRepository.micFatal.collectAsState()
-            val micLoopOn by JarvisStateRepository.micLoopEnabled.collectAsState()
-            val micLive by JarvisStateRepository.micListening.collectAsState()
-            var copiedNote by remember { mutableStateOf("") }
-            var lastCrash by remember {
-                mutableStateOf(JarvisDiagnosticsFile.readLastCrash())
-            }
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Diagnostics / Bug report", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFFB85C38))
-                    Text(
-                        text = "Kuch gadbad ho to COPY dabao aur report mujhe bhej do. " +
-                            "Isme kabhi key, token, poori licence key, contact, message " +
-                            "ya photo nahi aata — sirf states, codes aur last lines.",
-                        fontSize = 12.sp,
-                        color = Color(0xFF8A7A70)
-                    )
-                    Text(
-                        text = "Mic: loop=${if (micLoopOn) "ON" else "OFF"} · listening=${if (micLive) "YES" else "NO"} · " +
-                            "last error code=${micFatalState?.code?.toString() ?: "none"}",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Text(
-                        text = "Overlay now: ${if (diagContext.let {
-                            android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M ||
-                                android.provider.Settings.canDrawOverlays(it)
-                        }) "GRANTED" else "NOT GRANTED"}",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Text(
-                        text = "Diagnostics lines: ${diagnostics.size} · Last crash: ${lastCrash?.take(160) ?: "none"}",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                val report = buildDiagnosticsReport(
-                                    diagContext, prefs, diagnostics,
-                                    micFatalState, micLoopOn, micLive, lastCrash
-                                )
-                                val cm = diagContext.getSystemService(Context.CLIPBOARD_SERVICE)
-                                    as ClipboardManager
-                                cm.setPrimaryClip(
-                                    ClipData.newPlainText("Jarvis diagnostics", report)
-                                )
-                                copiedNote = "Copied — ab mujhe paste kar do."
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
-                        ) {
-                            Text("Copy bug report", color = Color.White, fontSize = 12.sp)
-                        }
-                        Button(
-                            onClick = {
-                                JarvisStateRepository.clearDiagnostics()
-                                lastCrash = null
-                                copiedNote = "Diagnostics cleared."
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
-                        ) {
-                            Text("Clear", color = Color.White, fontSize = 12.sp)
-                        }
-                    }
-                    if (copiedNote.isNotBlank()) {
-                        Text(copiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
-                    }
-                    diagnostics.takeLast(20).reversed().forEach { entry ->
-                        Text(
-                            text = "[${entry.time}] ${entry.area}/${entry.code}: ${entry.message}",
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = Color(0xFF8A7A70)
-                        )
-                    }
-                }
-            }
-        }
+
     }
 }
 
@@ -2009,9 +2169,30 @@ private fun buildDiagnosticsReport(
             "(full key NEVER included)"
     )
     sb.appendLine("Provider: ${prefs.provider.displayName} · Model: ${prefs.modelName} · Key saved: ${prefs.apiKey.isNotBlank()}")
+    // 1.4.3 gates: STT path + transcript script + last lifecycle
+    // markers (decide crash vs agent-HOME vs system kill), then
+    // the PREVIOUS SESSION's persisted file lines — the in-memory
+    // list above dies with the process, but diagnostics.jsonl
+    // survives it, so a post-death report still holds the trail.
+    val sttPathNow = com.jarvis.autonomous.data.JarvisStateRepository.sttPath.value
+    val sttReasonNow = com.jarvis.autonomous.data.JarvisStateRepository.sttPathReason.value
+    val scriptNow = com.jarvis.autonomous.data.JarvisStateRepository.lastTranscriptScript.value
+    sb.appendLine("STT: path=$sttPathNow · reason=$sttReasonNow · last transcript script=$scriptNow")
+    val lastLife = diagnostics.lastOrNull { it.code.startsWith("LIFE_") }
+    val lastSpk = diagnostics.lastOrNull { it.code.startsWith("SPK_") }
+    val lastNav = diagnostics.lastOrNull { it.code.startsWith("NAV_") }
+    sb.appendLine(
+        "Last lifecycle: ${lastLife?.let { "${it.code} @ ${it.time} (${it.message})" } ?: "none"} · " +
+            "Last speak: ${lastSpk?.let { "${it.code} @ ${it.time} (${it.message})" } ?: "none"} · " +
+            "Last nav: ${lastNav?.let { "${it.code} @ ${it.time} (${it.message})" } ?: "none"}"
+    )
     sb.appendLine("--- last diagnostics (max 50) ---")
     diagnostics.takeLast(50).forEach { entry ->
         sb.appendLine("[${entry.time}] ${entry.area}/${entry.code}: ${entry.message}")
+    }
+    sb.appendLine("--- previous session (persisted file, survives process death, last 30) ---")
+    com.jarvis.autonomous.data.JarvisDiagnosticsFile.readLast(30).forEach { line ->
+        sb.appendLine(line)
     }
     sb.appendLine("--- last crash ---")
     sb.appendLine(lastCrash ?: "none")

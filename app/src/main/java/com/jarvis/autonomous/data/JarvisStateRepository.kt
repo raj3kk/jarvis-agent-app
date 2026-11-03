@@ -103,13 +103,39 @@ object JarvisStateRepository {
     private val _micListening = MutableStateFlow(false)
     val micListening: StateFlow<Boolean> = _micListening.asStateFlow()
 
+    // 1.4.3: live STT path (deepgram|system) + switch reason +
+    // last Deepgram transcript script, written by the mic manager
+    // (and mirrored by the service's onSttPathChanged), read by
+    // the Diagnostics report. Values only — never a key.
+    private val _sttPath = MutableStateFlow("system")
+    val sttPath: StateFlow<String> = _sttPath.asStateFlow()
+
+    private val _sttPathReason = MutableStateFlow("not started")
+    val sttPathReason: StateFlow<String> = _sttPathReason.asStateFlow()
+
+    private val _lastTranscriptScript = MutableStateFlow("latin")
+    val lastTranscriptScript: StateFlow<String> = _lastTranscriptScript.asStateFlow()
+
+    fun setSttPath(path: String, reason: String) {
+        _sttPath.value = path
+        _sttPathReason.value = reason
+    }
+
+    fun setLastTranscriptScript(script: String) {
+        _lastTranscriptScript.value = script
+    }
+
     /** Strip anything that could carry a secret: ?key= / &key= query
      *  params and full URLs with query strings are reduced to the
-     *  path, so a request URL can never leak a key into a report. */
+     *  path, so a request URL can never leak a key into a report.
+     *  1.4.3: also strips "Authorization: Token ..." header values
+     *  (Deepgram) and any token-like value after the word Token. */
     fun sanitizeDiagnosticMessage(raw: String): String {
         var out = raw
         out = out.replace(Regex("[?&]key=[^&\\s]*"), "")
         out = out.replace(Regex("https?://[^\\s]*\\?[^\\s]*"), "[url-with-query-stripped]")
+        out = out.replace(Regex("(?i)Authorization:\\s*Token\\s+[^\\s]+"), "Authorization: Token [redacted]")
+        out = out.replace(Regex("(?i)Token\\s+[A-Za-z0-9._\\-]{16,}"), "Token [redacted]")
         return out.take(500)
     }
 

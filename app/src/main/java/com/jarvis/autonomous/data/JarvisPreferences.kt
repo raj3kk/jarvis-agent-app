@@ -97,6 +97,14 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getBoolean("kokoro_enabled", true)
         set(value) = prefs.edit().putBoolean("kokoro_enabled", value).apply()
 
+    // 1.4.3: Deepgram STT key (listening/transcription ONLY —
+    // speaking stays bundled Kokoro; Deepgram TTS/Aura is never
+    // used). Stored on the phone, never in the APK or repo, never
+    // logged. Empty = Deepgram unavailable -> system fallback.
+    var deepgramApiKey: String
+        get() = prefs.getString("deepgram_api_key", "") ?: ""
+        set(value) = prefs.edit().putString("deepgram_api_key", value.trim()).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the

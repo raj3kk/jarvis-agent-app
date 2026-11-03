@@ -19,6 +19,7 @@ import com.jarvis.autonomous.service.JarvisNotificationService
 import com.jarvis.autonomous.service.ScreenSnapshot
 import com.jarvis.autonomous.ui.BrowserBrowseStatus
 import com.jarvis.autonomous.ui.JarvisBackgroundBrowser
+import com.jarvis.autonomous.voice.TurnDetector
 import com.jarvis.autonomous.ui.LICENCE_SERVER_URL
 import com.jarvis.autonomous.ui.LicencePrefs
 import com.jarvis.autonomous.ui.normalizeBrowserUrl
@@ -547,7 +548,11 @@ class JarvisAgentEngine(
         if (trimmed.isEmpty()) return
 
         // Check for immediate stop command
-        val lower = trimmed.lowercase()
+        // 1.4.3: transliterate ONLY the matching variable so a
+        // Devanagari transcript ("रुक", "दिखाओ") matches the
+        // Latin keyword lists. `trimmed` (original) still feeds
+        // display + LLM paths below — never the transliteration.
+        val lower = TurnDetector.transliterateDevanagariKeywords(trimmed.lowercase())
         if (lower in listOf("stop", "ruk ja", "ruko", "cancel", "jarvis stop", "bas kar")) {
             cancelActiveTask("Stopped on voice command.")
             scope.launch { speak("Theek hai bhai, ruk gaya.") }
@@ -1101,6 +1106,22 @@ class JarvisAgentEngine(
                         )
                         replyWasSpoken = speak(decision.reply)
                     }
+                } else if (decision.isCompleted || decision.askUser) {
+                    // 1.4.3: a FINAL answer / question that arrives
+                    // BLANK must not pass in silence (the old
+                    // guard-only path). Speak a fixed fallback line
+                    // as an audible marker. replyWasSpoken stays
+                    // false on purpose: the fallback is NOT the
+                    // (blank) question, so no answer is waited for
+                    // — the existing pause path below still runs.
+                    JarvisStateRepository.addLog(
+                        "Blank final reply — speaking fallback line instead of silence."
+                    )
+                    JarvisStateRepository.setAgentState(
+                        AgentRunState.SPEAKING,
+                        "Speaking: fallback (blank reply)"
+                    )
+                    speak("Samajh gaya, aage badh raha hoon.")
                 }
 
                 // If Jarvis needs to ask the user a mid-task question, listen for reply and continue

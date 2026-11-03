@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -83,6 +84,14 @@ class VoiceManager(
     private var pendingSingleReplyCallback: ((String?) -> Unit)? = null
     /** B-M13: ALL speaks serialise through this mutex. */
     private val speakMutex = Mutex()
+    /**
+     * 1.4.3: true while a Kokoro utterance is playing. Mic-tap
+     * paths read this to QUEUE listening until TTS ends instead
+     * of cutting speech mid-word (the old stopSpeaking() on tap
+     * was a top "bolti hi nahi / band ho jati hai" cause).
+     */
+    @Volatile
+    private var speakInProgress: Boolean = false
     /** A-H6: the single cancellable wake-word restart handle. */
     private var restartRunnable: Runnable? = null
     /** A-H6: last recognizer start, for the 150ms double-start guard. */
@@ -114,9 +123,11 @@ class VoiceManager(
             // B-M13: transient audio focus per utterance, so music
             // / other audio ducks for exactly this utterance.
             val focus = requestTransientFocus()
+            speakInProgress = true
             val ok = try {
                 KokoroTtsClient.speak(context, text)
             } finally {
+                speakInProgress = false
                 abandonFocus(focus)
             }
             if (!ok) {
@@ -141,9 +152,23 @@ class VoiceManager(
     }
 
     fun stopSpeaking() {
+        stopSpeaking("unspecified (legacy call)")
+    }
+
+    /**
+     * 1.4.3: EVERY speak abort is logged with its cause — the old
+     * silent stop made "bolti hi nahi / band ho jati hai"
+     * undebuggable. Only explicit stops (barge-in keyword,
+     * STOP_TASK) cut speech; mic taps queue instead (see
+     * triggerManualVoiceCommand / listenForSingleReply).
+     */
+    fun stopSpeaking(reason: String) {
         // B-M13: stops only the utterance currently playing.
         // Queued speaks (waiting on speakMutex) are untouched —
         // Stop never cancels the whole queue.
+        JarvisStateRepository.addDiagnostic(
+            "tts", "SPEAK_ABORT", "Speech stopped: $reason"
+        )
         KokoroTtsClient.stopPlayback()
     }
 
@@ -211,9 +236,19 @@ class VoiceManager(
             return null
         }
         return withTimeoutOrNull(12_000L) {
+            // 1.4.3: queue BEHIND any playing TTS instead of
+            // cutting it — the old stopSpeaking() here was why
+            // Jarvis "bolti hi nahi / band ho jati hai" when the
+            // user tapped mic mid-speech. Wait up to 8s for the
+            // utterance to finish, then listen without stopping.
+            val waitStart = System.currentTimeMillis()
+            while (speakInProgress &&
+                System.currentTimeMillis() - waitStart < 8_000L
+            ) {
+                delay(200L)
+            }
             suspendCancellableCoroutine { cont ->
             mainHandler.post {
-                stopSpeaking()
                 pendingSingleReplyCallback = { recognizedText ->
                     if (cont.isActive) cont.resume(recognizedText)
                 }
@@ -239,25 +274,36 @@ class VoiceManager(
             )
             return
         }
-        mainHandler.post {
-            stopSpeaking()
-            JarvisStateRepository.setAgentState(
-                AgentRunState.LISTENING,
-                "Listening... बोलो भाई क्या करना है?"
-            )
-            pendingSingleReplyCallback = { text ->
-                if (!text.isNullOrBlank()) {
-                    onWakeCommandDetected(text)
-                } else {
-                    JarvisStateRepository.setAgentState(
-                        AgentRunState.IDLE,
-                        "Didn't catch that. Tap Core to speak."
-                    )
-                    if (prefs.wakeWordEnabled) startWakeWordListening()
+        // 1.4.3: a mic tap during TTS QUEUES listening until the
+        // utterance ends — it never cuts speech. Only an explicit
+        // stop (voice "ruk"/"bas", STOP button) stops TTS.
+        val startTapListening = object : Runnable {
+            var tries = 0
+            override fun run() {
+                if (speakInProgress && tries < 32) {
+                    tries++
+                    mainHandler.postDelayed(this, 250L)
+                    return
                 }
+                JarvisStateRepository.setAgentState(
+                    AgentRunState.LISTENING,
+                    "Listening... बोलो भाई क्या करना है?"
+                )
+                pendingSingleReplyCallback = { text ->
+                    if (!text.isNullOrBlank()) {
+                        onWakeCommandDetected(text)
+                    } else {
+                        JarvisStateRepository.setAgentState(
+                            AgentRunState.IDLE,
+                            "Didn't catch that. Tap Core to speak."
+                        )
+                        if (prefs.wakeWordEnabled) startWakeWordListening()
+                    }
+                }
+                startRecognizerInternal(isSingleShot = true)
             }
-            startRecognizerInternal(isSingleShot = true)
         }
+        mainHandler.post(startTapListening)
     }
 
     fun startWakeWordListening() {

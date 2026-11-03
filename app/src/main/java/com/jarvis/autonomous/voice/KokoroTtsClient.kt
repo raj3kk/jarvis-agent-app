@@ -12,6 +12,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -645,7 +646,20 @@ object KokoroTtsClient {
         withContext(Dispatchers.IO) {
             try {
                 val samples = audio.samples
-                if (samples.isEmpty()) return@withContext true
+                // 1.4.3: empty audio is a FAILURE, never a silent
+                // "success" — the old `return true` made Jarvis
+                // look like it spoke while nothing was heard, and
+                // the chat-only fallback never fired.
+                if (samples.isEmpty()) {
+                    JarvisStateRepository.addLog(
+                        "Kokoro playback failed: empty audio — nothing to play."
+                    )
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "EMPTY_AUDIO",
+                        "Kokoro generated zero samples — treated as failure, not success."
+                    )
+                    return@withContext false
+                }
                 val pcm = ByteArray(samples.size * 2)
                 for (i in samples.indices) {
                     val v = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767)
@@ -653,35 +667,84 @@ object KokoroTtsClient {
                     pcm[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
                 }
                 val rate = audio.sampleRate.takeIf { it > 0 } ?: 24000
-                val minBuf = AudioTrack.getMinBufferSize(
-                    rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                // 1.4.3: AudioTrack init/write failure gets ONE
+                // retry with a doubled buffer before giving up,
+                // and the exact exception is recorded — a dead
+                // track must never look like a finished utterance.
+                val played = playTrackOnce(pcm, rate, bufferScale = 1)
+                if (played || stopped.get()) return@withContext played
+                JarvisStateRepository.addLog(
+                    "Kokoro playback retrying once with a doubled AudioTrack buffer."
                 )
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setSampleRate(rate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(maxOf(minBuf, pcm.size))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
+                playTrackOnce(pcm, rate, bufferScale = 2)
+            } catch (e: Exception) {
+                JarvisStateRepository.addLog("Kokoro playback failed: ${e.message}")
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "PLAYBACK_ERROR",
+                    "Kokoro playback failed: ${e.javaClass.simpleName}: ${e.message ?: ""}"
+                )
+                false
+            }
+        }
+
+    /**
+     * One AudioTrack play attempt. Returns true only when the full
+     * buffer was written and played (or playback was explicitly
+     * stopped, which the caller treats as "not failed, not
+     * played" via the stopped flag). Throws on init failure so
+     * the caller can log + retry; a short write is a failure.
+     */
+    private fun playTrackOnce(pcm: ByteArray, rate: Int, bufferScale: Int): Boolean {
+        val minBuf = AudioTrack.getMinBufferSize(
+            rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
-                currentTrack = track
-                track.play()
-                var offset = 0
-                while (offset < pcm.size && !stopped.get()) {
-                    val written = track.write(pcm, offset, pcm.size - offset)
-                    if (written <= 0) break
-                    offset += written
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(rate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuf * bufferScale, pcm.size))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        try {
+            currentTrack = track
+            track.play()
+            var offset = 0
+            var writeFailed = false
+            while (offset < pcm.size && !stopped.get()) {
+                val written = track.write(pcm, offset, pcm.size - offset)
+                if (written < 0) {
+                    writeFailed = true
+                    break
                 }
-                val frames = pcm.size / 2
+                if (written == 0) {
+                    // Avoid a hot spin on a track that accepts
+                    // nothing; treat as a failed write.
+                    Thread.sleep(10L)
+                    writeFailed = true
+                    break
+                }
+                offset += written
+            }
+            if (stopped.get()) return false
+            if (writeFailed || offset < pcm.size) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "WRITE_FAIL",
+                    "AudioTrack wrote $offset/${pcm.size} bytes (scale=$bufferScale) — playback incomplete."
+                )
+                return false
+            }
+            val frames = pcm.size / 2
+            runBlocking {
                 withTimeoutOrNull(60_000L) {
                     while (!stopped.get() &&
                         track.playState == AudioTrack.PLAYSTATE_PLAYING &&
@@ -690,12 +753,11 @@ object KokoroTtsClient {
                         delay(50L)
                     }
                 }
-                runCatching { track.stop(); track.release() }
-                if (currentTrack == track) currentTrack = null
-                !stopped.get()
-            } catch (e: Exception) {
-                JarvisStateRepository.addLog("Kokoro playback failed: ${e.message}")
-                false
             }
+            return !stopped.get()
+        } finally {
+            runCatching { track.stop(); track.release() }
+            if (currentTrack == track) currentTrack = null
         }
+    }
 }
