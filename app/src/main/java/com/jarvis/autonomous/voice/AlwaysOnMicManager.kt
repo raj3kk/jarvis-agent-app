@@ -204,6 +204,19 @@ class AlwaysOnMicManager(
     @Volatile
     private var deepgramSuspended: Boolean = false
     private var deepgramFallbackTried: Boolean = false
+    // 1.4.5 cascade fix (1.4.1 regression: terminal stop killed
+    // listening permanently on the first network/server blip —
+    // the user's "listen band ho gaya" cascade start). Two
+    // bounded escapes before a terminal stop: (a) reverse
+    // fallback system -> Deepgram, once per start(); (b) bounded
+    // retry of transient NETWORK/SERVER errors (3 x 30 s).
+    // Both are observed (diagnostics) and both terminate:
+    // reverse fallback is once-only, retries are capped, and
+    // fallbackToSystem refuses to restart a system path that
+    // already failed terminally (both-paths-exhausted stop).
+    private var systemToDeepgramTried: Boolean = false
+    private var terminalRetryCount: Int = 0
+    private var terminalRetryRunnable: Runnable? = null
     @Volatile
     private var lastSpeechMs: Long = 0L
     private var vadSegmentCallback: ((SpeechSegment) -> Unit)? = null
@@ -327,6 +340,9 @@ class AlwaysOnMicManager(
         override fun onReadyForSpeech(params: Bundle?) {
             listeningActive = true
             consecutiveErrorCount = 0
+            // 1.4.5: session progress clears the terminal retry
+            // budget too — the path is alive again.
+            terminalRetryCount = 0
             listener.onListeningStateChanged(true)
         }
 
@@ -370,7 +386,34 @@ class AlwaysOnMicManager(
             if (!enabled) return
             // A-H4: terminal errors stop the loop and surface
             // onMicError — they are never silently retried.
+            // 1.4.5 cascade fix: "never silently retried" does NOT
+            // mean "die on the first transient blip". Before the
+            // terminal stop, two bounded escapes run (in order):
+            // (a) reverse fallback to Deepgram when it is
+            // configured (the pre-1.4.5 code only fell
+            // Deepgram -> system, never system -> Deepgram, so a
+            // system NETWORK death killed listening even with a
+            // working Deepgram key saved); (b) bounded retry of
+            // transient NETWORK/SERVER errors (3 x 30 s) when no
+            // Deepgram path exists. Both are diagnosed; if both
+            // are exhausted, the loop stops with onMicError and
+            // the banner/Retry exactly as before.
             if (error in TERMINAL_RECOGNIZER_ERRORS) {
+                if (tryReverseFallbackToDeepgram()) return
+                if ((error == SpeechRecognizer.ERROR_NETWORK ||
+                        error == SpeechRecognizer.ERROR_SERVER) &&
+                    terminalRetryCount < TERMINAL_RETRY_MAX
+                ) {
+                    terminalRetryCount++
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "TERMINAL_RETRY",
+                        "System recognizer terminal error $error — " +
+                            "retry $terminalRetryCount/$TERMINAL_RETRY_MAX in " +
+                            "${TERMINAL_RETRY_DELAY_MS / 1000}s (transient backend)."
+                    )
+                    scheduleTerminalRetry()
+                    return
+                }
                 stopWithError("Recognizer error $error (terminal) — mic loop stopped.")
                 return
             }
@@ -411,6 +454,9 @@ class AlwaysOnMicManager(
         override fun onResults(results: Bundle?) {
             listeningActive = false
             consecutiveErrorCount = 0
+            // 1.4.5: a real transcript clears the terminal retry
+            // budget too — the path is alive again.
+            terminalRetryCount = 0
             listener.onListeningStateChanged(false)
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val finalText = matches?.firstOrNull()?.trim() ?: ""
@@ -476,6 +522,12 @@ class AlwaysOnMicManager(
         turnDetector.reset()
         resetLanguageToPrimary()
         deepgramFallbackTried = false
+        // 1.4.5: fresh start() resets the cascade guards — a new
+        // start gets one reverse fallback and a fresh retry budget.
+        systemToDeepgramTried = false
+        terminalRetryCount = 0
+        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        terminalRetryRunnable = null
         val key = deepgramKey()
         if (key.isNotBlank() && hasNetwork()) {
             sttPath = "deepgram"
@@ -543,6 +595,17 @@ class AlwaysOnMicManager(
      */
     private fun fallbackToSystem(reason: String) {
         if (!enabled) return
+        // 1.4.5 ping-pong guard: if the system path already
+        // failed terminally this start (reverse fallback already
+        // ran), restarting it now would only die again — stop
+        // with both paths named instead of looping forever.
+        if (systemToDeepgramTried) {
+            stopWithError(
+                "Both STT paths exhausted (Deepgram failed, system " +
+                    "already failed terminally) — mic loop stopped."
+            )
+            return
+        }
         stopDeepgramStream()
         sttPath = "system"
         sttPathReason = "Deepgram unavailable ($reason) — listening via system mic"
@@ -743,6 +806,11 @@ class AlwaysOnMicManager(
         restartPending = false
         restartRunnable?.let { mainHandler.removeCallbacks(it) }
         restartRunnable = null
+        // 1.4.5: a pending terminal retry must never revive a
+        // stopped loop either.
+        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        terminalRetryRunnable = null
+        terminalRetryCount = 0
         consecutiveErrorCount = 0
         quarantinedWhileSpeaking.clear()
         speakingDepth = 0
@@ -773,6 +841,10 @@ class AlwaysOnMicManager(
         restartPending = false
         restartRunnable?.let { mainHandler.removeCallbacks(it) }
         restartRunnable = null
+        // 1.4.5: terminal stop also cancels any pending terminal
+        // retry (it must not restart a loop that just stopped).
+        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        terminalRetryRunnable = null
         mainHandler.removeCallbacks(turnCheckRunnable)
         runCatching { speechRecognizer?.cancel() }
         runCatching { speechRecognizer?.destroy() }
@@ -1013,6 +1085,46 @@ class AlwaysOnMicManager(
     }
 
     /**
+     * 1.4.5 reverse fallback: system -> Deepgram, once per
+     * start(). Returns true when the switch happened (caller
+     * must NOT stop the loop). Only when the loop is on the
+     * system path, Deepgram has never been tried this start, a
+     * key is saved, and network is present. The Deepgram side
+     * keeps its own failure path (fallbackToSystem), which
+     * refuses to restart a terminally-failed system path (see
+     * its both-paths-exhausted guard) — so no ping-pong.
+     */
+    private fun tryReverseFallbackToDeepgram(): Boolean {
+        if (sttPath != "system" || systemToDeepgramTried) return false
+        val key = deepgramKey()
+        if (key.isBlank() || !hasNetwork()) return false
+        systemToDeepgramTried = true
+        sttPath = "deepgram"
+        sttPathReason = "System recognizer failed terminally — listening via Deepgram"
+        JarvisStateRepository.setSttPath("deepgram", sttPathReason)
+        JarvisStateRepository.addDiagnostic("stt", "REVERSE_FALLBACK", sttPathReason)
+        listener.onSttPathChanged("deepgram", sttPathReason)
+        startDeepgram(key)
+        return true
+    }
+
+    /**
+     * 1.4.5 bounded terminal retry: one held 30 s runnable.
+     * Cancelled by stop()/stopWithError() and by any later
+     * session progress (onReady/onResults) — a retry can never
+     * revive a loop the user stopped.
+     */
+    private fun scheduleTerminalRetry() {
+        terminalRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            terminalRetryRunnable = null
+            if (enabled) startRecognizerSession()
+        }
+        terminalRetryRunnable = runnable
+        mainHandler.postDelayed(runnable, TERMINAL_RETRY_DELAY_MS)
+    }
+
+    /**
      * A-H4/A-H5: escalating backoff for counted (non-transient)
      * errors, RECOGNIZER_BUSY included — no fixed-delay bypass.
      * Delay doubles per consecutive error (150ms, 300ms, 600ms…
@@ -1057,6 +1169,9 @@ class AlwaysOnMicManager(
         const val RESTART_GUARD_MS: Long = 150L
         /** A-H4/A-H5: counted errors before the loop stops itself. */
         const val MAX_CONSECUTIVE_ERRORS: Int = 10
+        /** 1.4.5: bounded terminal retries (NETWORK/SERVER only). */
+        const val TERMINAL_RETRY_MAX: Int = 3
+        const val TERMINAL_RETRY_DELAY_MS: Long = 30_000L
         /** B-C3: cap on transcripts held while speaking. */
         const val MAX_QUARANTINED: Int = 20
         /** 1.4.3: silence after which the Deepgram WS suspends
@@ -1064,8 +1179,7 @@ class AlwaysOnMicManager(
         const val IDLE_SUSPEND_MS: Long = 120_000L
 
         /** A-H4: terminal recognizer errors — stop, never retry. */
-        val TERMINAL_RECOGNIZER_ERRORS: Set<Int> = setOf(
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
+        val TERMINAL_RECOGNIZER_ERRORS: Set<Int> = setOf(            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
             SpeechRecognizer.ERROR_CLIENT,
             SpeechRecognizer.ERROR_NETWORK,
             SpeechRecognizer.ERROR_SERVER,

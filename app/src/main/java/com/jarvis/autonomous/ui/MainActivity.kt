@@ -116,6 +116,7 @@ import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.KokoroTtsClient
+import com.jarvis.autonomous.voice.TtsProcessClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -1745,17 +1746,19 @@ fun AiBrainSettingsScreen(
                     ) {
                         Text(if (kokoroReady) "Use Kokoro Voice" else "Kokoro setup karo (bundled copy, no download)")
                     }
-                    // B-C1 reset path: corrupt copy? Delete the
-                    // whole model dir and re-copy bundled assets
-                    // fresh — this is the Settings retry that
-                    // actually fixes a bad copy, not just re-checks it.
+                    // 1.4.5 REDO: reset runs in the :tts process
+                    // (TtsProcessClient.reset) — the engine lives
+                    // there, so a main-process delete of the shared
+                    // model dir under a loaded engine would be a
+                    // native use-after-delete. Progress streams
+                    // from :tts exactly as before.
                     Button(
                         enabled = !kokoroWorking,
                         onClick = {
                             kokoroWorking = true
                             kokoroProgress = "Reset ho raha hai — purana model delete, dobara copy…"
                             kokoroScope.launch {
-                                val result = KokoroTtsClient.resetAndCopy(kokoroContext) { stage, copied, total ->
+                                val ok = TtsProcessClient.reset(kokoroContext) { stage, copied, total ->
                                     kokoroScope.launch {
                                         kokoroProgress = when (stage) {
                                             "checking_space" -> "Storage check ho raha hai…"
@@ -1765,14 +1768,13 @@ fun AiBrainSettingsScreen(
                                     }
                                 }
                                 kokoroWorking = false
-                                if (result.isSuccess) {
+                                if (ok) {
                                     kokoroReady = true
                                     kokoroProgress = "Kokoro reset complete ✅ — fresh copy taiyaar."
                                     kokoroOn = true
                                 } else {
                                     kokoroReady = false
-                                    kokoroProgress = result.exceptionOrNull()?.message
-                                        ?: "Kokoro reset fail ho gaya."
+                                    kokoroProgress = "Kokoro reset fail ho gaya."
                                 }
                             }
                         },

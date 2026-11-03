@@ -393,10 +393,18 @@ object KokoroTtsClient {
     }
 
     /**
-     * B-C1 reset path, callable from the Settings retry button:
-     * releases the engine, deletes the whole model dir, then
-     * re-copies bundled assets fresh. A corrupt copy is never
-     * "repaired" by re-verifying it in place — it is replaced.
+     * B-C1 reset path, callable from the Settings retry button
+     * VIA TtsProcessClient.reset (1.4.5): releases the engine,
+     * deletes the whole model dir, then re-copies bundled assets
+     * fresh. A corrupt copy is never "repaired" by re-verifying
+     * it in place — it is replaced.
+     *
+     * 1.4.5: this MUST run in the :tts process (KokoroTtsService
+     * MSG_RESET) — never call it directly from the main process.
+     * The engine lives in :tts; a main-process delete of the
+     * shared model dir under a loaded engine is a native
+     * use-after-delete. Main-process callers use
+     * TtsProcessClient.reset() instead.
      */
     suspend fun resetAndCopy(
         context: Context,
@@ -463,36 +471,61 @@ object KokoroTtsClient {
             "tts", "SPK_ENGINE_START",
             "Kokoro engine load started (native model load)."
         )
-        // B-C1: engine-init failure is NOT terminal. A corrupt
-        // model dir is deleted and re-copied fresh, then the
-        // engine is retried once — speak() must never return
-        // false forever on a dir that a fresh copy would fix.
-        // Playback/generation failures below do NOT delete the
-        // model (they are not model-corruption evidence).
+        // 1.4.5 REDO — init-failure handling split by EVIDENCE.
+        // The old code deleted + recopied the whole ~190 MB dir
+        // on EVERY init failure, so a deterministically-broken
+        // init (ABI/ONNX fault, OOM, or a bundle file the copy
+        // itself cannot supply) recopied 190 MB on every single
+        // utterance and re-entered the native death window each
+        // time. Now: size verification FAILED (isDownloaded
+        // false) = real corruption evidence -> ensureAssetsReady
+        // (recopies ONLY mismatched files, never a blind
+        // whole-dir delete) + one retry; sizes verify OK but
+        // init still throws = NOT corruption -> fail fast with
+        // the exact init error, dir untouched. The explicit
+        // Settings reset (routed via :tts) remains the recovery
+        // for a genuinely bad bundle.
         val tts = try {
             getEngine(context)
         } catch (e: Exception) {
-            JarvisStateRepository.addLog(
-                "Kokoro engine init failed (${e.message}) — deleting " +
-                    "model dir and forcing a fresh bundled copy."
+            JarvisStateRepository.addDiagnostic(
+                "tts", "ENGINE_INIT_FAIL",
+                "Kokoro engine init failed: ${e.javaClass.simpleName}: ${e.message ?: ""}."
             )
-            val recoveredTts = if (resetAndCopy(context).isSuccess) {
-                runCatching { getEngine(context) }.getOrNull()
-            } else {
-                null
-            }
-            if (recoveredTts == null) {
+            if (!isDownloaded(context)) {
                 JarvisStateRepository.addLog(
-                    "Kokoro still unavailable after fresh copy — no " +
-                        "fallback voice in the Kokoro-only build."
+                    "Kokoro init failed with size mismatch — recopying only mismatched files."
+                )
+                val ready = ensureAssetsReady(context)
+                val recoveredTts = if (ready.isSuccess) {
+                    runCatching { getEngine(context) }.getOrNull()
+                } else {
+                    null
+                }
+                if (recoveredTts == null) {
+                    JarvisStateRepository.addLog(
+                        "Kokoro still unavailable after recopy — no " +
+                            "fallback voice in the Kokoro-only build."
+                    )
+                    JarvisStateRepository.addDiagnostic(
+                        "tts", "SPK_ENGINE_END",
+                        "Kokoro engine unavailable after recopy."
+                    )
+                    return false
+                }
+                recoveredTts
+            } else {
+                JarvisStateRepository.addLog(
+                    "Kokoro init failed with verified sizes — NOT " +
+                        "deleting the model dir (cause is not corruption; " +
+                        "use Settings reset if the bundle itself is bad)."
                 )
                 JarvisStateRepository.addDiagnostic(
                     "tts", "SPK_ENGINE_END",
-                    "Kokoro engine unavailable after fresh copy."
+                    "Kokoro engine init failed with verified sizes — failing fast, dir untouched."
                 )
                 return false
             }
-            recoveredTts
         }
         JarvisStateRepository.addDiagnostic(
             "tts", "SPK_ENGINE_END",

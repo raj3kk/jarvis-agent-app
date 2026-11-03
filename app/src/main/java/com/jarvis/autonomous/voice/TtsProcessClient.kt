@@ -79,6 +79,7 @@ object TtsProcessClient {
     private var connection: ServiceConnection? = null
     private var bound: Boolean = false
     private var pending: CompletableDeferred<Outcome>? = null
+    private var pendingProgress: ((String, Long, Long) -> Unit)? = null
 
     private val replyMessenger = Messenger(
         Handler(Looper.getMainLooper(), Handler.Callback { msg ->
@@ -87,7 +88,14 @@ object TtsProcessClient {
                 synchronized(lock) {
                     pending?.complete(Outcome(ok, false))
                     pending = null
+                    pendingProgress = null
                 }
+                true
+            } else if (msg.what == KokoroTtsService.MSG_PROGRESS) {
+                val stage = msg.data?.getString(KokoroTtsService.KEY_STAGE) ?: ""
+                val copied = msg.data?.getLong(KokoroTtsService.KEY_COPIED) ?: 0L
+                val total = msg.data?.getLong(KokoroTtsService.KEY_TOTAL) ?: 0L
+                synchronized(lock) { pendingProgress }?.invoke(stage, copied, total)
                 true
             } else {
                 false
@@ -103,6 +111,7 @@ object TtsProcessClient {
             bound = false
             pending?.complete(Outcome(false, true))
             pending = null
+            pendingProgress = null
         }
         lastFailure = FAIL_NATIVE_DIED
         JarvisStateRepository.addDiagnostic(
@@ -254,5 +263,81 @@ object TtsProcessClient {
             val msg = Message.obtain(null, KokoroTtsService.MSG_STOP)
             messenger.send(msg)
         }
+    }
+
+    /**
+     * 1.4.5 REDO: Settings "Kokoro reset" routed through the
+     * :tts process (never the main process — the engine lives
+     * in :tts, and a main-process delete of the shared model dir
+     * under a loaded engine is a native use-after-delete).
+     * Streams copy progress to [onProgress] (stage, copiedMB,
+     * totalMB). Returns true only on a fresh verified copy.
+     * Refused (false) while a speak is in flight — retry after
+     * speech ends. Same death/timeout handling as speak().
+     */
+    suspend fun reset(
+        context: Context,
+        onProgress: (String, Long, Long) -> Unit = { _, _, _ -> }
+    ): Boolean {
+        lastFailure = null
+        val appContext = context.applicationContext
+        if (!ensureBound(appContext)) {
+            lastFailure = FAIL_BIND
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_BIND_FAILED",
+                "Could not bind the isolated TTS process for reset."
+            )
+            return false
+        }
+        val deferred = CompletableDeferred<Outcome>()
+        synchronized(lock) {
+            if (pending != null) {
+                lastFailure = FAIL_BUSY
+                return false
+            }
+            pending = deferred
+            pendingProgress = onProgress
+        }
+        val sent = runCatching {
+            val msg = Message.obtain(null, KokoroTtsService.MSG_RESET)
+            msg.replyTo = replyMessenger
+            val messenger = synchronized(lock) { serviceMessenger }
+                ?: throw RemoteException("TTS service messenger gone")
+            messenger.send(msg)
+        }
+        if (sent.isFailure) {
+            synchronized(lock) {
+                if (pending == deferred) {
+                    pending = null
+                    pendingProgress = null
+                }
+            }
+            if (lastFailure == null) {
+                lastFailure = FAIL_BIND
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "TTS_BIND_FAILED",
+                    "TTS service messenger gone while sending reset."
+                )
+            }
+            return false
+        }
+        // A full 190 MB asset copy is slow (streaming
+        // decompress); 10 minutes is the generous bound — the
+        // death path, not the timeout, is the fast failure.
+        val outcome = withTimeoutOrNull(600_000L) { deferred.await() }
+        if (outcome == null) {
+            unbind(appContext)
+            lastFailure = FAIL_TIMEOUT
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_PROCESS_TIMEOUT",
+                "No TTS reset reply in 600s — unbound; next request rebinds fresh."
+            )
+            return false
+        }
+        if (outcome.died) {
+            lastFailure = FAIL_NATIVE_DIED
+            return false
+        }
+        return outcome.ok
     }
 }

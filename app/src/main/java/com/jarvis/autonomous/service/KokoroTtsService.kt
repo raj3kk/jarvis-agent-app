@@ -70,13 +70,18 @@ class KokoroTtsService : Service() {
     companion object {
         const val MSG_SPEAK = 1
         const val MSG_STOP = 2
+        const val MSG_RESET = 3
         const val MSG_DONE = 11
+        const val MSG_PROGRESS = 12
         const val KEY_TEXT = "text"
         const val KEY_OK = "ok"
         const val KEY_STAGE = "stage"
+        const val KEY_COPIED = "copied"
+        const val KEY_TOTAL = "total"
         const val STAGE_DONE = "done"
         const val STAGE_BUSY = "busy"
         const val STAGE_STOPPED = "stopped"
+        const val STAGE_RESET = "reset"
     }
 
     private lateinit var workerThread: HandlerThread
@@ -122,6 +127,38 @@ class KokoroTtsService : Service() {
                 // so STOP pre-empts playback between chunks and
                 // during AudioTrack writes via the stopped flag.
                 KokoroTtsClient.stopPlayback()
+                true
+            }
+            MSG_RESET -> {
+                // 1.4.5 REDO: the Settings reset MUST run here,
+                // in the :tts process — the old main-process call
+                // deleted the shared model dir while this process
+                // could hold a loaded engine (mmap'd files), a
+                // native use-after-delete. Refused while a speak
+                // is in flight (busy = retry after speech ends).
+                val replyTo = msg.replyTo
+                if (speakBusy.get()) {
+                    replyTo?.let { sendDone(it, false, STAGE_BUSY) }
+                } else {
+                    scope.launch {
+                        try {
+                            val result = KokoroTtsClient.resetAndCopy(applicationContext) { stage, copied, total ->
+                                runCatching {
+                                    val progress = Message.obtain(null, MSG_PROGRESS)
+                                    progress.data = android.os.Bundle().apply {
+                                        putString(KEY_STAGE, stage)
+                                        putLong(KEY_COPIED, copied)
+                                        putLong(KEY_TOTAL, total)
+                                    }
+                                    replyTo?.send(progress)
+                                }
+                            }
+                            replyTo?.let { sendDone(it, result.isSuccess, STAGE_RESET) }
+                        } catch (t: Throwable) {
+                            replyTo?.let { sendDone(it, false, STAGE_RESET) }
+                        }
+                    }
+                }
                 true
             }
             else -> false
