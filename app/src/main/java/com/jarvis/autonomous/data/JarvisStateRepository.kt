@@ -423,6 +423,13 @@ object JarvisStateRepository {
         }
     }
 
+    // 1.4.17: Live mode label only — sets the overlay/pill step
+    // line WITHOUT touching AgentRunState (Live is not an agent
+    // task, so setAgentState would misreport task state).
+    fun setCurrentStepInfo(text: String) {
+        _currentStepInfo.value = text
+    }
+
     fun setCurrentGoal(goal: String) {
         _currentGoal.value = goal
     }

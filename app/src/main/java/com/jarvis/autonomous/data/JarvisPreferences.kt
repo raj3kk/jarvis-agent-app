@@ -120,6 +120,18 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getString("deepgram_api_key", "") ?: ""
         set(value) = prefs.edit().putString("deepgram_api_key", value.trim()).apply()
 
+    // 1.4.17: Live mode (Gemini real-time conversation) toggle.
+    // Persisted ONLY by the AI Brain Save button, like every
+    // other setting here — flipping the toggle alone changes
+    // nothing until Save. Default false: the normal pipeline
+    // (Deepgram listening + Gemini text + Swara speaking) stays
+    // default. The service gates Live start on provider==GEMINI
+    // + a saved Gemini key + a live mic loop, so a stale true
+    // here can never start Live on its own.
+    var liveModeEnabled: Boolean
+        get() = prefs.getBoolean("live_mode_enabled", false)
+        set(value) = prefs.edit().putBoolean("live_mode_enabled", value).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the

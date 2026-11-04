@@ -319,6 +319,13 @@ class AlwaysOnMicManager(
     private var reconnectAttempt: Int = 0
     private var reconnectRunnable: Runnable? = null
     private var connectTimeoutRunnable: Runnable? = null
+    // 1.4.17: true while the loop is paused for Live mode. The
+    // loop stays enabled (so stop()/start() semantics are
+    // untouched) but scheduleReconnect()/enterReconnecting()
+    // no-op, the turn check only reschedules, and transcripts
+    // are dropped — the Live session owns the mic instead.
+    @Volatile
+    private var livePaused: Boolean = false
     // Wake-word session (Deepgram-only, loop OFF only — see A-H3
     // gate in startWakeListening): own client/record/pump.
     private var wakeClient: DeepgramSttClient? = null
@@ -458,6 +465,15 @@ class AlwaysOnMicManager(
     private val turnCheckRunnable = object : Runnable {
         override fun run() {
             if (!enabled) return
+            // 1.4.17: while Live owns the mic the turn check
+            // must NOT complete a stale pre-Live turn into the
+            // engine (no-action boundary). A run queued before
+            // the pause simply dies here (no reschedule) — the
+            // resume re-posts exactly one chain, so two chains
+            // can never run side by side.
+            if (livePaused) {
+                return
+            }
             if (isSpeaking) {
                 mainHandler.postDelayed(this, TurnThresholds.TURN_CHECK_INTERVAL_MS)
                 return
@@ -637,6 +653,7 @@ class AlwaysOnMicManager(
      */
     private fun enterReconnecting(reason: String) {
         if (!enabled || reconnecting) return
+        if (livePaused) return
         reconnecting = true
         listeningActive = false
         listener.onListeningStateChanged(false)
@@ -649,6 +666,7 @@ class AlwaysOnMicManager(
     }
 
     private fun scheduleReconnect() {
+        if (livePaused) return
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         val delayMs = (RECONNECT_BASE_MS * (1L shl reconnectAttempt.coerceAtMost(3)))
             .coerceAtMost(RECONNECT_MAX_MS)
@@ -716,6 +734,194 @@ class AlwaysOnMicManager(
 
     /** True when the stream is idle-suspended (pump alive, WS closed). */
     fun isDeepgramSuspended(): Boolean = deepgramSuspended
+
+    /** True while the loop is paused for a Live session. */
+    fun isLivePaused(): Boolean = livePaused
+
+    /**
+     * 1.4.17 Live handoff — snapshot of the loop state the
+     * resume must restore exactly. No wake/one-shot callback is
+     * stored here: wake is owned by VoiceManager and is never
+     * restarted while the loop is on (A-H3 gate), and a one-shot
+     * session is single-use by definition.
+     */
+    data class LivePauseSnapshot(
+        val wasEnabled: Boolean,
+        val wasReconnecting: Boolean,
+        val wasSuspended: Boolean,
+        val wasWakeActive: Boolean,
+        val wasOneShotActive: Boolean,
+        val reconnectAttempt: Int,
+        val lastSpeechMs: Long
+    )
+
+    /**
+     * 1.4.17: pauses the loop for a Live session. MUST be called
+     * on the main thread (the service's Live path runs on its
+     * main-dispatcher scope). Refuses (null) when the loop is
+     * not enabled. Order: snapshot first, then cancel the
+     * reconnect + connect-timeout runnables and set livePaused
+     * (so scheduleReconnect/enterReconnecting no-op from here
+     * on), stop wake + one-shot, stop only the VAD runLoop
+     * (monitor object + callback kept, NOT released), stop the
+     * Deepgram stream, reset the speaking state (depth=0,
+     * quarantine cleared), and PROVE the pump thread exited
+     * before returning: the pump owns the mic AudioRecord, so
+     * a Live AudioRecord created while it still runs would
+     * fight over the mic. If the pump is still alive after a
+     * 2 s join, the pause aborts: the loop is restored from the
+     * snapshot and null is returned (LIVE_PUMP_STUCK). This
+     * does NOT change stop()/start() semantics — enabled stays
+     * true and language is untouched. A stale partial turn is
+     * dropped by turnDetector.reset() + resetTurnAssembly()
+     * here, so it can never fire after the Live session ends.
+     */
+    fun pauseForLive(): LivePauseSnapshot? {
+        if (!enabled) return null
+        val snapshot = LivePauseSnapshot(
+            wasEnabled = enabled,
+            wasReconnecting = reconnecting,
+            wasSuspended = deepgramSuspended,
+            wasWakeActive = wakeActive,
+            wasOneShotActive = oneShotJob?.isActive == true,
+            reconnectAttempt = reconnectAttempt,
+            lastSpeechMs = lastSpeechMs
+        )
+        val pumpThread = deepgramPumpThread
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        cancelConnectTimeout()
+        mainHandler.removeCallbacks(turnCheckRunnable)
+        livePaused = true
+        stopWakeListening()
+        cancelListenOnce()
+        stopVadLoopOnly()
+        stopDeepgramStream()
+        speakingDepth = 0
+        isSpeaking = false
+        currentSpokenText = ""
+        quarantinedWhileSpeaking.clear()
+        turnDetector.reset()
+        resetTurnAssembly()
+        val drained = if (pumpThread == null || !pumpThread.isAlive) {
+            true
+        } else {
+            runCatching { pumpThread.join(2000L) }.isSuccess && !pumpThread.isAlive
+        }
+        if (drained) {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_PUMP_DRAINED",
+                "Deepgram pump thread exited before Live mic capture."
+            )
+            return snapshot
+        }
+        JarvisStateRepository.addDiagnostic(
+            "live", "LIVE_PUMP_STUCK",
+            "Deepgram pump thread still alive after 2s — Live aborted, loop restoring."
+        )
+        restoreFromLiveSnapshot(snapshot)
+        return null
+    }
+
+    /**
+     * 1.4.17: resumes the loop after a Live session ends. Call
+     * in a finally on EVERY Live end path. Restores exactly as
+     * the snapshot dictates: suspended -> resumeDeepgram
+     * ("live-exit"), which resets lastSpeechMs/lastResumeMs to
+     * now — mandatory, else the 120 s idle-suspend check fires
+     * instantly on stale timestamps; otherwise a fresh
+     * startDeepgram(key) equivalent. NEVER calls start()
+     * (that would reset turn assembly/language) and NEVER
+     * resets reconnectAttempt. The VAD monitor object survived
+     * the pause, so nothing is re-created; the pump restarts
+     * from Deepgram onOpen when none is alive. Wake is NOT
+     * restarted here: if the loop is back on, the A-H3 gate
+     * forbids wake beside it, and wake ownership sits with
+     * VoiceManager. If the loop was stopped mid-Live (mic-off
+     * wins), nothing is restored — the loop stays off. If the
+     * restore itself fails, the normal enterReconnecting path
+     * takes over — the mic is never left dead silently.
+     */
+    fun resumeFromLive(snapshot: LivePauseSnapshot) {
+        livePaused = false
+        if (!enabled) {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_RESUMED",
+                "Live ended with loop off (mic-off wins) — loop stays off."
+            )
+            return
+        }
+        reconnectAttempt = snapshot.reconnectAttempt
+        try {
+            if (snapshot.wasSuspended) {
+                // stopDeepgramStream cleared the flag during the
+                // pause; restore it so resumeDeepgram's guard
+                // (enabled + suspended) passes.
+                deepgramSuspended = true
+                resumeDeepgram("live-exit")
+                // resumeDeepgram posts no turn check (the chain
+                // was removed by the pause); startDeepgram below
+                // posts its own, so post here only.
+                mainHandler.postDelayed(
+                    turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS
+                )
+            } else {
+                val key = deepgramKey()
+                if (key.isBlank()) {
+                    reconnecting = false
+                    enterReconnecting("Live exit: Deepgram key missing — reconnecting.")
+                } else {
+                    // The pause may have frozen a reconnecting
+                    // flag (backoff cancelled, never cleared) —
+                    // clear it before the fresh connect, else a
+                    // failed connect strands the loop: the error
+                    // path's enterReconnecting would no-op on the
+                    // stale true and schedule no backoff.
+                    reconnecting = false
+                    startDeepgram(key)
+                }
+            }
+        } catch (e: Exception) {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_RESUME_FAILED",
+                "Live-exit loop restore threw (${e.javaClass.simpleName}) — entering reconnect."
+            )
+            reconnecting = false
+            enterReconnecting("Live exit restore failed — reconnecting.")
+        }
+        JarvisStateRepository.addDiagnostic(
+            "live", "LIVE_RESUMED",
+            "Loop restored after Live (wasSuspended=${snapshot.wasSuspended}, " +
+                "wasReconnecting=${snapshot.wasReconnecting})."
+        )
+    }
+
+    private fun restoreFromLiveSnapshot(snapshot: LivePauseSnapshot) {
+        livePaused = false
+        if (!enabled) return
+        reconnectAttempt = snapshot.reconnectAttempt
+        try {
+            if (snapshot.wasSuspended) {
+                deepgramSuspended = true
+                resumeDeepgram("live-abort")
+                mainHandler.postDelayed(
+                    turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS
+                )
+            } else {
+                val key = deepgramKey()
+                if (key.isBlank()) {
+                    reconnecting = false
+                    enterReconnecting("Live abort: Deepgram key missing — reconnecting.")
+                } else {
+                    reconnecting = false
+                    startDeepgram(key)
+                }
+            }
+        } catch (e: Exception) {
+            reconnecting = false
+            enterReconnecting("Live abort restore failed — reconnecting.")
+        }
+    }
 
     /**
      * VAD-independent resume (item 4): called from the pump's
@@ -1328,6 +1534,11 @@ class AlwaysOnMicManager(
         isFinal: Boolean,
         speechFinal: Boolean = false
     ) {
+        // 1.4.17: while Live owns the mic, a transcript runnable
+        // posted just before the pause must never feed a turn —
+        // the Deepgram client is already closed, so anything here
+        // is stale pre-Live audio.
+        if (livePaused) return
         if (text.isBlank()) {
             // A-M6: an empty session flips NOTHING — heard-nothing
             // is not a locale failure. The fallback fires only

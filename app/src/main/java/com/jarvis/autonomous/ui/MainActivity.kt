@@ -1491,6 +1491,19 @@ fun AiBrainSettingsScreen(
     var confirmSensitive by remember { mutableStateOf(prefs.confirmSensitiveActions) }
     var speakIntermediate by remember { mutableStateOf(prefs.speakIntermediateSteps) }
     var swaraOn by remember { mutableStateOf(prefs.swaraEnabled) }
+    // 1.4.17: Live mode toggle state — declared HERE with the
+    // other settings state, BEFORE the Save button's onClick
+    // lambda that reads it (declaration order, verified by
+    // line numbers). Local to this composable only; never
+    // referenced from CommandCenterScreen or the pill. Flipping
+    // the toggle alone changes nothing — the Save button below
+    // persists it and sends ACTION_START_LIVE / ACTION_STOP_LIVE
+    // (only when the toggle was actually touched in this
+    // composition, so a stale remember value can never
+    // resurrect a Live session stopped via the overlay pill).
+    var liveOn by remember { mutableStateOf(prefs.liveModeEnabled) }
+    var liveTouched by remember { mutableStateOf(false) }
+    var liveGateMessage by remember { mutableStateOf("") }
     var visionMode by remember { mutableStateOf(prefs.visionModeEnabled) }
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
@@ -1909,6 +1922,36 @@ fun AiBrainSettingsScreen(
                     checked = swaraOn,
                     onCheckedChange = { swaraOn = it }
                 )
+                // 1.4.17: Live mode — Gemini real-time baat-cheet.
+                // Directly after the Swara row. Gates run on the
+                // flip itself (toggle stays OFF with a message):
+                // mic loop must be ON, provider must be Gemini,
+                // and a Gemini key must be entered. The service
+                // re-checks the same gates on ACTION_START_LIVE.
+                SettingToggleRow(
+                    title = "Live Mode (Gemini real-time baat-cheet)",
+                    subtitle = "ON = mic loop rukega, Gemini se seedhi awaaz me baat hogi; koi phone action nahi hoga",
+                    checked = liveOn,
+                    onCheckedChange = {
+                        liveTouched = true
+                        if (!it) {
+                            liveOn = false
+                            liveGateMessage = ""
+                        } else if (!JarvisStateRepository.micLoopEnabled.value) {
+                            liveGateMessage = "Pehle mic on karo, phir Live on karo"
+                        } else if (selectedProvider != AiProvider.GEMINI ||
+                            apiKey.isBlank()
+                        ) {
+                            liveGateMessage = "Live sirf Gemini key par chalta hai — AI Brain me Gemini key save karo"
+                        } else {
+                            liveOn = true
+                            liveGateMessage = ""
+                        }
+                    }
+                )
+                if (liveGateMessage.isNotBlank()) {
+                    Text(liveGateMessage, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
                 SettingToggleRow(
                     title = "Speak Every Step (slower)",
                     subtitle = "OFF = fast: only final answers & questions are spoken, steps show in chat",
@@ -1973,6 +2016,7 @@ fun AiBrainSettingsScreen(
                 prefs.confirmSensitiveActions = confirmSensitive
                 prefs.speakIntermediateSteps = speakIntermediate
                 prefs.swaraEnabled = swaraOn
+                prefs.liveModeEnabled = liveOn
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 onSettingsUpdated()
@@ -1982,6 +2026,30 @@ fun AiBrainSettingsScreen(
                 // 1.4.12: Swara toggle-on reopens the latch
                 // (no-op when not latched or when OFF).
                 if (swaraOn) SwaraTtsClient.clearLatch("swara-toggle-on")
+                // 1.4.17: Live action ONLY when the toggle was
+                // actually touched in this composition — a stale
+                // remember value (e.g. Live stopped via the
+                // overlay pill while this screen was alive) must
+                // never resurrect or kill a session on an
+                // unrelated Save. START/STOP are idempotent in
+                // the service, so a repeat Save is harmless.
+                if (liveTouched) {
+                    val liveIntent = Intent(
+                        aiBrainContext,
+                        JarvisForegroundService::class.java
+                    ).apply {
+                        action = if (liveOn) {
+                            JarvisForegroundService.ACTION_START_LIVE
+                        } else {
+                            JarvisForegroundService.ACTION_STOP_LIVE
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        aiBrainContext.startForegroundService(liveIntent)
+                    } else {
+                        aiBrainContext.startService(liveIntent)
+                    }
+                }
                 // 1.4.5 (item 4): key-change restart — only when the
                 // key actually changed AND the loop is live (the
                 // repository flag is the live-loop signal). RETRY

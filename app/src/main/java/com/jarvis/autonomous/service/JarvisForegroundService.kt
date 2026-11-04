@@ -10,6 +10,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -20,6 +25,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
+import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.TestVoiceStageTracker
@@ -36,6 +42,7 @@ import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
 import com.jarvis.autonomous.voice.DeepgramSttClient
+import com.jarvis.autonomous.voice.GeminiLiveSession
 import com.jarvis.autonomous.voice.VadFailureReason
 import com.jarvis.autonomous.voice.VadMonitorResult
 import com.jarvis.autonomous.voice.SwaraTtsClient
@@ -63,6 +70,12 @@ class JarvisForegroundService : Service() {
         // line through the normal speak path.
         const val ACTION_SPEAK_TEST = "com.jarvis.autonomous.ACTION_SPEAK_TEST"
         const val ACTION_STOP_LISTENING = "com.jarvis.autonomous.ACTION_STOP_LISTENING"
+        // 1.4.17: Live mode (Gemini real-time conversation).
+        // Sent by the AI Brain Save button only; the overlay
+        // pill tap stops Live by calling stopLiveInternal
+        // directly (same service instance, no intent needed).
+        const val ACTION_START_LIVE = "com.jarvis.autonomous.ACTION_START_LIVE"
+        const val ACTION_STOP_LIVE = "com.jarvis.autonomous.ACTION_STOP_LIVE"
         const val ACTION_RETRY_MIC = "com.jarvis.autonomous.ACTION_RETRY_MIC"
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
         const val ACTION_GREET = "com.jarvis.autonomous.ACTION_GREET"
@@ -156,6 +169,37 @@ class JarvisForegroundService : Service() {
      */
     @Volatile
     private var fgsSpeakEpoch: Long = 0L
+
+    // ---- 1.4.17 Live mode state (service-owned) ----
+    // The session owns ONLY the WebSocket; this service owns
+    // the Live AudioRecord (capture) and AudioTrack (playback).
+    // Every Live end path runs stopLiveInternal, whose finally
+    // resumes the mic loop from the pause snapshot.
+    @Volatile
+    private var liveActive: Boolean = false
+    private var liveSession: GeminiLiveSession? = null
+    private var liveSnapshot: AlwaysOnMicManager.LivePauseSnapshot? = null
+    private var liveRecord: AudioRecord? = null
+    @Volatile
+    private var liveCaptureRunning: Boolean = false
+    private var liveCaptureThread: Thread? = null
+    private var liveTrack: AudioTrack? = null
+    private val livePlaybackQueue: ArrayDeque<ByteArray> = ArrayDeque()
+    private val livePlaybackLock: Any = Any()
+    @Volatile
+    private var livePlaybackRunning: Boolean = false
+    private var livePlaybackThread: Thread? = null
+    @Volatile
+    private var liveModelSpeaking: Boolean = false
+    private var liveCapRunnable: Runnable? = null
+    // 9-minute wall-clock cap, measured from setupComplete.
+    private val liveCapMs: Long = 9 * 60 * 1000L
+    // Cooldown anchor: set ONLY on fallback ends (cap/error),
+    // never on manual ends — a re-toggle within 60 s of a
+    // fallback is refused with the cooldown string.
+    private var lastLiveFallbackMs: Long = 0L
+
+    private fun isLiveActive(): Boolean = liveActive
 
     /**
      * 1.4.0 echo gate: EVERY speak goes through here so the
@@ -885,7 +929,14 @@ class JarvisForegroundService : Service() {
             // which already requires the grant (show() fails
             // safe otherwise).
             onMicTap = {
-                if (!JarvisStateRepository.micLoopEnabled.value) {
+                // 1.4.17: pill tap during Live = stop Live +
+                // resume loop (new FIRST branch — the loop
+                // below would otherwise mic-off entirely).
+                if (isLiveActive()) {
+                    stopLiveInternal(
+                        GeminiLiveSession.EndKind.MANUAL, fallback = false
+                    )
+                } else if (!JarvisStateRepository.micLoopEnabled.value) {
                     startService(
                         Intent(this, JarvisForegroundService::class.java).apply {
                             action = ACTION_START_LISTENING
@@ -1149,6 +1200,15 @@ class JarvisForegroundService : Service() {
                 // enabled, so a dead loop could never be revived
                 // from the UI. Stop clears the loop AND the fatal
                 // banner; a later start begins fresh.
+                // 1.4.17: mic-off stops BOTH Live and loop —
+                // loop-off wins: end Live first (its finally
+                // would otherwise restore a loop we are about
+                // to stop), then stop the loop below.
+                if (isLiveActive()) {
+                    stopLiveInternal(
+                        GeminiLiveSession.EndKind.MANUAL, fallback = false
+                    )
+                }
                 if (::micManager.isInitialized) {
                     micManager.stop()
                 }
@@ -1189,12 +1249,37 @@ class JarvisForegroundService : Service() {
                 }
             }
 
+            ACTION_START_LIVE -> {
+                // 1.4.17: AI Brain Save button path (gates live
+                // inside startLive; idempotent when live).
+                startLive()
+            }
+
+            ACTION_STOP_LIVE -> {
+                // 1.4.17: AI Brain Save with Live toggled OFF.
+                // ACTION_STOP_TASK deliberately does NOT stop
+                // Live — only this action, the overlay tap,
+                // mic-off, destroy, cap, goAway, or an error do.
+                stopLiveInternal(
+                    GeminiLiveSession.EndKind.MANUAL, fallback = false
+                )
+            }
+
             ACTION_STOP_TASK -> {
                 voiceManager.stopSpeaking("user STOP_TASK")
                 agentEngine.cancelActiveTask("Stopped by user.")
             }
 
             ACTION_GREET -> {
+                // 1.4.17: greeting suppressed while Live is
+                // active — the Live session owns the voice.
+                if (isLiveActive()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_ANNOUNCE_SUPPRESSED",
+                        "Greeting suppressed during Live."
+                    )
+                    return START_STICKY
+                }
                 // 1.4.3: MainActivity sends this once on launch.
                 if (::voiceManager.isInitialized) {
                     speakGreeting()
@@ -1204,6 +1289,19 @@ class JarvisForegroundService : Service() {
             }
 
             ACTION_TEXT_COMMAND -> {
+                // 1.4.17: text commands during Live are rejected
+                // to the execution log, never routed to the
+                // engine (Live is conversation only).
+                if (isLiveActive()) {
+                    JarvisStateRepository.addLog(
+                        "Live mode on hai — pehle Live band karo, phir command do"
+                    )
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_COMMAND_REJECTED",
+                        "Text command rejected during Live (not routed to engine)."
+                    )
+                    return START_STICKY
+                }
                 val cmd = intent.getStringExtra(EXTRA_COMMAND_TEXT) ?: ""
                 if (cmd.isNotBlank()) {
                     agentEngine.handleUserCommand(cmd)
@@ -1211,6 +1309,15 @@ class JarvisForegroundService : Service() {
             }
 
             ACTION_ANNOUNCE_NOTIFICATION -> {
+                // 1.4.17: announces suppressed while Live is
+                // active (same diagnostic as greetings).
+                if (isLiveActive()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_ANNOUNCE_SUPPRESSED",
+                        "Notification announce suppressed during Live."
+                    )
+                    return START_STICKY
+                }
                 if (!agentEngine.isTaskRunning() && prefs.autoAnnounceNotifications) {
                     val sender = intent.getStringExtra(EXTRA_NOTIF_SENDER) ?: ""
                     val msg = intent.getStringExtra(EXTRA_NOTIF_TEXT) ?: ""
@@ -1221,6 +1328,14 @@ class JarvisForegroundService : Service() {
             }
 
             ACTION_ANNOUNCE_CALL -> {
+                // 1.4.17: call announces suppressed during Live.
+                if (isLiveActive()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_ANNOUNCE_SUPPRESSED",
+                        "Call announce suppressed during Live."
+                    )
+                    return START_STICKY
+                }
                 if (!agentEngine.isTaskRunning() && prefs.autoAnnounceNotifications) {
                     val display = intent.getStringExtra(EXTRA_CALL_DISPLAY) ?: ""
                     if (display.isNotBlank()) {
@@ -1329,10 +1444,11 @@ class JarvisForegroundService : Service() {
      * the type set always reflects live state.
      */
     private fun isMicInUse(): Boolean {
-        if (!::micManager.isInitialized) return false
+        if (!::micManager.isInitialized) return liveActive
         return micManager.isEnabled() ||
             micManager.isWakeActive() ||
-            micManager.isOneShotActive()
+            micManager.isOneShotActive() ||
+            liveActive
     }
 
     private fun qualifiedForegroundTypes(): Int {
@@ -1458,6 +1574,429 @@ class JarvisForegroundService : Service() {
         }
     }
 
+    // ---- 1.4.17 Live mode implementation ----
+    private val liveListener = object : GeminiLiveSession.Listener {
+        override fun onSetupComplete() {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_STARTED",
+                "Live session ready (model gemini-3.8-live) — conversation only, no phone actions."
+            )
+            serviceScope.launch {
+                startLiveCapture()
+                val cap = Runnable {
+                    serviceScope.launch {
+                        stopLiveInternal(
+                            GeminiLiveSession.EndKind.CAP, fallback = true
+                        )
+                    }
+                }
+                liveCapRunnable = cap
+                wakeLockHandler.postDelayed(cap, liveCapMs)
+            }
+        }
+
+        override fun onAudioFrame(pcm: ByteArray) {
+            if (!liveActive) return
+            synchronized(livePlaybackLock) {
+                livePlaybackQueue.addLast(pcm)
+                livePlaybackLock.notifyAll()
+            }
+            if (!liveModelSpeaking) {
+                liveModelSpeaking = true
+                JarvisStateRepository.setPlaybackState(
+                    com.jarvis.autonomous.data.PlaybackState.SPEAKING
+                )
+            }
+        }
+
+        override fun onInterrupted() {
+            interruptLivePlayback()
+        }
+
+        override fun onToolCallDropped() {
+            // Session already logged LIVE_TOOLCALL_DROPPED;
+            // nothing to answer, session continues.
+        }
+
+        override fun onEnded(kind: GeminiLiveSession.EndKind) {
+            serviceScope.launch {
+                stopLiveInternal(kind, fallback = true)
+            }
+        }
+    }
+
+    /**
+     * 1.4.17: starts a Live session. Gates (refusals only log
+     * + reset the persisted toggle — they never speak, except
+     * the cooldown refusal which speaks its exact string):
+     * already live, provider != GEMINI or blank Gemini key, mic
+     * loop off, or within 60 s of a fallback end. On the normal
+     * path the LIVE_STARTED line is spoken FIRST via
+     * speakWrapped — it serialises behind any in-flight speak,
+     * so by its return VoiceManager is not mid-speak (the
+     * entry assert), and the mic speaking state is clear. Then
+     * pauseForLive hands the mic over (pump-drain proven
+     * there); Live AudioRecord + AudioTrack are created only
+     * after the pump is proven dead. Capture starts only after
+     * setupComplete (see liveListener). This never touches
+     * speakMutex state, LlmClient, modelName, the fallback
+     * chain, or provider handling — Live reads ONLY
+     * prefs.apiKey, plus the provider gate above.
+     */
+    private fun startLive() {
+        if (liveActive) {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_ALREADY",
+                "Live start ignored: a Live session is already active."
+            )
+            return
+        }
+        if (prefs.provider != AiProvider.GEMINI || prefs.apiKey.isBlank()) {
+            prefs.liveModeEnabled = false
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_REFUSED",
+                "Live refused: provider is not Gemini or no Gemini key saved."
+            )
+            return
+        }
+        if (!::micManager.isInitialized || !micManager.isEnabled()) {
+            prefs.liveModeEnabled = false
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_REFUSED",
+                "Live refused: mic loop is off — pehle mic on karo, phir Live on karo."
+            )
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        if (lastLiveFallbackMs > 0L && nowMs - lastLiveFallbackMs < 60_000L) {
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_COOLDOWN",
+                "Live re-toggle refused within 60s of a fallback end."
+            )
+            serviceScope.launch {
+                runCatching {
+                    speakWrapped(
+                        "Live abhi thodi der ke liye band hai — ek minute baad phir try karo.",
+                        "live-cooldown"
+                    )
+                }
+            }
+            return
+        }
+        serviceScope.launch {
+            runCatching {
+                speakWrapped(
+                    "Live mode on hai — ab seedhi baat karo, koi action nahi hoga.",
+                    "live-started"
+                )
+            }
+            // A STOP sent while the line above was speaking
+            // (Save OFF, overlay tap, mic-off) already flipped
+            // the persisted toggle off while no live state
+            // existed yet — honour it instead of starting a
+            // session the user just cancelled. This is the only
+            // interleave window: everything after this point in
+            // the coroutine runs synchronously on Main.
+            if (!prefs.liveModeEnabled) return@launch
+            val snapshot = runCatching { micManager.pauseForLive() }.getOrNull()
+            if (snapshot == null) {
+                // Loop-off race, or pump-stuck abort (the pause
+                // already restored the loop on the stuck path).
+                abortLiveStart(null)
+                return@launch
+            }
+            val record = createLiveRecord()
+            if (record == null) {
+                abortLiveStart(snapshot)
+                return@launch
+            }
+            val track = createLiveTrack()
+            if (track == null) {
+                runCatching { record.stop() }
+                runCatching { record.release() }
+                abortLiveStart(snapshot)
+                return@launch
+            }
+            liveSnapshot = snapshot
+            liveRecord = record
+            liveTrack = track
+            liveActive = true
+            JarvisStateRepository.setCurrentStepInfo("Live mode — baat chal rahi hai")
+            refreshForegroundTypes()
+            startLivePlayback()
+            val session = GeminiLiveSession()
+            liveSession = session
+            val ok = runCatching { session.start(prefs.apiKey, liveListener) }
+                .getOrDefault(false)
+            if (!ok) {
+                stopLiveInternal(
+                    GeminiLiveSession.EndKind.ERROR, fallback = true
+                )
+            }
+        }
+    }
+
+    /**
+     * 1.4.17: failed-start path — no session ever became live,
+     * so there is no cap/queue to tear down: just resume the
+     * loop (when a snapshot exists), mark the cooldown, and
+     * speak the generic fallback AFTER the loop resumes.
+     */
+    private fun abortLiveStart(snapshot: AlwaysOnMicManager.LivePauseSnapshot?) {
+        if (snapshot != null) {
+            runCatching { micManager.resumeFromLive(snapshot) }
+            refreshForegroundTypes()
+        }
+        lastLiveFallbackMs = System.currentTimeMillis()
+        JarvisStateRepository.addDiagnostic(
+            "live", "LIVE_FALLBACK_ERROR",
+            "Live start failed before setup — normal mic restored."
+        )
+        serviceScope.launch {
+            runCatching {
+                speakWrapped(
+                    "Live me dikkat aayi hai — normal mic par wapas aa gaya hoon, baat yahin jaari rakh sakte ho.",
+                    "live-fallback"
+                )
+            }
+        }
+    }
+
+    /**
+     * 1.4.17: ends a Live session on EVERY path (toggle OFF,
+     * overlay tap, mic-off, destroy, 9-min cap, goAway, any
+     * error). Order is fixed: cancel the cap, stop + release
+     * the Live AudioRecord and AudioTrack, cancel the Live WS,
+     * THEN resume the loop from the snapshot in a finally —
+     * the fallback line is spoken only AFTER the loop resumes.
+     * Manual ends (fallback=false) speak nothing, set no
+     * cooldown, and reset the persisted toggle. Fallback ends
+     * set the 60 s cooldown and speak the exact §(e) string
+     * for the kind. ACTION_STOP_TASK deliberately never calls
+     * this. Idempotent: a second call with no live state is a
+     * no-op (the session's own onEnded cannot re-enter after
+     * stop(), which clears liveSession first).
+     */
+    private fun stopLiveInternal(
+        kind: GeminiLiveSession.EndKind,
+        fallback: Boolean,
+        resumeLoop: Boolean = true,
+        refreshTypes: Boolean = true
+    ) {
+        // Manual ends reset the persisted toggle FIRST, even
+        // when no live state exists yet (a stop sent while the
+        // STARTED line was still speaking): the start coroutine
+        // re-checks this flag after the speak and aborts.
+        if (!fallback) prefs.liveModeEnabled = false
+        if (!liveActive && liveSession == null && liveSnapshot == null) return
+        liveActive = false
+        liveCapRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+        liveCapRunnable = null
+        liveCaptureRunning = false
+        val record = liveRecord
+        liveRecord = null
+        runCatching { record?.stop() }
+        runCatching { record?.release() }
+        runCatching { liveCaptureThread?.join(1000L) }
+        liveCaptureThread = null
+        livePlaybackRunning = false
+        synchronized(livePlaybackLock) {
+            livePlaybackQueue.clear()
+            livePlaybackLock.notifyAll()
+        }
+        val track = liveTrack
+        liveTrack = null
+        runCatching { track?.stop() }
+        runCatching { track?.flush() }
+        runCatching { track?.release() }
+        runCatching { livePlaybackThread?.join(1000L) }
+        livePlaybackThread = null
+        liveSession?.stop()
+        liveSession = null
+        val snapshot = liveSnapshot
+        liveSnapshot = null
+        liveModelSpeaking = false
+        JarvisStateRepository.setPlaybackState(
+            com.jarvis.autonomous.data.PlaybackState.IDLE
+        )
+        JarvisStateRepository.setCurrentStepInfo("Ready — Say 'Hey Jarvis' or tap the Core")
+        if (resumeLoop && snapshot != null && ::micManager.isInitialized) {
+            runCatching { micManager.resumeFromLive(snapshot) }
+        }
+        if (refreshTypes) refreshForegroundTypes()
+        JarvisStateRepository.addDiagnostic(
+            "live", "LIVE_ENDED",
+            "Live ended reason=$kind fallback=$fallback."
+        )
+        if (!fallback) {
+            return
+        }
+        lastLiveFallbackMs = System.currentTimeMillis()
+        val (text, code) = when (kind) {
+            GeminiLiveSession.EndKind.CAP,
+            GeminiLiveSession.EndKind.LIMIT -> Pair(
+                "Live limit par pahunch gaya hai — normal mic par wapas aa gaya hoon. Thodi der baad phir Live try karna.",
+                "LIVE_FALLBACK_LIMIT"
+            )
+            GeminiLiveSession.EndKind.NETWORK -> Pair(
+                "Live connection toot gaya hai — normal mic par wapas aa gaya hoon.",
+                "LIVE_FALLBACK_NETWORK"
+            )
+            GeminiLiveSession.EndKind.GOAWAY,
+            GeminiLiveSession.EndKind.TIMEOUT -> Pair(
+                "Live session khatam ho gayi hai — normal mic par wapas aa gaya hoon.",
+                "LIVE_FALLBACK_TIMEOUT"
+            )
+            else -> Pair(
+                "Live me dikkat aayi hai — normal mic par wapas aa gaya hoon, baat yahin jaari rakh sakte ho.",
+                "LIVE_FALLBACK_ERROR"
+            )
+        }
+        JarvisStateRepository.addDiagnostic("live", code, "Live fallback spoken after loop resume.")
+        serviceScope.launch {
+            runCatching { speakWrapped(text, "live-fallback") }
+        }
+    }
+
+    private fun createLiveRecord(): AudioRecord? {
+        val minBuf = AudioRecord.getMinBufferSize(
+            16_000, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) return null
+        val record = runCatching {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                16_000, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT, minBuf * 2
+            )
+        }.getOrNull()
+        if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+            runCatching { record?.release() }
+            return null
+        }
+        return record
+    }
+
+    private fun createLiveTrack(): AudioTrack? {
+        val minBuf = AudioTrack.getMinBufferSize(
+            24_000, AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) return null
+        val track = runCatching {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(24_000)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(minBuf * 4)
+                .build()
+        }.getOrNull()
+        if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
+            runCatching { track?.release() }
+            return null
+        }
+        runCatching { track.play() }
+        return track
+    }
+
+    private fun startLiveCapture() {
+        val record = liveRecord ?: return
+        runCatching { record.startRecording() }
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            serviceScope.launch {
+                stopLiveInternal(
+                    GeminiLiveSession.EndKind.ERROR, fallback = true
+                )
+            }
+            return
+        }
+        liveCaptureRunning = true
+        val thread = Thread {
+            val buf = ByteArray(3200)
+            try {
+                while (liveCaptureRunning) {
+                    val read = runCatching { record.read(buf, 0, buf.size) }
+                        .getOrDefault(-1)
+                    if (read > 0) {
+                        liveSession?.sendPcm(buf, read)
+                    } else if (read < 0) {
+                        break
+                    }
+                }
+            } catch (_: Exception) {
+                // Capture death ends via the session watchdog /
+                // cap path; never throws out of the thread.
+            }
+        }
+        liveCaptureThread = thread
+        thread.start()
+    }
+
+    private fun startLivePlayback() {
+        val track = liveTrack ?: return
+        livePlaybackRunning = true
+        val thread = Thread {
+            while (true) {
+                val chunk: ByteArray? = synchronized(livePlaybackLock) {
+                    while (livePlaybackQueue.isEmpty() && livePlaybackRunning) {
+                        runCatching { livePlaybackLock.wait() }
+                    }
+                    if (!livePlaybackRunning) null
+                    else livePlaybackQueue.removeFirst()
+                } ?: break
+                runCatching { track.write(chunk, 0, chunk.size) }
+                synchronized(livePlaybackLock) {
+                    if (livePlaybackQueue.isEmpty() && liveModelSpeaking) {
+                        liveModelSpeaking = false
+                        JarvisStateRepository.setPlaybackState(
+                            com.jarvis.autonomous.data.PlaybackState.IDLE
+                        )
+                    }
+                }
+            }
+        }
+        livePlaybackThread = thread
+        thread.start()
+    }
+
+    /**
+     * 1.4.17 server-native interruption: stop the Live
+     * AudioTrack at once, drop the ENTIRE pending PCM queue,
+     * keep capturing (mic thread untouched, no activity_end
+     * sent — the session protocol has none). NEVER touches
+     * BargeInDetector, TurnDetector, VoiceManager.stopSpeaking,
+     * or micManager.setSpeaking on this path.
+     */
+    private fun interruptLivePlayback() {
+        val track = liveTrack ?: return
+        synchronized(livePlaybackLock) {
+            livePlaybackQueue.clear()
+        }
+        runCatching { track.stop() }
+        runCatching { track.flush() }
+        runCatching { track.play() }
+        liveModelSpeaking = false
+        JarvisStateRepository.setPlaybackState(
+            com.jarvis.autonomous.data.PlaybackState.IDLE
+        )
+        JarvisStateRepository.addDiagnostic(
+            "live", "LIVE_INTERRUPTED",
+            "Server interruption: model audio stopped, pending queue dropped, mic capture continues."
+        )
+    }
+
     private fun buildNotification(statusText: String): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
@@ -1553,6 +2092,16 @@ class JarvisForegroundService : Service() {
         // kill-vs-crash signal in the next report.
         JarvisStateRepository.addDiagnostic("nav", "SVC_DESTROY", "Foreground service destroyed.")
         floatingOverlay?.hide()
+        // 1.4.17: explicit Live end on destroy — audio + WS
+        // released, loop NOT resumed (shutdown below stops it).
+        if (isLiveActive() || liveSession != null || liveSnapshot != null) {
+            stopLiveInternal(
+                GeminiLiveSession.EndKind.MANUAL,
+                fallback = false,
+                resumeLoop = false,
+                refreshTypes = false
+            )
+        }
         // A-H8: destroy cancels a pending reply (a stale reply
         // must never swallow the next command after recreation).
         // NOTE: the persisted mic flag is deliberately NOT cleared
