@@ -50,6 +50,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.security.MessageDigest
 
 class JarvisForegroundService : Service() {
 
@@ -488,6 +489,19 @@ class JarvisForegroundService : Service() {
      * silently to VAD-off on mic-busy (see AlwaysOnMicManager).
      * A missing asset only logs — it never breaks the mic loop.
      */
+    /** 1.4.15: SHA-256 hex of a file, for the VAD-copy pin check. */
+    private fun sha256Hex(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(8192)
+            var read: Int
+            while (input.read(buffer).also { read = it } != -1) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun startVadMonitor() {
         // 1.4.12: while a greeting speak is in flight, VAD
         // init is deferred until the greeting speak completes,
@@ -543,6 +557,9 @@ class JarvisForegroundService : Service() {
             // — and a successful enable is then started=true
             // with NO reason, even if the APK asset is missing
             // (that is a success, never MODEL_MISSING).
+            // 1.4.15: the skipped copy is now SHA-256-checked
+            // against PIN_VAD_SHA and re-copied once on mismatch,
+            // so "full-size" alone no longer proves it is good.
             val target = File(filesDir, "silero_vad.onnx")
             var copyFailed = false
             try {
@@ -553,6 +570,28 @@ class JarvisForegroundService : Service() {
                     withContext(Dispatchers.IO) {
                         assets.open("silero_vad.onnx").use { input ->
                             target.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                }
+                // 1.4.15 hardening: the size-only skip above passes
+                // a full-size but corrupt filesDir copy to native
+                // load. SHA-256 the copy against the CI-enforced
+                // pin (AlwaysOnMicManager.PIN_VAD_SHA, identical
+                // to the workflow's bundle gate) and re-copy once
+                // on mismatch. copyFailed is set ONLY if the
+                // re-copy also mismatches, so a repaired copy
+                // stays a clean success; a still-bad copy surfaces
+                // as COPY_FAILED when enable also fails (the
+                // existing started -> null rule is unchanged).
+                withContext(Dispatchers.IO) {
+                    if (target.exists() &&
+                        sha256Hex(target) != AlwaysOnMicManager.PIN_VAD_SHA
+                    ) {
+                        assets.open("silero_vad.onnx").use { input ->
+                            target.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        if (sha256Hex(target) != AlwaysOnMicManager.PIN_VAD_SHA) {
+                            copyFailed = true
                         }
                     }
                 }

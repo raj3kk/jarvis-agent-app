@@ -1846,13 +1846,18 @@ fun interface StopSpeakingCallback {
  *
  * Verified API (sherpa-onnx 1.13.4 AAR, classes.jar inspected with
  * javap): com.k2fsa.sherpa.onnx.Vad(AssetManager, VadModelConfig),
+ * Vad(VadModelConfig) (file constructor, for a filesDir path),
  * acceptWaveform(FloatArray), isSpeechDetected(), empty(),
  * front(): SpeechSegment(start: Int, samples: FloatArray), pop(),
  * flush(), reset(), release(); VadModelConfig(SileroVadModelConfig,
  * TenVadModelConfig, sampleRate, numThreads, provider, debug);
  * SileroVadModelConfig(model, threshold, minSilenceDuration,
  * minSpeechDuration, windowSize, maxSpeechDuration);
- * getVadModelConfig(sampleRate) (top-level function in Vad.kt).
+ * getVadModelConfig(type) (top-level function in Vad.kt;
+ * 1.4.15 correction: the Int is a MODEL-TYPE SELECTOR, not a
+ * sample rate — 0 = Silero. The sample rate stays 16000 from
+ * the returned base config. The old "sampleRate" reading was a
+ * javap misread: javap shows only the Int type, never the name.
  *
  * HONEST LIMITS — read before enabling:
  * 1. MODEL BUNDLED (1.4.2 correction of a stale comment): CI bundles
@@ -1927,12 +1932,16 @@ class SherpaVadMonitor(
             VadFailureReason.MODEL_MISSING
         } else {
             try {
-                // getVadModelConfig's Kotlin metadata declares a
-                // nullable return (VadModelConfig?), so a null
-                // result means VAD is unavailable — a
+                // 1.4.15: getVadModelConfig's Int is a model-type
+                // selector (0 = Silero), NOT a sample rate — the
+                // old SAMPLE_RATE_HZ (16000) argument matched no
+                // branch, returned null on every device, and VAD
+                // never constructed. The sample rate stays 16000
+                // from the returned base config. A null result
+                // means the type selector was unknown — a
                 // construction failure, NOT a missing model
                 // (the file exists; the config could not be built).
-                val baseConfig = getVadModelConfig(SAMPLE_RATE_HZ)
+                val baseConfig = getVadModelConfig(0)
                 if (baseConfig == null) {
                     VadFailureReason.VAD_CONSTRUCTION_FAILED
                 } else {
@@ -1946,7 +1955,14 @@ class SherpaVadMonitor(
                             VAD_MAX_SPEECH_SEC
                         )
                     )
-                    vad = Vad(appContext.assets, config)
+                    // 1.4.15: file constructor, NOT the
+                    // AssetManager one: the model path here is a
+                    // filesDir ABSOLUTE path, and the AssetManager
+                    // constructor routes to native newFromAsset,
+                    // which expects an asset-relative name. The
+                    // file constructor routes to newFromFile and
+                    // runs config.Validate().
+                    vad = Vad(config)
                     null
                 }
             } catch (e: Exception) {
