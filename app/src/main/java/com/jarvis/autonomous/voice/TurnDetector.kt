@@ -341,6 +341,27 @@ class TurnDetector {
             }
         }
 
+        /**
+         * WAVE-2 (ADD 1e): INVERTED Devanagari map for the
+         * system-TTS fallback's bounded Roman→Devanagari step
+         * (Latin token → Devanagari token). Single tokens ONLY:
+         * multi-word Latin values (e.g. "ruk ja") are skipped,
+         * filler entries mapped to "" are skipped, and on a
+         * Latin collision (two Devanagari keys → one Latin
+         * value, e.g. नहीं/नही → nahi) the FIRST Devanagari
+         * form wins. Detection behaviour is untouched — this
+         * only exposes the existing map read-only.
+         */
+        fun latinToDevanagariKeywords(): Map<String, String> {
+            val out = LinkedHashMap<String, String>()
+            for ((devanagari, latin) in DEVANAGARI_KEYWORDS) {
+                if (latin.isBlank() || latin.contains(" ")) continue
+                if (devanagari.isBlank() || devanagari.contains(" ")) continue
+                out.putIfAbsent(latin, devanagari)
+            }
+            return out
+        }
+
         private val DEVANAGARI_KEYWORDS: Map<String, String> = mapOf(
             // Stop / barge-in keywords
             "रुक" to "ruk", "रुको" to "ruko", "रुकजा" to "ruk ja",

@@ -717,6 +717,12 @@ object SwaraTtsClient {
                                 "tts", "SWARA_FIRST_AUDIO",
                                 "First Swara audio after ${firstAudioMs - speakStartMs}ms (chars=$charCount)."
                             )
+                            // WAVE-2 (§D-8): first audio upgrades
+                            // PREPARING→SPEAKING. No connect/
+                            // synthesis path change — marker only.
+                            JarvisStateRepository.setPlaybackState(
+                                com.jarvis.autonomous.data.PlaybackState.SPEAKING
+                            )
                             if (!playback.ensureDecoder()) {
                                 failure = AttemptResult.Failure(
                                     "synthesize", FAIL_SYNTHESIZE, false, true
@@ -1000,6 +1006,13 @@ object SwaraTtsClient {
                                     JarvisStateRepository.addDiagnostic(
                                         "tts", "SWARA_STREAMING",
                                         "Swara streaming playback started."
+                                    )
+                                    // WAVE-2 (§D-8): first PCM
+                                    // upgrades PREPARING→SPEAKING
+                                    // (idempotent if FIRST_AUDIO
+                                    // already did; marker only).
+                                    JarvisStateRepository.setPlaybackState(
+                                        com.jarvis.autonomous.data.PlaybackState.SPEAKING
                                     )
                                 }
                             }

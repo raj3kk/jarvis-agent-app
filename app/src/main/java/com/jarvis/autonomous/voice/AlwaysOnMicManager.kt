@@ -174,27 +174,51 @@ class AlwaysOnMicManager(
         private set
 
     /**
-     * 1.4.13 (F-E1): fingerprint of the LAST spoken text, kept
-     * for the LIVE-transcript echo gate after speech ends.
-     * Set on every setSpeaking(true); cleared when the next
-     * NON-echo turn completes, when the next speak starts
-     * (overwritten), when the loop stops, or — G8 MINOR-1 fix —
-     * immediately after the live gate drops its first FINAL on
-     * fingerprint match (see the live gate below). Content-gated
-     * ONLY — there is deliberately no timer and no post-speech
-     * grace window: a live transcript is dropped exactly when
-     * it is a subsequence of this text, however late it arrives
-     * (speaker drain tail), and genuine new speech is never
-     * time-blocked. Retiring after the first dropped final
-     * breaks the repeat-stuck trap: a legitimate follow-up
-     * whose tokens are a subsequence of the last spoken text
-     * is dropped at most once per speak and is heard on its
-     * second attempt, while the single drain-tail final is
-     * still consumed — Deepgram sends one final per segment,
-     * so retiring here cannot re-open the echo loop. A stop
+     * WAVE-2 (§B): echo-fingerprint STACK — SUPERSEDES the
+     * G8 MINOR-1 single-string count-retire mechanism (which
+     * closed as specified at b63853: retire after the first
+     * dropped final). MINOR-1's INTENT is preserved inside
+     * this design (bounded, no repeat-stuck — see retire rules
+     * below) but its mechanism is replaced, because a single
+     * string OVERWRITES: at launch the greeting speak's
+     * fingerprint was erased by the announce speak, so the
+     * greeting's drain tail arrived unguarded. A new speak
+     * PUSHES here and never erases prior entries, so the stack
+     * covers at least the greeting + announce launch pair.
+     * N = 5: matches the VoiceManager speak-queue capacity
+     * (5 waiters), so the stack can hold every speak that can
+     * be in flight or queued; the oldest entry evicts on the
+     * 6th push (bounded — no unbounded growth, no unbounded
+     * repeat-stuck). Content-gated ONLY — no timer, no grace
+     * window: a live transcript drops exactly when it is a
+     * subsequence of ANY stacked text, however late it arrives.
+     *
+     * RETIRE rules (finals only — interim drops NEVER retire,
+     * verified at the live gate): (1) SEGMENT BOUNDARY — a
+     * dropped final with speechFinal=true arms
+     * [echoSegmentBoundaryPending]; the NEXT non-echo
+     * transcript (a new segment's onset, interim or final)
+     * retires the whole stack, so ALL finals of one tail
+     * segment drop while a genuine fresh segment is heard.
+     * (2) NON-ECHO FINAL — any genuine (non-echo) final
+     * retires the stack outright. (3) TURN COMPLETE — a
+     * completed turn was non-echo by construction, so it
+     * retires the stack. (4) LOOP STOP — clears the stack.
+     * NOT a retire trigger, by design: a new speak's PUSH
+     * must NOT clear prior entries (that would reintroduce
+     * the greeting-overwrite bug for the announce pair);
+     * push bounds lifetime only via N-eviction. A stop
      * keyword still barges in during speech.
      */
-    private var echoFingerprintText: String = ""
+    private val echoFingerprintStack: ArrayDeque<String> = ArrayDeque()
+    private val ECHO_STACK_MAX = 5
+    /** Armed by a dropped speechFinal final; cleared on retire. */
+    private var echoSegmentBoundaryPending: Boolean = false
+    /** Optional resume callback (WAVE-2 §A): fired by
+     * [resumeDeepgram] on a real resume so the owning service
+     * can re-qualify its FGS types (pump resumes have no
+     * service call site of their own). */
+    var onMicResumed: (() -> Unit)? = null
 
     /**
      * 1.4.13 (F-E5): true between a barge-in trigger and the
@@ -344,7 +368,12 @@ class AlwaysOnMicManager(
             lastSpeechMs = System.currentTimeMillis()
             lastTranscriptScript = TurnDetector.scriptOf(text)
             JarvisStateRepository.setLastTranscriptScript(lastTranscriptScript)
-            mainHandler.post { handleTranscript(text, isFinal = true) }
+            // WAVE-2 (§B): speechFinal is plumbed through to
+            // the live gate (segment-boundary retire) — it was
+            // previously dropped at this post boundary.
+            mainHandler.post {
+                handleTranscript(text, isFinal = true, speechFinal = speechFinal)
+            }
         }
 
         override fun onError(code: String, message: String) {
@@ -415,8 +444,9 @@ class AlwaysOnMicManager(
                     // 1.4.13 (F-E1): this turn completed, so it
                     // was non-echo by construction (echo was
                     // filtered at flush / dropped live) — the
-                    // last-spoken fingerprint retires here.
-                    echoFingerprintText = ""
+                    // echo stack retires here (WAVE-2 §B rule 3).
+                    echoFingerprintStack.clear()
+                    echoSegmentBoundaryPending = false
                     resetLanguageToPrimary()
                     if (TurnDetector.isMicStopCommand(text)) {
                         // TurnDetector.check already fast-tracks
@@ -699,6 +729,12 @@ class AlwaysOnMicManager(
         deepgramClient = client
         client.connect(deepgramListener)
         scheduleConnectTimeout()
+        // WAVE-2 (§A): pump resumes (rms_spike / vad_segment)
+        // reach here with no service call site — notify the
+        // service so it re-qualifies its FGS types. Service
+        // call sites that already refresh will refresh twice;
+        // refresh is change-only, so the duplicate is a no-op.
+        onMicResumed?.invoke()
     }
 
     /** Closes the Deepgram stream + pump mic (idempotent). */
@@ -1085,7 +1121,9 @@ class AlwaysOnMicManager(
         currentSpokenText = ""
         // 1.4.13 (F-E1/F-E5): a stopped loop holds no fingerprint
         // and no stopping state — a later start speaks fresh.
-        echoFingerprintText = ""
+        // WAVE-2 (§B): the stack clears on stop (rule 4).
+        echoFingerprintStack.clear()
+        echoSegmentBoundaryPending = false
         speakStopping = false
         mainHandler.removeCallbacks(turnCheckRunnable)
         stopDeepgramStream()
@@ -1132,10 +1170,30 @@ class AlwaysOnMicManager(
             speakingDepth++
             isSpeaking = true
             currentSpokenText = spokenText
-            // 1.4.13 (F-E1/F-E5): a new speak refreshes the live
-            // echo fingerprint and supersedes any stopping state
-            // left by the previous speak's barge-in.
-            echoFingerprintText = spokenText
+            // WAVE-2 (§B): PUSH, never overwrite — prior
+            // entries keep their tail coverage (greeting +
+            // announce pair). One exception, the "retire on
+            // next speak" rule: if a dropped speechFinal final
+            // already armed a segment boundary, the prior tail
+            // segment is DONE, so the stack retires BEFORE this
+            // push (the new speak starts fresh); without a
+            // boundary, nothing is cleared here.
+            if (echoSegmentBoundaryPending) {
+                echoFingerprintStack.clear()
+                echoSegmentBoundaryPending = false
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "ECHO_STACK_RETIRED",
+                    "Echo stack retired on next speak after a segment boundary (entries=0)."
+                )
+            }
+            if (spokenText.isNotBlank()) {
+                echoFingerprintStack.addLast(spokenText)
+                while (echoFingerprintStack.size > ECHO_STACK_MAX) {
+                    echoFingerprintStack.removeFirst()
+                }
+            }
+            // 1.4.13 (F-E1/F-E5): a new speak supersedes any
+            // stopping state left by the previous speak's barge-in.
             speakStopping = false
             vadMonitor?.pauseForSpeech()
         } else {
@@ -1229,7 +1287,11 @@ class AlwaysOnMicManager(
 
     // ---- Internals (main thread unless noted) ----
 
-    private fun handleTranscript(text: String, isFinal: Boolean) {
+    private fun handleTranscript(
+        text: String,
+        isFinal: Boolean,
+        speechFinal: Boolean = false
+    ) {
         if (text.isBlank()) {
             // A-M6: an empty session flips NOTHING — heard-nothing
             // is not a locale failure. The fallback fires only
@@ -1299,33 +1361,67 @@ class AlwaysOnMicManager(
             quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
             return
         }
-        // 1.4.13 (F-E1): LIVE-transcript echo gate, content-gated
-        // NOT time-gated. After a speak ends, the speaker drain
-        // tail can still arrive as live transcripts; the old code
-        // fed them straight into the turn (only the quarantine
-        // flush filtered echo). Now a live transcript that is a
-        // subsequence of the last spoken text is dropped — no
-        // grace timer, no silence window, so genuine speech is
-        // never time-blocked and tail echo is never time-let-in.
-        // Finals get one diagnostic line (bounded, one per echo
-        // utterance); interims drop silently like the flush.
-        // G8 MINOR-1: retire the fingerprint after the first
-        // dropped FINAL — at most one final per speak is dropped
-        // this way, so a repeated legitimate command is heard on
-        // its second attempt. Interims do NOT retire it (the
-        // drain-tail final is the transcript this rule must
-        // consume); no timer or grace window is added.
-        if (echoFingerprintText.isNotBlank() &&
-            isEchoOfSpoken(text, echoFingerprintText)
-        ) {
+        // WAVE-2 (§B): LIVE-transcript echo gate, content-gated
+        // NOT time-gated — SUPERSEDES the G8 MINOR-1
+        // count-retire rule (retire after the first dropped
+        // final). After a speak ends, the speaker drain tail
+        // can still arrive as live transcripts; a live
+        // transcript that is a subsequence of ANY stacked
+        // spoken text is dropped — no grace timer, no silence
+        // window, so genuine speech is never time-blocked and
+        // tail echo is never time-let-in. Finals get one
+        // diagnostic line each (bounded: one per dropped final);
+        // interims drop silently like the flush.
+        // RETIRE (finals only — interim drops NEVER retire, and
+        // no branch below touches the stack for an interim):
+        // a dropped final with speechFinal=true arms a segment
+        // boundary (the tail segment is complete), but the
+        // stack is NOT cleared yet — further finals of the
+        // same tail segment must still drop. The next NON-echo
+        // transcript (new segment onset, interim or final)
+        // retires the stack, as does any non-echo FINAL even
+        // without a boundary. No timer or grace window is added.
+        val echoMatch = echoFingerprintStack.any { entry ->
+            isEchoOfSpoken(text, entry)
+        }
+        if (echoMatch) {
             if (isFinal) {
                 JarvisStateRepository.addDiagnostic(
                     "stt", "ECHO_DROPPED_LIVE",
-                    "Live transcript dropped as echo of last spoken text (content gate, no timer)."
+                    "Live transcript dropped as echo of a stacked spoken text (content gate, no timer; stack kept for tail-segment finals)."
                 )
-                echoFingerprintText = ""
+                if (speechFinal) {
+                    echoSegmentBoundaryPending = true
+                }
             }
             return
+        }
+        // Guarded by non-empty: without it every genuine
+        // final would log a spurious retire for an empty stack.
+        if (echoFingerprintStack.isNotEmpty() &&
+            (echoSegmentBoundaryPending || isFinal)
+        ) {
+            // Segment-boundary retire (pending armed by a
+            // dropped speechFinal final, new segment onset
+            // arrived) and/or non-echo-final retire (genuine
+            // speech). Either way the stack's lifetime ends
+            // here; a later tail final is no longer dropped,
+            // which is the specified tradeoff (a tail arriving
+            // after genuine speech has begun is acoustically
+            // mixed with that speech anyway).
+            val reason = if (echoSegmentBoundaryPending && isFinal) {
+                "segment_boundary+non_echo_final"
+            } else if (echoSegmentBoundaryPending) {
+                "segment_boundary"
+            } else {
+                "non_echo_final"
+            }
+            echoFingerprintStack.clear()
+            echoSegmentBoundaryPending = false
+            JarvisStateRepository.addDiagnostic(
+                "stt", "ECHO_STACK_RETIRED",
+                "Echo stack retired ($reason; entries=0)."
+            )
         }
         // 1.4.7 (A1): Deepgram segments are assembled into the
         // cumulative turn text (see feedAssembled) — the old

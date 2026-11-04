@@ -16,6 +16,28 @@ enum class AgentRunState {
     SPEAKING
 }
 
+/**
+ * 1.4.13 WAVE-2 (§D-8): TRUE playback state, distinct from
+ * [AgentRunState.SPEAKING] (which the engine sets at speak
+ * REQUEST time, i.e. before any audio exists). PREPARING =
+ * speak requested/acquired but no audio yet (the
+ * SPK_START→first-audio gap); SPEAKING = audio is really
+ * playing (first-audio/streaming until marker/done/cancel);
+ * IDLE = no speak in flight. The indicator must show
+ * "speaking" ONLY in SPEAKING; PREPARING is its own visible
+ * state, never hidden, never merged into SPEAKING. Set by
+ * speakWrapped (PREPARING at SPK_START/SPK_ACQUIRED, IDLE in
+ * its finally), by Swara at SWARA_FIRST_AUDIO/SWARA_STREAMING,
+ * and by the system-TTS fallback at utterance onStart. A
+ * speak that fails before first audio goes PREPARING→IDLE
+ * (never SPEAKING) via speakWrapped's finally.
+ */
+enum class PlaybackState {
+    IDLE,
+    PREPARING,
+    SPEAKING
+}
+
 data class ChatEntry(
     val id: Long = System.currentTimeMillis(),
     val sender: String, // "You", "Jarvis", "System"
@@ -385,6 +407,14 @@ object JarvisStateRepository {
 
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())
     val recentNotifications: StateFlow<List<NotificationItem>> = _recentNotifications.asStateFlow()
+
+    private val _playbackState = MutableStateFlow(PlaybackState.IDLE)
+    val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
+
+    /** WAVE-2 (§D-8): publishes the true playback state (see [PlaybackState]). */
+    fun setPlaybackState(state: PlaybackState) {
+        _playbackState.value = state
+    }
 
     fun setAgentState(state: AgentRunState, stepDescription: String? = null) {
         _agentState.value = state

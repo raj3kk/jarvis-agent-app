@@ -253,6 +253,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         JarvisStateRepository.addDiagnostic("nav", "LIFE_RESUME", "MainActivity resumed.")
+        // WAVE-2 (§A): foreground ENTRY re-qualifies the FGS
+        // type set — a service downgraded to specialUse-only
+        // while backgrounded re-upgrades to microphone here
+        // when the mic is live (no mic tap needed). The service
+        // branch (ACTION_REFRESH_FGS_TYPES) changes no mic state.
+        sendServiceAction(JarvisForegroundService.ACTION_REFRESH_FGS_TYPES)
     }
 
     override fun onPause() {
@@ -553,6 +559,10 @@ fun CommandCenterScreen(
     onRetryMic: () -> Unit = {}
 ) {
     val agentState by JarvisStateRepository.agentState.collectAsState()
+    // WAVE-2 (§D-8): true playback state — the avatar ring /
+    // label must follow THIS for speaking, not agentState
+    // (which is set at speak-request time, before audio).
+    val playbackState by JarvisStateRepository.playbackState.collectAsState()
     val currentGoal by JarvisStateRepository.currentGoal.collectAsState()
     val stepInfo by JarvisStateRepository.currentStepInfo.collectAsState()
     val isAccConnected by JarvisStateRepository.isAccessibilityConnected.collectAsState()
@@ -984,6 +994,7 @@ fun CommandCenterScreen(
         ) {
             JarvisPersonaAvatar(
                 state = agentState,
+                playbackState = playbackState,
                 onClick = {
                     if (agentState == AgentRunState.IDLE) {
                         // C-B13: voice disabled -> go to Permissions
@@ -1192,15 +1203,26 @@ fun CommandCenterScreen(
 @Composable
 fun JarvisPersonaAvatar(
     state: AgentRunState,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    // WAVE-2 (§D-8): true playback state (default IDLE keeps
+    // any other caller compiling). Playback wins over
+    // agentState for the speaking ring: SPEAKING (blue) only
+    // while audio really plays; PREPARING gets its own
+    // distinct grey-blue ring and is never shown as speaking.
+    playbackState: com.jarvis.autonomous.data.PlaybackState =
+        com.jarvis.autonomous.data.PlaybackState.IDLE
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "persona_pulse")
+    // WAVE-2 (§D-8): a greeting speak runs with agentState
+    // IDLE, so activity follows playback too, not state alone.
+    val isActive = state != AgentRunState.IDLE ||
+        playbackState != com.jarvis.autonomous.data.PlaybackState.IDLE
     val scale by infiniteTransition.animateFloat(
         initialValue = 0.97f,
-        targetValue = if (state == AgentRunState.IDLE) 1.03f else 1.09f,
+        targetValue = if (isActive) 1.09f else 1.03f,
         animationSpec = infiniteRepeatable(
             animation = tween(
-                durationMillis = if (state == AgentRunState.IDLE) 1800 else 650,
+                durationMillis = if (isActive) 650 else 1800,
                 easing = FastOutSlowInEasing
             ),
             repeatMode = RepeatMode.Reverse
@@ -1208,13 +1230,17 @@ fun JarvisPersonaAvatar(
         label = "persona_scale"
     )
     val ringColor by animateColorAsState(
-        targetValue = when (state) {
-            AgentRunState.IDLE -> Color(0xFFFF6EC7)
-            AgentRunState.LISTENING -> Color(0xFF2E7D5B)
-            AgentRunState.THINKING -> Color(0xFFD500F9)
-            AgentRunState.EXECUTING_STEP -> Color(0xFFFFAB00)
-            AgentRunState.WAITING_USER_REPLY -> Color(0xFF2E7D5B)
-            AgentRunState.SPEAKING -> Color(0xFF2979FF)
+        targetValue = when (playbackState) {
+            com.jarvis.autonomous.data.PlaybackState.SPEAKING -> Color(0xFF2979FF)
+            com.jarvis.autonomous.data.PlaybackState.PREPARING -> Color(0xFF78909C)
+            com.jarvis.autonomous.data.PlaybackState.IDLE -> when (state) {
+                AgentRunState.IDLE -> Color(0xFFFF6EC7)
+                AgentRunState.LISTENING -> Color(0xFF2E7D5B)
+                AgentRunState.THINKING -> Color(0xFFD500F9)
+                AgentRunState.EXECUTING_STEP -> Color(0xFFFFAB00)
+                AgentRunState.WAITING_USER_REPLY -> Color(0xFF2E7D5B)
+                AgentRunState.SPEAKING -> Color(0xFF2979FF)
+            }
         },
         label = "persona_ring"
     )
@@ -1239,7 +1265,15 @@ fun JarvisPersonaAvatar(
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = if (state == AgentRunState.IDLE) "TAP TO SPEAK" else "TAP TO STOP",
+            // WAVE-2 (§D-8): PREPARING is a distinct visible
+            // label, not hidden and not "speaking"; it still
+            // taps to stop (a speak is in flight).
+            text = when (playbackState) {
+                com.jarvis.autonomous.data.PlaybackState.PREPARING -> "BOLNE KI TAYYARI…"
+                com.jarvis.autonomous.data.PlaybackState.SPEAKING -> "TAP TO STOP"
+                com.jarvis.autonomous.data.PlaybackState.IDLE ->
+                    if (state == AgentRunState.IDLE) "TAP TO SPEAK" else "TAP TO STOP"
+            },
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
             color = Color(0xFF3B2F2A)
@@ -1907,8 +1941,8 @@ fun AiBrainSettingsScreen(
 
         // B-L12: the old Voice Speech Speed slider is REMOVED —
         // it only ever tuned system TTS, which no longer exists
-        // (Swara build, prosody defaults +0%). A slider that
-        // saves a dead pref is worse than no slider.
+        // (Swara build, prosody rate +0%, pitch -12%).
+        // A slider that saves a dead pref is worse than no slider.
         Text(
             text = "Voice speed: Swara prosody default par bolta hai " +
                 "(rate +0%, pitch -12% — speed slider hataya gaya, wo sirf purani system " +

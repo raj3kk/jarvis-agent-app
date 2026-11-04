@@ -66,6 +66,11 @@ class JarvisForegroundService : Service() {
         const val ACTION_TEXT_COMMAND = "com.jarvis.autonomous.ACTION_TEXT_COMMAND"
         const val EXTRA_COMMAND_TEXT = "extra_command_text"
         const val ACTION_REFRESH_OVERLAY = "com.jarvis.autonomous.ACTION_REFRESH_OVERLAY"
+        /** WAVE-2 (§A): foreground-entry re-qualification — MainActivity
+         * onResume sends this so a background-downgraded service
+         * re-upgrades to the microphone type when the user returns
+         * to foreground (no mic start needed). */
+        const val ACTION_REFRESH_FGS_TYPES = "com.jarvis.autonomous.ACTION_REFRESH_FGS_TYPES"
         const val ACTION_ANNOUNCE_NOTIFICATION = "com.jarvis.autonomous.ACTION_ANNOUNCE_NOTIFICATION"
         const val EXTRA_NOTIF_SENDER = "extra_notif_sender"
         const val EXTRA_NOTIF_TEXT = "extra_notif_text"
@@ -173,6 +178,16 @@ class JarvisForegroundService : Service() {
         // returns (SPK_END is always written) instead of hanging
         // the breaker detector.
         val startMs = System.currentTimeMillis()
+        // WAVE-2 (§D-8): PREPARING from request time — the
+        // indicator must NOT show "speaking" during the
+        // SPK_START→first-audio gap. Swara first-audio /
+        // streaming (or fallback onStart) upgrades this to
+        // SPEAKING; the finally below clears it to IDLE on
+        // every return path (done, failed, cancelled). Applies
+        // to ALL origins through here, including greeting.
+        JarvisStateRepository.setPlaybackState(
+            com.jarvis.autonomous.data.PlaybackState.PREPARING
+        )
         JarvisStateRepository.addDiagnostic(
             "tts", "SPK_START",
             "Speak started (origin=$origin, chars=${text.length})."
@@ -193,6 +208,12 @@ class JarvisForegroundService : Service() {
                 "tts", "SPK_ACQUIRED",
                 "Speak acquired the FGS mutex after " +
                     "${System.currentTimeMillis() - startMs}ms queue wait (origin=$origin)."
+            )
+            // WAVE-2 (§D-8): re-assert PREPARING on acquire —
+            // a predecessor speak's finally may have cleared
+            // the state to IDLE while this speak was queued.
+            JarvisStateRepository.setPlaybackState(
+                com.jarvis.autonomous.data.PlaybackState.PREPARING
             )
             // 1.4.13 (F-E6): stopped while waiting — drop
             // instead of speaking after the stop. SPK_END below
@@ -224,20 +245,41 @@ class JarvisForegroundService : Service() {
                     }
                 } finally {
                     micManager.setSpeaking(false)
+                    // WAVE-2 (§D-8): cleared in speakWrapped's
+                    // finally — runs before the mutex releases,
+                    // so a queued successor cannot interleave
+                    // between playback end and this clear.
+                    JarvisStateRepository.setPlaybackState(
+                        com.jarvis.autonomous.data.PlaybackState.IDLE
+                    )
                 }
             } else {
-                runCatching { voiceManager.speakAndWait(text) }.getOrElse { t ->
+                val result = runCatching { voiceManager.speakAndWait(text) }.getOrElse { t ->
                     JarvisStateRepository.addDiagnostic(
                         "tts", "SPK_START",
                         "Speak failed at start: ${t.javaClass.simpleName}: ${t.message ?: ""}"
                     )
                     false
                 }
+                // WAVE-2 (§D-8): same in-mutex clear as the
+                // mic branch's finally (no mic manager here).
+                JarvisStateRepository.setPlaybackState(
+                    com.jarvis.autonomous.data.PlaybackState.IDLE
+                )
+                result
             }
         }
         JarvisStateRepository.addDiagnostic(
             "tts", "SPK_END",
             "Speak finished: ok=$ok, ms=${System.currentTimeMillis() - startMs}."
+        )
+        // WAVE-2 (§D-8): cleared-on-return — marker/done/
+        // cancel all land here (SPK_END is unconditional), so
+        // the indicator can never stay stuck on SPEAKING or
+        // PREPARING after a speak returns. A queued successor
+        // re-asserts PREPARING at its own SPK_ACQUIRED.
+        JarvisStateRepository.setPlaybackState(
+            com.jarvis.autonomous.data.PlaybackState.IDLE
         )
         return ok
     }
@@ -749,6 +791,14 @@ class JarvisForegroundService : Service() {
             }
         })
         micManager.setStopSpeakingCallback { voiceManager.stopSpeaking("barge-in keyword") }
+        // WAVE-2 (§A): pump-resume paths (rms_spike /
+        // vad_segment inside the manager) call resumeDeepgram
+        // directly, with no service call site to refresh from —
+        // so the manager fires this callback on every real
+        // resume and the service re-qualifies here. Covers the
+        // last refresh gap alongside the overlay-tap refresh
+        // above and the existing mic-start refreshes.
+        micManager.onMicResumed = { refreshForegroundTypes() }
 
         floatingOverlay = FloatingJarvisOverlay(
             context = this,
@@ -775,7 +825,13 @@ class JarvisForegroundService : Service() {
                         }
                     )
                 } else if (::micManager.isInitialized && micManager.isDeepgramSuspended()) {
+                    // WAVE-2 (§A): overlay-tap resume is a mic
+                    // start/refresh — it previously called
+                    // resumeDeepgram with NO refresh, so a
+                    // background-downgraded service stayed
+                    // specialUse-only after the resume.
                     micManager.resumeDeepgram("overlay-tap")
+                    refreshForegroundTypes()
                 } else {
                     startService(
                         Intent(this, JarvisForegroundService::class.java).apply {
@@ -1106,6 +1162,16 @@ class JarvisForegroundService : Service() {
                 }
             }
 
+            ACTION_REFRESH_FGS_TYPES -> {
+                // WAVE-2 (§A): foreground-entry re-qualification
+                // (MainActivity onResume). Level-triggered: if
+                // the mic is live and RECORD_AUDIO is granted,
+                // a background-downgraded service re-upgrades
+                // here; if the mic is idle, this confirms the
+                // specialUse-only downgrade. No mic state changes.
+                refreshForegroundTypes()
+            }
+
             ACTION_REFRESH_OVERLAY -> {
                 if (prefs.floatingOverlayEnabled) {
                     floatingOverlay?.show()
@@ -1213,13 +1279,27 @@ class JarvisForegroundService : Service() {
         return types
     }
 
-    private fun startForegroundSafe(notification: Notification) {
+    /**
+     * WAVE-2 (§A): returns the ACTUALLY applied type set and
+     * records it in [lastFgsTypes] — the pre-wave-2 bug was
+     * that [refreshForegroundTypes] recorded the COMPUTED set
+     * even when this fallback ran, so a report could show
+     * "microphone|specialUse (mic live)" while the system type
+     * was specialUse-only. Now a fallback logs FGS_TYPES_ACTUAL
+     * with computed-vs-actual, and lastFgsTypes always holds
+     * the real applied set (null when even specialUse-only
+     * failed, i.e. no foreground state at all).
+     */
+    private fun startForegroundSafe(notification: Notification): Int? {
+        val requested = qualifiedForegroundTypes()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, qualifiedForegroundTypes())
+                startForeground(NOTIFICATION_ID, notification, requested)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
+            lastFgsTypes = requested
+            return requested
         } catch (e: Exception) {
             // TOCTOU (permission revoked between check and call)
             // or a background-start restriction: retry with
@@ -1230,21 +1310,32 @@ class JarvisForegroundService : Service() {
                 "nav", "FGS_TYPE_FALLBACK",
                 "Foreground start with qualified types failed (${e.javaClass.simpleName}) — retrying specialUse-only."
             )
-            runCatching {
+            val fallback = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            val ok = runCatching {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIFICATION_ID, notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                    )
+                    startForeground(NOTIFICATION_ID, notification, fallback)
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
                 }
-            }.onFailure {
+            }
+            if (ok.isSuccess) {
+                lastFgsTypes = fallback
+                JarvisStateRepository.addDiagnostic(
+                    "nav", "FGS_TYPES_ACTUAL",
+                    "Foreground types ACTUAL: specialUse-only " +
+                        "(computed was " +
+                        if (requested and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0) "microphone|specialUse" else "specialUse-only" +
+                        " — fallback applied, computed record corrected)."
+                )
+                return fallback
+            }
+            ok.onFailure {
                 JarvisStateRepository.addDiagnostic(
                     "nav", "FGS_START_FAILED",
                     "Foreground start failed even with specialUse-only (${it.javaClass.simpleName}) — service continues without foreground state."
                 )
             }
+            return null
         }
     }
 
@@ -1270,10 +1361,19 @@ class JarvisForegroundService : Service() {
         // flood diagnostics. Only a changed type set is logged
         // (FGS_TYPES_APPLIED), which is what a phone report
         // needs to prove the mic-in-use rule.
+        // WAVE-2 (§A): the APPLIED marker fires ONLY when the
+        // actually-applied set (returned by startForegroundSafe)
+        // equals the computed set AND changed — a fallback run
+        // already logged FGS_TYPES_ACTUAL inside
+        // startForegroundSafe and set lastFgsTypes to the real
+        // specialUse-only set, so no APPLIED line can lie about it.
         val types = qualifiedForegroundTypes()
-        if (types != lastFgsTypes) {
-            lastFgsTypes = types
-            val micLive = types and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0
+        val prev = lastFgsTypes
+        val applied = startForegroundSafe(
+            buildNotification("JARVIS Active — Listening in background")
+        )
+        if (applied != null && applied == types && applied != prev) {
+            val micLive = applied and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0
             JarvisStateRepository.addDiagnostic(
                 "nav", "FGS_TYPES_APPLIED",
                 "Foreground types now: " +
@@ -1281,7 +1381,6 @@ class JarvisForegroundService : Service() {
                     else "specialUse-only (mic idle)"
             )
         }
-        startForegroundSafe(buildNotification("JARVIS Active — Listening in background"))
     }
 
     private fun buildNotification(statusText: String): Notification {

@@ -180,11 +180,12 @@ class FloatingJarvisOverlay(
                     JarvisStateRepository.currentStepInfo,
                     JarvisStateRepository.micLoopEnabled,
                     JarvisStateRepository.micListening,
-                    JarvisStateRepository.micReconnecting
-                ) { state, step, loopOn, listening, reconnecting ->
-                    Quint(state, step, loopOn, listening, reconnecting)
-                }.collect { (state, step, loopOn, listening, reconnecting) ->
-                    updateHudAppearance(state, step, loopOn, listening, reconnecting)
+                    JarvisStateRepository.micReconnecting,
+                    JarvisStateRepository.playbackState
+                ) { state, step, loopOn, listening, reconnecting, playback ->
+                    Quint(state, step, loopOn, listening, reconnecting, playback)
+                }.collect { (state, step, loopOn, listening, reconnecting, playback) ->
+                    updateHudAppearance(state, step, loopOn, listening, reconnecting, playback)
                 }
             }
         }
@@ -195,7 +196,9 @@ class FloatingJarvisOverlay(
         val step: String,
         val loopOn: Boolean,
         val listening: Boolean,
-        val reconnecting: String?
+        val reconnecting: String?,
+        val playback: com.jarvis.autonomous.data.PlaybackState =
+            com.jarvis.autonomous.data.PlaybackState.IDLE
     )
 
     /** B-L13 failure channel: state log + notification, best effort
@@ -247,12 +250,23 @@ class FloatingJarvisOverlay(
         step: String,
         loopOn: Boolean,
         listening: Boolean,
-        reconnecting: String?
+        reconnecting: String?,
+        playback: com.jarvis.autonomous.data.PlaybackState =
+            com.jarvis.autonomous.data.PlaybackState.IDLE
     ) {
         val container = rootView ?: return
         val bg = container.background as? GradientDrawable
 
+        // WAVE-2 (§D-8): true playback wins over agentState
+        // for speaking — agentState SPEAKING is set at speak
+        // REQUEST time, so without this the pill shows
+        // "Bol raha hoon" through the whole connect gap.
+        // PREPARING is its own label, never hidden.
         val (icon, label, borderColor, showStop) = when {
+            playback == com.jarvis.autonomous.data.PlaybackState.SPEAKING ->
+                Quad("🔊", step.ifBlank { "Bol raha hoon" }, "#00B0FF", true)
+            playback == com.jarvis.autonomous.data.PlaybackState.PREPARING ->
+                Quad("⏳", "Bolne ki tayyari…", "#78909C", true)
             state == AgentRunState.LISTENING -> Quad("🟢", step.ifBlank { "Sun raha hoon" }, "#00E676", false)
             state == AgentRunState.THINKING -> Quad("🧠", step.ifBlank { "Soch raha hoon" }, "#D500F9", true)
             state == AgentRunState.EXECUTING_STEP -> Quad("⚡", step.ifBlank { "Kaam kar raha hoon" }, "#FFAB00", true)
