@@ -1941,11 +1941,11 @@ fun AiBrainSettingsScreen(
 
         // B-L12: the old Voice Speech Speed slider is REMOVED —
         // it only ever tuned system TTS, which no longer exists
-        // (Swara build, prosody rate +0%, pitch -12%).
+        // (Swara build, prosody rate +0%, pitch +0%).
         // A slider that saves a dead pref is worse than no slider.
         Text(
             text = "Voice speed: Swara prosody default par bolta hai " +
-                "(rate +0%, pitch -12% — speed slider hataya gaya, wo sirf purani system " +
+                "(rate +0%, pitch +0% — speed slider hataya gaya, wo sirf purani system " +
                 "voice ko control karta tha).",
             fontSize = 13.sp
         )

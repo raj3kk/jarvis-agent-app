@@ -20,7 +20,7 @@ enum class AiProvider(
     GEMINI(
         "Google Gemini (Recommended)", "gemini-3.5-flash-lite",
         "https://generativelanguage.googleapis.com/v1beta",
-        listOf("gemini-3.8-flash", "gemini-3-flash-preview")
+        listOf("gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3-flash-preview")
     ),
     // gpt-4o-mini still answers in Nov 2026; OpenAI shuts the GPT-4 family
     // down on 2027-01-14 (replacement gpt-6-luna, a reasoning model).

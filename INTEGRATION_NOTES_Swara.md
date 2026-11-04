@@ -29,7 +29,7 @@ bundled assets are all deleted in the same change.
 - **SSML (edge-tts shape, replicated exactly):**
   `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'
   xml:lang='en-US'><voice name='hi-IN-SwaraNeural'><prosody
-  pitch='+0Hz' rate='+0%' volume='+0%'>ESCAPED_TEXT</prosody></voice></speak>`
+  pitch='+0%' rate='+0%' volume='+0%'>ESCAPED_TEXT</prosody></voice></speak>`
   — `xml:lang='en-US'` is hardcoded by edge-tts regardless of voice
   (not a mistake), and the SSML `X-Timestamp` trailing `Z` is a
   Microsoft Edge bug replicated by edge-tts (speech.config uses the
@@ -169,7 +169,7 @@ bundled assets are all deleted in the same change.
   `app/build.gradle.kts` itself; the Gemma `buildConfigField` was not
   touched. One voice for ALL text (incl. English replies —
   Indian-accented English is acceptable, spec-ordered); prosody defaults
-  rate +0%, pitch +0Hz, volume +0% (edge-tts defaults); no speed slider.
+  rate +0%, pitch +0%, volume +0% (edge-tts defaults); no speed slider.
 
 ## Phone-test proof note (for the parent / tester — NOT done by Phase 1)
 

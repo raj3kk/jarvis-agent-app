@@ -198,7 +198,7 @@ object SystemTtsFallbackSpeaker {
             // WAVE-2 (ADD 1d): fallback-only tuning, literals —
             // NEVER prefs.voicePitch/prefs.voiceSpeed, and never
             // applied to Swara (different object/path; Swara's
-            // deep voice is Edge SSML prosody pitch='-12%'
+            // normal voice is Edge SSML prosody pitch='+0%'
             // rate='+0%' in SwaraTtsClient).
             engine.setSpeechRate(0.9f)
             engine.setPitch(1.0f)
