@@ -1911,7 +1911,7 @@ fun AiBrainSettingsScreen(
         // saves a dead pref is worse than no slider.
         Text(
             text = "Voice speed: Swara prosody default par bolta hai " +
-                "(rate +0%, pitch +0Hz — speed slider hataya gaya, wo sirf purani system " +
+                "(rate +0%, pitch -12% — speed slider hataya gaya, wo sirf purani system " +
                 "voice ko control karta tha).",
             fontSize = 13.sp
         )

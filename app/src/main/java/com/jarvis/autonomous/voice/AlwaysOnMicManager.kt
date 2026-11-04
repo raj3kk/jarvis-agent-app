@@ -178,16 +178,21 @@ class AlwaysOnMicManager(
      * for the LIVE-transcript echo gate after speech ends.
      * Set on every setSpeaking(true); cleared when the next
      * NON-echo turn completes, when the next speak starts
-     * (overwritten), or when the loop stops. Content-gated
+     * (overwritten), when the loop stops, or — G8 MINOR-1 fix —
+     * immediately after the live gate drops its first FINAL on
+     * fingerprint match (see the live gate below). Content-gated
      * ONLY — there is deliberately no timer and no post-speech
      * grace window: a live transcript is dropped exactly when
      * it is a subsequence of this text, however late it arrives
      * (speaker drain tail), and genuine new speech is never
-     * time-blocked. Edge case, accepted by design: a user
-     * command that is VERBATIM a subsequence of the last
-     * spoken text is dropped until the next speak refreshes
-     * the fingerprint — the user rephrases, or a stop keyword
-     * still barges in during speech.
+     * time-blocked. Retiring after the first dropped final
+     * breaks the repeat-stuck trap: a legitimate follow-up
+     * whose tokens are a subsequence of the last spoken text
+     * is dropped at most once per speak and is heard on its
+     * second attempt, while the single drain-tail final is
+     * still consumed — Deepgram sends one final per segment,
+     * so retiring here cannot re-open the echo loop. A stop
+     * keyword still barges in during speech.
      */
     private var echoFingerprintText: String = ""
 
@@ -1304,6 +1309,12 @@ class AlwaysOnMicManager(
         // never time-blocked and tail echo is never time-let-in.
         // Finals get one diagnostic line (bounded, one per echo
         // utterance); interims drop silently like the flush.
+        // G8 MINOR-1: retire the fingerprint after the first
+        // dropped FINAL — at most one final per speak is dropped
+        // this way, so a repeated legitimate command is heard on
+        // its second attempt. Interims do NOT retire it (the
+        // drain-tail final is the transcript this rule must
+        // consume); no timer or grace window is added.
         if (echoFingerprintText.isNotBlank() &&
             isEchoOfSpoken(text, echoFingerprintText)
         ) {
@@ -1312,6 +1323,7 @@ class AlwaysOnMicManager(
                     "stt", "ECHO_DROPPED_LIVE",
                     "Live transcript dropped as echo of last spoken text (content gate, no timer)."
                 )
+                echoFingerprintText = ""
             }
             return
         }
