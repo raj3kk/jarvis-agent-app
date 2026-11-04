@@ -1324,7 +1324,7 @@ class JarvisAgentEngine(
                             v.emptyFiles.map { "$it khaali" }).joinToString(", ")
                         val repairNote = "Build validation fail ho gaya — $detail. In files ko dobara likh raha hoon, success tabhi bolunga jab validation OK ho."
                         JarvisStateRepository.addChatMessage("Jarvis", repairNote)
-                        speak(repairNote)
+                        speak(repairNote, alreadyPostedToChat = true)
                         currentGoal = "$initialGoal (Repair: $detail dobara likhna hai)"
                         step++
                         continue
@@ -1369,7 +1369,7 @@ class JarvisAgentEngine(
                                 "Preview: ${ProjectStore.localhostUrl(projectName)} — " +
                                 "Projects tab me Preview dabao, ya Browser me kholo (full-screen, wahi preview)."
                             JarvisStateRepository.addChatMessage("Jarvis", summary)
-                            speak(summary)
+                            speak(summary, alreadyPostedToChat = true)
                         }
                     }
                     // Verified completion: persist the learned
