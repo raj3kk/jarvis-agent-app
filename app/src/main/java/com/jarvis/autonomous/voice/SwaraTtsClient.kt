@@ -249,6 +249,9 @@ object SwaraTtsClient {
     @Volatile
     private var currentDecoder: MediaCodec? = null
 
+    @Volatile
+    private var currentPlayback: Playback? = null
+
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
@@ -270,6 +273,7 @@ object SwaraTtsClient {
         runCatching { currentTrack?.stop() }
         runCatching { currentTrack?.flush() }
         runCatching { currentDecoder?.flush() }
+        runCatching { currentPlayback?.cancelTailWait() }
     }
 
     /**
@@ -620,6 +624,7 @@ object SwaraTtsClient {
             myGen, cancelled, generation,
             { currentDecoder = it }, { currentTrack = it }
         )
+        currentPlayback = playback
         try {
             val url = SwaraDrm.buildSpeechUrl(
                 SwaraDrm.connectId(),
@@ -645,6 +650,7 @@ object SwaraTtsClient {
             var anyAudio = false
             var firstAudioMs = -1L
             var failure: AttemptResult.Failure? = null
+            var tailCancelled = false
             var done = false
 
             while (!done) {
@@ -727,9 +733,15 @@ object SwaraTtsClient {
                                 // Drain everything still queued,
                                 // then decoder EOS, then let the
                                 // track play out to its marker.
+                                // G8 F1: a barge-in during this tail
+                                // window must report Cancelled, not
+                                // Success — waitPlaybackComplete
+                                // returns false when cut short.
                                 playback.feedPending()
                                 playback.finishAndDrain(overallDeadlineMs)
-                                playback.waitPlaybackComplete()
+                                if (!playback.waitPlaybackComplete()) {
+                                    tailCancelled = true
+                                }
                                 done = true
                             }
                         }
@@ -763,6 +775,7 @@ object SwaraTtsClient {
                 playback.feedPending()
                 playback.drainOutput(0)
             }
+            if (tailCancelled) return AttemptResult.Cancelled
             if (failure != null) return failure
             // Reached here only via the TurnEnd branch with audio:
             // success (finishAndDrain already ran). If the loop
@@ -781,6 +794,7 @@ object SwaraTtsClient {
             )
         } finally {
             playback.release()
+            if (currentPlayback === playback) currentPlayback = null
             runCatching { socket?.close(1000, "done") }
             if (currentSocket === socket) currentSocket = null
         }
@@ -1036,18 +1050,32 @@ object SwaraTtsClient {
             }
         }
 
+        /** Tail-wait deferred, completed by cancelTailWait() on stop. */
+        @Volatile
+        private var tailDone: CompletableDeferred<Unit>? = null
+
+        /** Called from stop(): wakes a tail wait immediately. */
+        fun cancelTailWait() {
+            tailDone?.complete(Unit)
+        }
+
         /**
          * Waits for the track to actually play out (marker at
          * the last written frame, event-driven — no polling,
          * no delay()). Bounded by remaining audio + margin.
+         * Returns false when a stop cut the tail short (G8 F1);
+         * a plain timeout still counts as played (audio was
+         * delivered to the track), unless a stop also landed.
          */
-        suspend fun waitPlaybackComplete() {
-            val tr = track ?: return
-            if (totalFramesWritten <= 0) return
+        suspend fun waitPlaybackComplete(): Boolean {
+            val tr = track ?: return true
+            if (totalFramesWritten <= 0) return true
+            if (cancelled.get() || generation.get() != myGen) return false
             val head = runCatching { tr.playbackHeadPosition }.getOrDefault(0)
-            if (head >= totalFramesWritten) return
+            if (head >= totalFramesWritten) return true
             val remainingMs = ((totalFramesWritten - head) * 1000L / trackRate) + 5_000L
             val done = CompletableDeferred<Unit>()
+            tailDone = done
             try {
                 tr.setPlaybackPositionUpdateListener(
                     object : AudioTrack.OnPlaybackPositionUpdateListener {
@@ -1060,19 +1088,21 @@ object SwaraTtsClient {
                 )
                 tr.notificationMarkerPosition = totalFramesWritten.toInt()
             } catch (e: Exception) {
-                return
+                return true
             }
             try {
                 withTimeoutOrNull(remainingMs.coerceIn(1_000L, 60_000L)) {
                     done.await()
                 }
             } catch (e: Exception) {
-                // Timeout or cancellation: playback tail is cut,
-                // but the speak still counts as played (audio was
-                // delivered to the track). Release proceeds.
+                // Timeout: playback tail is cut, but the speak
+                // still counts as played (audio was delivered
+                // to the track) — unless a stop also landed.
             } finally {
+                if (tailDone === done) tailDone = null
                 runCatching { tr.setPlaybackPositionUpdateListener(null) }
             }
+            return !(cancelled.get() || generation.get() != myGen)
         }
 
         fun release() {

@@ -166,9 +166,17 @@ class JarvisAgentEngine(
      *  SPK_START line (1.4.10 Step 3): engine replies default to
      *  "reply"; announces pass their own origin so the next
      *  report can tell a reply from an announcement. */
-    private suspend fun speak(text: String, origin: String = "reply"): Boolean {
+    private suspend fun speak(
+        text: String,
+        origin: String = "reply",
+        alreadyPostedToChat: Boolean = false
+    ): Boolean {
         val spoken = onSpeakAndAwait(text, origin)
-        if (!spoken) {
+        // G8 F2: callers that already posted this exact line to chat
+        // before calling speak() must not get a duplicate line on
+        // TTS failure — the failure re-post exists only for callers
+        // that did NOT pre-post (greeting / askUserVoice paths).
+        if (!spoken && !alreadyPostedToChat) {
             JarvisStateRepository.addChatMessage("Jarvis", text)
         }
         return spoken
@@ -317,7 +325,7 @@ class JarvisAgentEngine(
         scope.launch {
             val announcement = "Bhai, $sender ka message aaya hai: ${message.take(90)}"
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            speak(announcement, "announce-notification")
+            speak(announcement, "announce-notification", alreadyPostedToChat = true)
         }
     }
 
@@ -342,7 +350,7 @@ class JarvisAgentEngine(
             // speech from this path.
             val announcement = "Bhai, call aa rahi hai."
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
-            speak(announcement, "announce-call")
+            speak(announcement, "announce-call", alreadyPostedToChat = true)
         }
     }
 
@@ -1209,7 +1217,7 @@ class JarvisAgentEngine(
                             AgentRunState.SPEAKING,
                             "Speaking: ${decision.reply}"
                         )
-                        replyWasSpoken = speak(decision.reply)
+                        replyWasSpoken = speak(decision.reply, alreadyPostedToChat = true)
                     }
                 } else if (decision.isCompleted || decision.askUser) {
                     // 1.4.3: a FINAL answer / question that arrives

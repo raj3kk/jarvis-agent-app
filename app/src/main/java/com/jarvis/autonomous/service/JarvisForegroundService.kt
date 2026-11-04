@@ -478,9 +478,12 @@ class JarvisForegroundService : Service() {
                 if (pendingVoiceReply === deferred) pendingVoiceReply = null
             }
         }
-        // 1.4.3: loop OFF — Deepgram one-shot FIRST (key present),
-        // system single-reply second (key missing or Deepgram
-        // timeout/failure). Speaking stays Swara either way.
+        // 1.4.3 (G8 N4 reword): loop OFF — Deepgram ONLY, everywhere.
+        // Deepgram one-shot first (key present); otherwise the
+        // VoiceManager single-reply path, which is Deepgram-session
+        // only — there is no system-recognizer second path any more
+        // (Deepgram-only mic policy, 1.4.5 FINAL). Speaking stays
+        // Swara either way.
         val dgKey = prefs.deepgramApiKey
         if (dgKey.isNotBlank()) {
             val heard = runCatching {
