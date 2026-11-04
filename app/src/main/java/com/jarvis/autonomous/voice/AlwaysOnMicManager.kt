@@ -1845,8 +1845,9 @@ fun interface StopSpeakingCallback {
  * OPTIONAL Sherpa-ONNX Silero VAD monitor (S1 VAD path).
  *
  * Verified API (sherpa-onnx 1.13.4 AAR, classes.jar inspected with
- * javap): com.k2fsa.sherpa.onnx.Vad(AssetManager, VadModelConfig),
- * Vad(VadModelConfig) (file constructor, for a filesDir path),
+ * javap): com.k2fsa.sherpa.onnx.Vad(AssetManager?, VadModelConfig)
+ * — null AssetManager routes to native newFromFile, non-null
+ * routes to newFromAsset (bytecode-verified, 1.4.15).
  * acceptWaveform(FloatArray), isSpeechDetected(), empty(),
  * front(): SpeechSegment(start: Int, samples: FloatArray), pop(),
  * flush(), reset(), release(); VadModelConfig(SileroVadModelConfig,
@@ -1955,14 +1956,16 @@ class SherpaVadMonitor(
                             VAD_MAX_SPEECH_SEC
                         )
                     )
-                    // 1.4.15: file constructor, NOT the
-                    // AssetManager one: the model path here is a
-                    // filesDir ABSOLUTE path, and the AssetManager
-                    // constructor routes to native newFromAsset,
-                    // which expects an asset-relative name. The
-                    // file constructor routes to newFromFile and
-                    // runs config.Validate().
-                    vad = Vad(config)
+                    // 1.4.15: null AssetManager = file path. The
+                    // model path here is a filesDir ABSOLUTE path,
+                    // and the Vad constructor routes on it: null
+                    // AssetManager -> native newFromFile (which
+                    // runs config.Validate()); non-null -> native
+                    // newFromAsset, which expects an asset-relative
+                    // name. (Bytecode-verified on the CI AAR: there
+                    // is no single-arg Vad(config) constructor —
+                    // the first CI run failed on exactly that.)
+                    vad = Vad(null, config)
                     null
                 }
             } catch (e: Exception) {
