@@ -2,6 +2,7 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.net.NetworkCapabilities
 import com.jarvis.autonomous.data.AgentRunState
@@ -65,6 +66,13 @@ class JarvisAgentEngine(
     private val learnedRoutineStore = LearnedRoutineStore(context)
     private val memoryIndex = MemoryIndex(context)
     private var activeTaskJob: Job? = null
+    // 1.4.14 (D1): announce dedupe — in-memory only, dies with
+    // process death, never persisted. Key = trimmed sender +
+    // trimmed text of the notification; value = elapsedRealtime
+    // ms when that announce actually happened. Pruned on every
+    // check (no timer, no handler); expired keys are dropped,
+    // never consulted.
+    private val recentAnnounces = mutableMapOf<String, Long>()
     private var chatRestored = false
 
     // 1.4.0 browser approval state (see Browser §7): a URL Jarvis
@@ -323,6 +331,33 @@ class JarvisAgentEngine(
     fun announceIncomingNotification(sender: String, message: String) {
         if (isTaskRunning()) return
         scope.launch {
+            // 1.4.14 (D1): dedupe lives ONLY here, inside the
+            // announce path — never in JarvisNotificationService
+            // (its tab listing + reply-handle storage stay ungated)
+            // and never via VoiceManager coalescing (downstream,
+            // keyed on spoken text, cannot tell call announces
+            // from notification announces). Drops below NEVER
+            // arm the record: the record updates only when an
+            // announce actually happens.
+            if (isTaskRunning()) return@launch
+            if (!prefs.autoAnnounceNotifications) return@launch
+            val trimmedSender = sender.trim()
+            val trimmedMessage = message.trim()
+            if (trimmedSender.isBlank() || trimmedMessage.isBlank()) return@launch
+            val now = SystemClock.elapsedRealtime()
+            val dedupeKey = trimmedSender + "\u0001" + trimmedMessage
+            val pruneIt = recentAnnounces.entries.iterator()
+            while (pruneIt.hasNext()) {
+                if (now - pruneIt.next().value >= 60_000L) pruneIt.remove()
+            }
+            val lastAnnounced = recentAnnounces[dedupeKey]
+            if (lastAnnounced != null && now - lastAnnounced < 60_000L) {
+                // Content-free log only: sender/text values must
+                // never reach diagnostics (repository header rule).
+                JarvisStateRepository.addLog("Announce deduped: identical sender+text within 60s")
+                return@launch
+            }
+            recentAnnounces[dedupeKey] = now
             val announcement = "Bhai, $sender ka message aaya hai: ${message.take(90)}"
             JarvisStateRepository.addChatMessage("Jarvis", announcement)
             speak(announcement, "announce-notification", alreadyPostedToChat = true)

@@ -132,6 +132,33 @@ import kotlinx.coroutines.withContext
  * foreground service is running, and must prompt the battery
  * exemption on first enable (see [buildBatteryExemptionIntent]).
  */
+/**
+ * 1.4.14 (D2): WHY a VAD init failed — diagnostics tokens only,
+ * never paths, exception text, or message content. The reason is
+ * set atomically where the failure is detected (Sherpa init /
+ * enable), never recomputed later by the coordinator, because
+ * mic state can change between start() success and the enable
+ * call. COPY_FAILED is a coordinator-side bucket (asset copy
+ * threw) — the mic manager never returns it; the foreground
+ * service records it from its own copy try/catch.
+ */
+enum class VadFailureReason {
+    MODEL_MISSING,
+    VAD_CONSTRUCTION_FAILED,
+    LOOP_OFF,
+    COPY_FAILED
+}
+
+/**
+ * 1.4.14 (D2): enableVadMonitor result. Started carries no
+ * reason (success lines stay reason-free); Failed carries the
+ * token from the failure site.
+ */
+sealed class VadMonitorResult {
+    data object Started : VadMonitorResult()
+    data class Failed(val reason: VadFailureReason) : VadMonitorResult()
+}
+
 class AlwaysOnMicManager(
     context: Context,
     private val listener: AlwaysOnMicListener
@@ -1252,21 +1279,30 @@ class AlwaysOnMicManager(
      * file (see [SherpaVadMonitor]); if it is missing or VAD setup
      * fails, this is a no-op and the recognizer timer stays primary.
      * Call only after [start]; the monitor stops with [stop].
-     * Returns true only if the monitor actually started.
+     * Returns [VadMonitorResult.Started] only if the monitor
+     * actually started; on failure the reason comes from the
+     * failure site (loop-off here, model/construction from
+     * the monitor's own init). The Deepgram early-return path
+     * (monitor available, no runLoop in deepgram mode) stays
+     * Started with NO reason token.
      */
-    fun enableVadMonitor(modelFile: File, onSegment: (SpeechSegment) -> Unit): Boolean {
-        if (!enabled) return false
+    fun enableVadMonitor(modelFile: File, onSegment: (SpeechSegment) -> Unit): VadMonitorResult {
+        if (!enabled) return VadMonitorResult.Failed(VadFailureReason.LOOP_OFF)
         val monitor = SherpaVadMonitor(appContext, modelFile, onSegment) { isSpeaking }
-        if (!monitor.isAvailable()) return false
+        if (!monitor.isAvailable()) {
+            return VadMonitorResult.Failed(
+                monitor.failureReason ?: VadFailureReason.VAD_CONSTRUCTION_FAILED
+            )
+        }
         stopVadMonitor()
         vadMonitor = monitor
         vadSegmentCallback = onSegment
         // 1.4.3: in Deepgram mode the pump feeds this monitor in
         // tap mode — starting runLoop here would open a SECOND
         // AudioRecord and steal the mic from the pump.
-        if (sttPath == "deepgram") return true
+        if (sttPath == "deepgram") return VadMonitorResult.Started
         vadJob = vadScope.launch { monitor.runLoop() }
-        return true
+        return VadMonitorResult.Started
     }
 
     /**
@@ -1879,26 +1915,45 @@ class SherpaVadMonitor(
     @Volatile
     private var available: Boolean = false
 
+    // 1.4.14 (D2): reason for init failure, set atomically in
+    // init — null on success. Model-file-missing is kept
+    // distinct from null-config / Vad(...) throw, which the
+    // old single available flag collapsed together.
+    var failureReason: VadFailureReason? = null
+        private set
+
     init {
-        available = runCatching {
-            if (!modelFile.exists()) return@runCatching false
-            // getVadModelConfig's Kotlin metadata declares a
-            // nullable return (VadModelConfig?), so a null result
-            // means VAD is unavailable — same as a missing model.
-            val baseConfig = getVadModelConfig(SAMPLE_RATE_HZ) ?: return@runCatching false
-            val config = baseConfig.copy(
-                sileroVadModelConfig = SileroVadModelConfig(
-                    modelFile.absolutePath,
-                    VAD_THRESHOLD,
-                    VAD_MIN_SILENCE_SEC,
-                    VAD_MIN_SPEECH_SEC,
-                    VAD_WINDOW_SIZE,
-                    VAD_MAX_SPEECH_SEC
-                )
-            )
-            vad = Vad(appContext.assets, config)
-            true
-        }.getOrDefault(false)
+        failureReason = if (!modelFile.exists()) {
+            VadFailureReason.MODEL_MISSING
+        } else {
+            try {
+                // getVadModelConfig's Kotlin metadata declares a
+                // nullable return (VadModelConfig?), so a null
+                // result means VAD is unavailable — a
+                // construction failure, NOT a missing model
+                // (the file exists; the config could not be built).
+                val baseConfig = getVadModelConfig(SAMPLE_RATE_HZ)
+                if (baseConfig == null) {
+                    VadFailureReason.VAD_CONSTRUCTION_FAILED
+                } else {
+                    val config = baseConfig.copy(
+                        sileroVadModelConfig = SileroVadModelConfig(
+                            modelFile.absolutePath,
+                            VAD_THRESHOLD,
+                            VAD_MIN_SILENCE_SEC,
+                            VAD_MIN_SPEECH_SEC,
+                            VAD_WINDOW_SIZE,
+                            VAD_MAX_SPEECH_SEC
+                        )
+                    )
+                    vad = Vad(appContext.assets, config)
+                    null
+                }
+            } catch (e: Exception) {
+                VadFailureReason.VAD_CONSTRUCTION_FAILED
+            }
+        }
+        available = failureReason == null && vad != null
         if (!available) {
             synchronized(vadLock) {
                 runCatching { vad?.release() }

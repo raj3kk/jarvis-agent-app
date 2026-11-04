@@ -36,6 +36,8 @@ import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
 import com.jarvis.autonomous.voice.DeepgramSttClient
+import com.jarvis.autonomous.voice.VadFailureReason
+import com.jarvis.autonomous.voice.VadMonitorResult
 import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.voice.VoiceManager
 import kotlinx.coroutines.CompletableDeferred
@@ -530,8 +532,20 @@ class JarvisForegroundService : Service() {
                 "tts", "VAD_INIT_START",
                 "Sherpa VAD init started."
             )
-            val started = runCatching {
-                val target = File(filesDir, "silero_vad.onnx")
+            // 1.4.14 (D2): asset-copy outcome and enable outcome
+            // are split BEFORE any collapse, so VAD_INIT_END can
+            // say WHY started=false. The copy runs in its own
+            // try/catch (COPY_FAILED if it throws); the enable
+            // result carries its own failure-site reason. If the
+            // copy threw but enable still started, that is a
+            // success with NO reason token. If a full-size
+            // filesDir copy already exists, the copy is skipped
+            // — and a successful enable is then started=true
+            // with NO reason, even if the APK asset is missing
+            // (that is a success, never MODEL_MISSING).
+            val target = File(filesDir, "silero_vad.onnx")
+            var copyFailed = false
+            try {
                 val assetSize = runCatching {
                     assets.openFd("silero_vad.onnx").use { it.length }
                 }.getOrDefault(-1L)
@@ -542,14 +556,28 @@ class JarvisForegroundService : Service() {
                         }
                     }
                 }
+            } catch (e: Exception) {
+                copyFailed = true
+            }
+            val vadResult = runCatching {
                 micManager.enableVadMonitor(target) { _ ->
                     // Echo-gated segments; no per-segment action:
                     // the recognizer timer remains the primary path.
                 }
-            }.getOrDefault(false)
+            }.getOrDefault(
+                VadMonitorResult.Failed(VadFailureReason.VAD_CONSTRUCTION_FAILED)
+            )
+            val started = vadResult is VadMonitorResult.Started
+            val failureReason: VadFailureReason? = when {
+                started -> null
+                copyFailed -> VadFailureReason.COPY_FAILED
+                vadResult is VadMonitorResult.Failed -> vadResult.reason
+                else -> null
+            }
             JarvisStateRepository.addDiagnostic(
                 "tts", "VAD_INIT_END",
-                "Sherpa VAD init finished (started=$started)."
+                "Sherpa VAD init finished (started=$started)" +
+                    (if (failureReason != null) " reason=$failureReason" else "") + "."
             )
             JarvisStateRepository.addLog(
                 "Silero VAD monitor started=$started " +
