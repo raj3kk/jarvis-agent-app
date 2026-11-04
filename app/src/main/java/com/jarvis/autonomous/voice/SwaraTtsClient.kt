@@ -1041,7 +1041,7 @@ object SwaraTtsClient {
          * the last written frame, event-driven — no polling,
          * no delay()). Bounded by remaining audio + margin.
          */
-        private suspend fun waitPlaybackComplete() {
+        suspend fun waitPlaybackComplete() {
             val tr = track ?: return
             if (totalFramesWritten <= 0) return
             val head = runCatching { tr.playbackHeadPosition }.getOrDefault(0)

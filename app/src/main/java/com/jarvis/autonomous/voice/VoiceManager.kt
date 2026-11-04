@@ -21,7 +21,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
-/**
  * VoiceManager — Swara PRIMARY + system-TTS fallback (1.4.12).
  *
  * SPEECH (output) is Swara (Microsoft Edge Read-Aloud voice
@@ -132,7 +131,6 @@ class VoiceManager(
     private var lastAbortReason: String? = null
     private var lastAbortMs: Long = 0L
 
-    /**
     /**
      * Speaks [text] with Swara primary + system-TTS fallback
      * (1.4.12 hybrid). Returns true if the full text was spoken
