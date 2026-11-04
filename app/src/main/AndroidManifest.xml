@@ -11,7 +11,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -103,27 +102,14 @@
                 android:value="Autonomous voice assistant and multi-step agent (microphone FGS type only while listening)" />
         </service>
 
-        <!-- 1.4.5: Kokoro TTS in an ISOLATED process (:tts). A
-             native Sherpa/ONNX death during model load / generate
-             kills only this process, never the UI process — the
-             main-process client (TtsProcessClient) observes the
-             binder death and degrades to a visible failure.
-             Not exported: only this app binds to it.
-             1.4.8: foregroundServiceType="mediaPlayback" so the
-             service can promote itself to foreground DURING a
-             speak (TTS_FG_STARTED) — a secondary process is the
-             first LMK victim on Vivo; foreground oom_adj is the
-             strongest survival signal available. The matching
-             FOREGROUND_SERVICE_MEDIA_PLAYBACK permission is
-             declared above (Android 14 requires it for this
-             type). Promotion is speak-scoped only (see
-             KokoroTtsService): no permanent second notification. -->
-        <service
-            android:name=".service.KokoroTtsService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="mediaPlayback"
-            android:process=":tts" />
+        <!-- 1.4.12: the isolated :tts speech process is GONE.
+             Swara runs in the main process (SwaraTtsClient), so
+             no second service, no mediaPlayback FGS type, and no
+             FOREGROUND_SERVICE_MEDIA_PLAYBACK permission are
+             needed any more. Background playback (notification /
+             call announce while backgrounded) comes from this
+             main foreground service (microphone|specialUse) —
+             a phone test, not a manifest claim. -->
 
         <!-- Floating Whiteboard over other apps (S4, 1.4.0) -->
         <service

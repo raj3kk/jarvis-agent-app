@@ -21,19 +21,27 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
- * VoiceManager — Kokoro PRIMARY + system-TTS fallback (1.4.10).
+/**
+ * VoiceManager — Swara PRIMARY + system-TTS fallback (1.4.12).
  *
- * SPEECH (output) is Kokoro hf_alpha, on-device via Sherpa-ONNX,
- * first. The 1.3.0 chain is gone, deliberately:
+ * SPEECH (output) is Swara (Microsoft Edge Read-Aloud voice
+ * hi-IN-SwaraNeural, cloud, free, no key) first, via
+ * SwaraTtsClient in the MAIN process (streaming MP3 decode to
+ * AudioTrack, first-audio-ASAP). The 1.3.0 chain is gone,
+ * deliberately:
  *  - Deepgram TTS (cloud, user key) — REMOVED.
  *  - Gemini TTS Sulafat (cloud, user key, tiny free quota) — REMOVED.
  *  - Android system TextToSpeech as a PRIMARY voice — REMOVED.
- * 1.4.10 hybrid (Phase 1 audit verdict): system TextToSpeech
- * returns ONLY as a fallback when Kokoro is latched (3
- * consecutive failed speaks) or the failing speak trips the
- * latch — never for toggle-OFF, never for a first/second
- * failure, never silently (TTS_FALLBACK_USED + latch card name
- * the voice that spoke; the fallback voice is NOT hf_alpha).
+ *  - The 1.4.11 bundled on-device voice — REMOVED in 1.4.12
+ *    (user order 2026-11-04: Swara primary, bundled voice fully
+ *    removed, replies fast via streaming).
+ * 1.4.12 hybrid: system TextToSpeech returns as a fallback when
+ * Swara is latched (3 consecutive failed speaks), when the
+ * failing speak trips the latch, OR when the Swara toggle is
+ * OFF — toggle-OFF no longer refuses (the 1.4.11 OFF-refusal is
+ * gone: OFF means "system voice speaks", never silence).
+ * Never for a first/second failure, never silently
+ * (TTS_FALLBACK_USED + latch card name the voice that spoke).
  * 1.4.5 FINAL MIC POLICY (user order 2026-11-03 ~19:36 IST):
  * system SpeechRecognizer is REMOVED ENTIRELY — loop, one-shot,
  * wake-word, everywhere. Listening is Deepgram ONLY, via the
@@ -42,37 +50,36 @@ import kotlin.coroutines.resume
  * [cancelListenOnceSession]). The old "System STT below is
  * UNTOUCHED" note is DEAD: there is no system STT left here.
  *
- * If Kokoro is unavailable, [speakAndWait] returns false and logs a
- * clear message — UNLESS the Kokoro latch is active (or this
- * speak trips it), in which case the system-TTS fallback speaks
- * instead (1.4.10 hybrid, see above) and true means "spoken by
- * the fallback". It never leaves the caller guessing: false
- * means "nothing was spoken". Callers that only need
- * fire-and-forget speech can ignore the return value — the
- * service lambda
+ * If Swara is unavailable, [speakAndWait] returns false and logs a
+ * clear message — UNLESS the Swara latch is active (or this
+ * speak trips it) or the toggle is OFF, in which case the
+ * system-TTS fallback speaks instead (1.4.12 hybrid, see above)
+ * and true means "spoken by the fallback". It never leaves the
+ * caller guessing: false means "nothing was spoken". Callers
+ * that only need fire-and-forget speech can ignore the return
+ * value — the service lambda
  * `onSpeakAndAwait = { text, origin -> speakWrapped(text, origin) }`
  * still compiles unchanged, because a Boolean result is coerced to
  * Unit for a `suspend (String, String) -> Unit` function type.
  *
- * Signature change (documented, see INTEGRATION_NOTES_Kokoro.md):
+ * Signature change (documented, see INTEGRATION_NOTES_Swara.md):
  *  - 1.3.0: `suspend fun speakAndWait(text: String)` (Unit)
  *  - 1.4.0: `suspend fun speakAndWait(text: String): Boolean`
  * [stopSpeaking] is unchanged in signature.
  *
- * First-run behaviour: the first call triggers
- * KokoroTtsClient's bundled-asset copy (assets/kokoro/ -> files
- * dir Kokoro/) with progress logging. That copy must ALSO be
- * driven from the UI at app launch with a VISIBLE progress screen
- * (see INTEGRATION_NOTES_Kokoro.md §5) — this class only logs, it
- * cannot show a screen, so a speak-triggered copy is the safety
- * net, not the intended first-run UX.
+ * First-run behaviour (1.4.12): there is NO bundled-voice copy
+ * any more — Swara needs no local model. The first 1.4.12 run
+ * deletes the legacy bundled-voice model dir in the background
+ * (see SwaraTtsClient.cleanupLegacyModelDir, called from
+ * MainActivity launch) to free ~190 MB; a rollback to 1.4.11
+ * would re-copy from that APK's bundled assets.
  *
  * prefs.voiceSpeed / prefs.voicePitch are no longer applied here:
- * they only ever tuned system TTS. Kokoro speaks at its fixed
- * speed (1.0f in KokoroTtsClient). The prefs fields themselves
- * live in JarvisPreferences (outside this worker's ownership) and
- * are listed as dead in the integration notes until the
- * coordinator removes or rewires the slider.
+ * they only ever tuned system TTS. Swara speaks at Edge prosody
+ * defaults (rate +0%, pitch +0Hz, volume +0%). The prefs fields
+ * themselves live in JarvisPreferences (outside this worker's
+ * ownership) and are listed as dead in the integration notes
+ * until the coordinator removes or rewires the slider.
  */
 class VoiceManager(
     private val context: Context,
@@ -112,7 +119,7 @@ class VoiceManager(
 
     private enum class SpeakSlot { ACQUIRED, COALESCED, FULL, TIMEOUT, DRAINED }
     /**
-     * 1.4.3: true while a Kokoro utterance is playing. Mic-tap
+     * 1.4.3: true while a Swara utterance is playing. Mic-tap
      * paths read this to QUEUE listening until TTS ends instead
      * of cutting speech mid-word (the old stopSpeaking() on tap
      * was a top "bolti hi nahi / band ho jati hai" cause).
@@ -126,16 +133,15 @@ class VoiceManager(
     private var lastAbortMs: Long = 0L
 
     /**
-     * Speaks [text] with Kokoro primary + system-TTS fallback
-     * (1.4.10 hybrid). Returns true if the full text was spoken
+    /**
+     * Speaks [text] with Swara primary + system-TTS fallback
+     * (1.4.12 hybrid). Returns true if the full text was spoken
      * (by either voice), false if nothing (or only part) was
-     * spoken — e.g. Kokoro disabled in prefs, bundled model
-     * missing, free space too low for the first-run copy,
-     * playback interrupted by [stopSpeaking], or both voices
-     * failed. On false, the reason is in the app log. The
-     * fallback runs ONLY when Kokoro is latched (see
-     * [speakLocked]) — never for toggle-OFF, never for a
-     * first/second failure, never silently: the latch card +
+     * spoken — e.g. Swara unreachable, playback interrupted by
+     * [stopSpeaking], or both voices failed. On false, the
+     * reason is in the app log. The fallback runs when Swara is
+     * latched (see [speakLocked]) or the toggle is OFF — never
+     * for a first/second failure, never silently: the latch card +
      * TTS_FALLBACK_USED say which voice spoke.
      */
     suspend fun speakAndWait(text: String): Boolean {
@@ -260,84 +266,79 @@ class VoiceManager(
         speakMutex.unlock()
     }
 
-    /** The slot holder's speak: Kokoro primary, system-TTS
-     * fallback only when latched (Step 2). Runs with the queue
-     * slot held — never call directly without a slot. */
+    /** The slot holder's speak: Swara primary, system-TTS
+     * fallback when latched or toggled OFF (1.4.12). Runs with
+     * the queue slot held — never call directly without a slot. */
     private suspend fun speakLocked(text: String): Boolean {
         stopListeningInternal()
 
-            if (!prefs.kokoroEnabled) {
-                JarvisStateRepository.addLog(
-                    "Kokoro voice OFF in settings — nothing spoken " +
-                        "(toggle OFF: no voice is used, not even the fallback)."
-                )
-                // 1.4.6: toggle-OFF used to leave NO diagnostic —
-                // only a log line — so a phone report with
-                // SPK_END ok=false and no ENGINE markers could
-                // not distinguish "toggle OFF" from a TTS failure.
-                // Now it has its own code (KOKORO_OFF), distinct
-                // from TTS_BIND_FAILED / ENGINE_INIT_FAIL /
-                // HASH_MISMATCH / NATIVE_TTS_PROCESS_DIED.
-                JarvisStateRepository.addDiagnostic(
-                    "tts", "KOKORO_OFF",
-                    "Speak refused: Kokoro voice OFF in settings — " +
-                        "nothing spoken (toggle ON in AI Brain to speak)."
-                )
-                return false
-            }
-
-            // 1.4.10 hybrid (Step 2): latched Kokoro is NOT
-            // retried — the latch means auto-rebind is band, so
-            // go straight to the system-voice fallback (visible:
-            // TTS_FALLBACK_USED + latch card). Toggle-OFF never
-            // reaches here (above).
-            if (TtsProcessClient.isKokoroLatched()) {
-                JarvisStateRepository.addDiagnostic(
-                    "tts", "TTS_FALLBACK_USED",
-                    "Kokoro latched — system-voice fallback (reason=latched; fallback voice is NOT hf_alpha)."
-                )
-                return speakViaFallback(text)
-            }
-
-            // 1.4.5: synthesis runs in the ISOLATED :tts process
-            // (TtsProcessClient) — a native Sherpa/ONNX death
-            // during model load / generate kills only TTS, never
-            // this UI process. On :tts death this returns false
-            // (with tts/NATIVE_TTS_PROCESS_DIED recorded) instead
-            // of the app vanishing; see KokoroTtsService.
-            val focus = requestTransientFocus()
-            speakInProgress = true
-            val ok = try {
-                TtsProcessClient.speak(context, text)
-            } finally {
-                speakInProgress = false
-                abandonFocus(focus)
-            }
-            if (ok) {
-                restartWakeIfNeeded()
-                return true
-            }
-            // Kokoro failed: fall back ONLY if this failure
-            // tripped the latch (Step 2 trigger ii). First/second
-            // failures stay visible failures — falling back on
-            // every failure would mask transient faults and make
-            // the fallback the de-facto voice.
-            if (TtsProcessClient.isKokoroLatched()) {
-                JarvisStateRepository.addDiagnostic(
-                    "tts", "TTS_FALLBACK_USED",
-                    "Kokoro speak failed and latch tripped (lastFailure=${TtsProcessClient.lastFailure}) — system-voice fallback (fallback voice is NOT hf_alpha)."
-                )
-                return speakViaFallback(text)
-            }
-            JarvisStateRepository.addLog(
-                "Kokoro unavailable — nothing spoken " +
-                    "(latch not tripped: fallback runs only when Kokoro is latched)."
+        // 1.4.12 BEHAVIOUR CHANGE (user order 2026-11-04):
+        // toggle-OFF no longer refuses. Swara OFF means the
+        // system voice speaks (visible: TTS_FALLBACK_USED) —
+        // Jarvis is never silent because of a toggle.
+        if (!prefs.swaraEnabled) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_FALLBACK_USED",
+                "Swara OFF in settings — system-voice fallback (reason=Swara OFF; toggle ON in AI Brain for Swara)."
             )
-            return false
+            return speakViaFallback(text)
+        }
+
+        // 1.4.12 hybrid: latched Swara is NOT retried — the
+        // latch means auto-retry is stopped, so go straight to
+        // the system-voice fallback (visible: SWARA_LATCHED_REFUSED
+        // + TTS_FALLBACK_USED + latch card). Toggle-OFF never
+        // reaches here (above).
+        if (SwaraTtsClient.isSwaraLatched()) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "SWARA_LATCHED_REFUSED",
+                "Swara latched — speak refused without retry (latch), system-voice fallback follows."
+            )
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_FALLBACK_USED",
+                "Swara latched — system-voice fallback (reason=latched)."
+            )
+            return speakViaFallback(text)
+        }
+
+        // 1.4.12: synthesis runs in the MAIN process
+        // (SwaraTtsClient, streaming Edge voice) — there is no
+        // isolated speech process any more. A Swara failure
+        // returns false (with SWARA_* markers recorded) instead
+        // of the app vanishing; see SwaraTtsClient.
+        val focus = requestTransientFocus()
+        speakInProgress = true
+        val ok = try {
+            SwaraTtsClient.speak(context, text)
+        } finally {
+            speakInProgress = false
+            abandonFocus(focus)
+        }
+        if (ok) {
+            restartWakeIfNeeded()
+            return true
+        }
+        // Swara failed: fall back ONLY if this failure
+        // tripped the latch. First/second failures stay visible
+        // failures — falling back on every failure would mask
+        // transient faults and make the fallback the de-facto
+        // voice.
+        if (SwaraTtsClient.isSwaraLatched()) {
+            JarvisStateRepository.addDiagnostic(
+                "tts", "TTS_FALLBACK_USED",
+                "Swara speak failed and latch tripped (lastFailure=${SwaraTtsClient.lastFailure}) — system-voice fallback."
+            )
+            return speakViaFallback(text)
+        }
+        JarvisStateRepository.addLog(
+            "Swara unavailable — nothing spoken " +
+                "(latch not tripped: fallback runs only when Swara is latched or OFF)."
+        )
+        return false
     }
 
-    /** System-voice fallback speak (Step 2). Same focus +
-     * wake-restart discipline as the Kokoro path. */
+    /** System-voice fallback speak. Same focus + wake-restart
+     * discipline as the Swara path. */
     private suspend fun speakViaFallback(text: String): Boolean {
         val focus = requestTransientFocus()
         speakInProgress = true
@@ -400,10 +401,10 @@ class VoiceManager(
                 "tts", "SPEAK_ABORT", "Speech stopped: $reason"
             )
         }
-        // 1.4.5: playback lives in the :tts process — stop it
-        // there. (The old main-process stopPlayback() call is
-        // gone: no AudioTrack exists in this process any more.)
-        TtsProcessClient.stop()
+        // 1.4.12: playback lives in the main process
+        // (SwaraTtsClient) — stop it there: socket closed,
+        // track stopped, decoder flushed, generation bumped.
+        SwaraTtsClient.stop()
     }
 
     /** B-M13: transient focus for one utterance; null if unavailable. */

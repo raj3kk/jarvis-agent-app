@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 19
-        versionName = "1.4.11-PRO"
+        versionCode = 20
+        versionName = "1.4.12-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
@@ -65,15 +65,15 @@ android {
             useSupportLibrary = true
         }
 
-        // 1.4.0 Kokoro-only: ship native libs for arm64-v8a only.
+        // 1.4.12: ship native libs for arm64-v8a only.
         // Both native stacks ship arm64-v8a (Sherpa-ONNX static AAR
-        // and LiteRT-LM Android), and the user's phone is arm64, so
-        // this does not break either lib on the target device. It
-        // drops the x86_64 slice (emulator-only) and saves a few MB
-        // against the ~190 MB bundled Kokoro assets. CI GATE: if
-        // the 1.4.0 build fails with a missing-native-lib error,
-        // revert this block first (keep both ABIs) before touching
-        // anything else — see INTEGRATION_NOTES_Kokoro.md §4.
+        // for Silero VAD, and LiteRT-LM Android), and the user's
+        // phone is arm64, so this does not break either lib on
+        // the target device. It drops the x86_64 slice
+        // (emulator-only) and saves a few MB. CI GATE: if the
+        // build fails with a missing-native-lib error, revert
+        // this block first (keep both ABIs) before touching
+        // anything else.
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -128,11 +128,11 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        // Deliberately NO aapt noCompress for onnx/bin: Sherpa never
-        // reads APK assets directly. KokoroTtsClient copies assets
-        // via AssetManager streams (which decompress on the fly) to
-        // the files dir, and Sherpa loads those copies. noCompress
-        // would only inflate the APK further for zero benefit.
+        // Deliberately NO aapt noCompress for onnx: Sherpa never
+        // reads APK assets directly. The VAD copy step reads the
+        // asset via AssetManager streams (which decompress on the
+        // fly) to the files dir, and Sherpa loads that copy.
+        // noCompress would only inflate the APK for zero benefit.
     }
 }
 
@@ -151,7 +151,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Sherpa-ONNX (Kokoro offline voice) — AAR is downloaded in CI,
+    // Sherpa-ONNX (Silero VAD only in 1.4.12) — AAR is downloaded in CI,
     // never committed (37 MB, would bloat the repo). The workflow
     // downloads the same file to app/libs/sherpa-onnx.aar before
     // building; local builds need that file present too.

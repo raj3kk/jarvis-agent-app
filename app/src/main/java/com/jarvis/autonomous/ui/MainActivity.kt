@@ -117,8 +117,7 @@ import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.voice.DeepgramSttClient
-import com.jarvis.autonomous.voice.KokoroTtsClient
-import com.jarvis.autonomous.voice.TtsProcessClient
+import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -163,13 +162,13 @@ class MainActivity : ComponentActivity() {
         // 1.4.4 per-launch guard window: reset HOME/BACK blocking
         // for THIS launch (see LaunchSession.onActivityLaunch).
         LaunchSession.onActivityLaunch()
-        // 1.4.5 (item 6): seed the Kokoro-OFF card's single source
+        // 1.4.5 (item 6): seed the Swara ON/OFF flow's single source
         // (repository flow) from prefs at launch, and load the
         // PERSISTED diagnostics into the in-memory mirror on a
         // background thread — a fresh post-bounce launch previously
         // showed an empty Diagnostics section (mirror starts empty)
         // until NEW entries arrived, looking evidence-free.
-        JarvisStateRepository.setKokoroEnabled(JarvisPreferences(this).kokoroEnabled)
+        JarvisStateRepository.setSwaraEnabled(JarvisPreferences(this).swaraEnabled)
         Thread {
             runCatching { JarvisStateRepository.loadPersistedDiagnostics() }
         }.start()
@@ -327,47 +326,19 @@ fun JarvisMainApp(
         }
     }
 
-    // Kokoro first-run progress (1.4.0, bundled assets — NO download):
-    // shown only while the bundled copy is actually running. If the
-    // model dir is already ready, no overlay ever appears (no flicker).
-    var kokoroStage by remember { mutableStateOf("") }
-    var kokoroCopiedMb by remember { mutableStateOf(0L) }
-    var kokoroTotalMb by remember { mutableStateOf(0L) }
-    var kokoroError by remember { mutableStateOf<String?>(null) }
-    var kokoroDismissed by remember { mutableStateOf(false) }
-    var kokoroChecking by remember { mutableStateOf(!KokoroTtsClient.isDownloaded(context)) }
-    // 1.4.5 (item 1a): launch copy goes through :tts (single
-    // writer) — a main-process copy used to collide with the :tts
-    // copy on the same *.tmp files (per-process copyMutex).
-    // Read-only isDownloaded checks stay main-process (safe).
+    // 1.4.12: NO first-run voice overlay any more — Swara
+    // needs no local model, so there is nothing to copy and
+    // nothing to block the chat for. Launch only seeds the
+    // Swara ON/OFF flow from prefs and deletes the legacy
+    // bundled-voice model dir in the background on first
+    // 1.4.12 run (best-effort, never blocking speech).
     LaunchedEffect(Unit) {
-        // Seed the Kokoro-OFF card flow from prefs at launch.
-        JarvisStateRepository.setKokoroEnabled(prefs.kokoroEnabled)
-        if (!KokoroTtsClient.isDownloaded(context)) {
-            kokoroChecking = true
-            val ok = TtsProcessClient.ensure(context) { stage, copied, total ->
-                kokoroStage = stage
-                kokoroCopiedMb = copied
-                kokoroTotalMb = total
-            }
-            kokoroChecking = false
-            // 1.4.6: an ensure that lost to an in-flight speak
-            // (TTS_BUSY) is NOT a setup failure — the speak's own
-            // :tts ensure completes the assets (copyMutex in
-            // :tts) — so it must not paint a "setup fail"
-            // overlay during a greeting speak. Only a real
-            // ensure failure shows the error.
-            kokoroError = if (ok) {
-                null
-            } else if (TtsProcessClient.lastFailure == TtsProcessClient.FAIL_BUSY) {
-                null
-            } else {
-                "Kokoro setup fail ho gaya — dobara try karo."
-            }
-        }
+        // Seed the Swara ON/OFF flow from prefs at launch.
+        JarvisStateRepository.setSwaraEnabled(prefs.swaraEnabled)
+        Thread {
+            runCatching { SwaraTtsClient.cleanupLegacyModelDir(context) }
+        }.start()
     }
-    val showKokoroOverlay = !kokoroDismissed &&
-        (kokoroChecking || (kokoroStage == "copying") || kokoroError != null)
 
     // C-B13: the permission-result map is HANDLED, not ignored.
     // A denied mic permission explains itself in a banner, can be
@@ -493,35 +464,6 @@ fun JarvisMainApp(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // 1.4.3 Kokoro-OFF launch warning: speakAndWait
-            // returns false silently when the toggle is off, and
-            // the engine's chat-only fallback made "bolti hi nahi"
-            // look like a bug. Now the OFF state is visible.
-            // 1.4.5 (item 6): reads the repository flow, NOT prefs
-            // directly — prefs is a plain SharedPreferences delegate
-            // (not Compose state), so an AI Brain Save never
-            // recomposed this parent header and the card stayed
-            // stale until a tab switch forced recomposition.
-            val kokoroEnabledFlow by JarvisStateRepository.kokoroEnabled.collectAsState()
-            if (!kokoroEnabledFlow) {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFFFFEBEE)
-                    )
-                ) {
-                    Text(
-                        "Kokoro OFF hai — Jarvis bolega nahi. Bolna " +
-                            "wapas chahiye to AI Brain me Kokoro ON karo.",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFD32F2F),
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-            }
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -564,8 +506,7 @@ fun JarvisMainApp(
         }
         }
     }
-        // C-B13 mic-permission explainer banner (above content,
-        // below the Kokoro overlay when that is showing).
+        // C-B13 mic-permission explainer banner (above content).
         if (micPermissionDenied) {
             Card(
                 modifier = Modifier.fillMaxWidth().padding(12.dp),
@@ -592,101 +533,6 @@ fun JarvisMainApp(
                                 containerColor = Color(0xFF8A7A70)
                             )
                         ) { Text("Permissions kholo") }
-                    }
-                }
-            }
-        }
-        // Kokoro first-run overlay (blocks the chat behind it while
-        // copying, so a tap cannot queue a speak that silently fails).
-        if (showKokoroOverlay) {
-            val kokoroScope = rememberCoroutineScope()
-            Box(
-                modifier = Modifier.fillMaxSize().background(Color(0xFFFFF8ED)),
-                contentAlignment = Alignment.Center
-            ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(24.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "Jarvis ki awaaz taiyaar ho rahi hai…",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFFB85C38)
-                        )
-                        if (kokoroError != null) {
-                            Text(
-                                text = kokoroError ?: "",
-                                fontSize = 13.sp,
-                                color = Color(0xFF3B2F2A)
-                            )
-                            Text(
-                                text = "Space kam ho to kuch files/photos delete karke dobara try karo. Voice ke bina bhi chat kaam karegi.",
-                                fontSize = 12.sp,
-                                color = Color(0xFF8A7A70)
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(
-                                    onClick = {
-                                        kokoroError = null
-                                        kokoroChecking = true
-                                        kokoroScope.launch {
-                                            // 1.4.9 (Step 1c): the old
-                                            // direct
-                                            // KokoroTtsClient.ensureAssetsReady
-                                            // call ran a copy from the MAIN
-                                            // process, breaking the 1.4.5
-                                            // single-writer rule — a
-                                            // per-process mutex cannot
-                                            // exclude the :tts process, so
-                                            // a main-process delete/recopy
-                                            // under a loaded mmap'd engine
-                                            // is a use-after-delete hazard.
-                                            // Route through :tts instead.
-                                            val ok = TtsProcessClient.ensure(context) { stage, copied, total ->
-                                                kokoroStage = stage
-                                                kokoroCopiedMb = copied
-                                                kokoroTotalMb = total
-                                            }
-                                            kokoroChecking = false
-                                            if (!ok) {
-                                                kokoroError = TtsProcessClient.lastFailure
-                                                    ?: "Kokoro setup fail ho gaya"
-                                            }
-                                        }
-                                    }
-                                ) { Text("Dobara try karo") }
-                                Button(
-                                    onClick = { kokoroDismissed = true },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
-                                ) { Text("Baad me") }
-                            }
-                        } else if (kokoroStage == "copying" && kokoroTotalMb > 0) {
-                            Text(
-                                text = "Copy ho raha hai: $kokoroCopiedMb / $kokoroTotalMb MB — pehli baar hi hoga, dobara nahi.",
-                                fontSize = 13.sp,
-                                color = Color(0xFF3B2F2A)
-                            )
-                            LinearProgressIndicator(
-                                progress = { kokoroCopiedMb.toFloat() / kokoroTotalMb.toFloat() },
-                                modifier = Modifier.fillMaxWidth(),
-                                color = Color(0xFFB85C38)
-                            )
-                        } else {
-                            Text(
-                                text = "Storage check ho raha hai…",
-                                fontSize = 13.sp,
-                                color = Color(0xFF3B2F2A)
-                            )
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth(),
-                                color = Color(0xFFB85C38)
-                            )
-                        }
                     }
                 }
             }
@@ -1595,7 +1441,7 @@ fun AiBrainSettingsScreen(
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
     // 1.4.3: Deepgram STT key (listening only — speaking stays
-    // Kokoro). Saved by the same SAVE button.
+    // Swara). Saved by the same SAVE button.
     // 1.4.5 FINAL policy: empty = CANNOT LISTEN (system fallback
     // REMOVED entirely — no fallback exists any more). Never
     // displayed, never logged.
@@ -1610,7 +1456,7 @@ fun AiBrainSettingsScreen(
     var overlayEnabled by remember { mutableStateOf(prefs.floatingOverlayEnabled) }
     var confirmSensitive by remember { mutableStateOf(prefs.confirmSensitiveActions) }
     var speakIntermediate by remember { mutableStateOf(prefs.speakIntermediateSteps) }
-    var kokoroOn by remember { mutableStateOf(prefs.kokoroEnabled) }
+    var swaraOn by remember { mutableStateOf(prefs.swaraEnabled) }
     var visionMode by remember { mutableStateOf(prefs.visionModeEnabled) }
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
     var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
@@ -1736,29 +1582,24 @@ fun AiBrainSettingsScreen(
             }
         }
 
-        // Kokoro offline voice (1.4.0, Kokoro-only): hf_alpha Hindi
-        // female, phone par hi chalti hai — bina key, bina quota,
-        // bina internet. Model APK me bundled hai: pehli baar app
-        // khulte hi assets se copy hota hai (koi download nahi).
-        // Yahan sirf wahi copy dobara chalai ja sakti hai.
+        // Swara cloud voice (1.4.12, primary): Microsoft Edge
+        // Read-Aloud hi-IN-SwaraNeural — free, no key, internet
+        // needed; offline/airplane me system voice bolti hai.
+        // Koi model setup/reset nahi (koi bundled model nahi).
         run {
-            val kokoroContext = LocalContext.current
-            val kokoroScope = rememberCoroutineScope()
-            var kokoroReady by remember {
-                mutableStateOf(KokoroTtsClient.isDownloaded(kokoroContext))
-            }
-            var kokoroProgress by remember { mutableStateOf("") }
-            var kokoroWorking by remember { mutableStateOf(false) }
-            // 1.4.10 (Step 1): latch banner state — visible while
-            // the bounded-recovery latch is tripped (system voice
-            // is speaking instead of Kokoro). Test Voice reopens it.
-            val kokoroLatched by JarvisStateRepository.kokoroLatched.collectAsState()
+            val swaraScope = rememberCoroutineScope()
+            var swaraProgress by remember { mutableStateOf("") }
+            var swaraWorking by remember { mutableStateOf(false) }
+            // 1.4.12: latch banner state — visible while the
+            // bounded-recovery latch is tripped (system voice
+            // is speaking instead of Swara). Test Voice reopens it.
+            val swaraLatched by JarvisStateRepository.swaraLatched.collectAsState()
             // 1.4.11: live Test Voice stage display — event-driven
-            // from TestVoiceStageTracker (existing tts markers +
-            // :tts stage relay, no polling). Null until the first
-            // test tap; then live stage ("…") during a test and
-            // the frozen terminal result (trail + stuck point +
-            // kaaran) until the next test.
+            // from TestVoiceStageTracker (existing tts markers,
+            // no polling). Null until the first test tap; then
+            // live stage ("…") during a test and the frozen
+            // terminal result (trail + stuck point + kaaran)
+            // until the next test.
             val testVoiceStage by JarvisStateRepository.testVoiceStage.collectAsState()
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1769,120 +1610,72 @@ fun AiBrainSettingsScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Kokoro Voice — hf_alpha (Offline primary)",
+                        text = "Swara Voice — hi-IN-SwaraNeural (Primary)",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
                     Text(
-                        text = "Jarvis ki ek hi awaaz: Kokoro hf_alpha Hindi female, phone par hi chalti hai — bina key, bina quota, bina internet. Model APK ke andar bundled hai, isliye koi download nahi hota; pehli baar sirf ~190 MB assets se copy hote hain. Agar Kokoro 3 baar lagatar fail ho to system voice bolti hai (alag awaaz) — Test Voice se Kokoro dobara try hota hai.",
+                        text = "Jarvis ki ek hi awaaz: Swara Hindi female cloud voice — bina key, bina quota, sirf internet se; streaming, isliye pehli awaaz turant bajti hai. Offline/airplane me ya 3 baar lagatar fail par system voice bolti hai (alag awaaz) — Jarvis kabhi silent nahi rehta. Swara OFF par bhi system voice bolti hai.",
                         fontSize = 12.sp
                     )
                     Text(
-                        text = if (kokoroReady) {
-                            "Status: Ready ✅ (${KokoroTtsClient.bundledModelBytes(kokoroContext) / 1_000_000L} MB) — ab Jarvis isi awaaz me bolega (jab Kokoro toggle ON hai)."
+                        text = if (swaraOn) {
+                            "Status: Swara ON — ab Jarvis isi awaaz me bolega (internet chahiye)."
                         } else {
-                            "Status: Not ready — bundled copy abhi baaki hai. Neeche wala button dabao (koi download nahi, sirf APK assets se copy)."
+                            "Status: Swara OFF — ab Jarvis system voice me bolega (kabhi silent nahi)."
                         },
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    if (kokoroLatched) {
+                    if (swaraLatched) {
                         Text(
-                            text = "Kokoro bol nahi pa raha — 3 baar lagatar fail hone par system voice bol rahi hai (ye awaaz hf_alpha nahi hai). Test Voice dabao — Kokoro dobara try hoga.",
+                            text = "Swara bol nahi pa raha — 3 baar lagatar fail hone par system voice bol rahi hai. Test Voice dabao — Swara dobara try hoga.",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFFB85C38)
                         )
                     }
-                    if (kokoroProgress.isNotBlank()) {
-                        Text(kokoroProgress, fontSize = 12.sp)
+                    if (swaraProgress.isNotBlank()) {
+                        Text(swaraProgress, fontSize = 12.sp)
                     }
                     Button(
-                        enabled = !kokoroWorking,
+                        enabled = !swaraWorking,
                         onClick = {
-                            if (kokoroReady) {
-                                kokoroOn = true
-                            } else {
-                                kokoroWorking = true
-                                kokoroProgress = "Checking space…"
-                                kokoroScope.launch {
-                                    // 1.4.5 (item 1a): setup copy goes
-                                    // through :tts (single writer) —
-                                    // never a main-process copy.
-                                    val ok = TtsProcessClient.ensure(kokoroContext) { stage, copied, total ->
-                                        kokoroScope.launch {
-                                            kokoroProgress = when (stage) {
-                                                "checking_space" -> "Storage check ho raha hai…"
-                                                "copying" -> "Copy ho raha hai: $copied / $total MB — pehli baar hi hoga, dobara nahi."
-                                                else -> "Ready ✅"
-                                            }
-                                        }
-                                    }
-                                    kokoroWorking = false
-                                    if (ok) {
-                                        kokoroReady = true
-                                        kokoroProgress = "Kokoro ready ✅ — ab Jarvis Kokoro awaaz me bolega."
-                                        kokoroOn = true
-                                        JarvisStateRepository.setKokoroEnabled(true)
-                                    } else {
-                                        kokoroProgress = "Kokoro setup fail ho gaya."
-                                    }
-                                }
-                            }
+                            swaraOn = true
+                            prefs.swaraEnabled = true
+                            JarvisStateRepository.setSwaraEnabled(true)
+                            SwaraTtsClient.clearLatch("swara-toggle-on")
+                            swaraProgress = "Swara ON ✅ — ab Jarvis Swara awaaz me bolega."
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(if (kokoroReady) "Use Kokoro Voice" else "Kokoro setup karo (bundled copy, no download)")
+                        Text("Use Swara Voice")
                     }
-                    // 1.4.5 REDO: reset runs in the :tts process
-                    // (TtsProcessClient.reset) — the engine lives
-                    // there, so a main-process delete of the shared
-                    // model dir under a loaded engine would be a
-                    // native use-after-delete. Progress streams
-                    // from :tts exactly as before.
                     Button(
-                        enabled = !kokoroWorking,
+                        enabled = !swaraWorking,
                         onClick = {
-                            kokoroWorking = true
-                            kokoroProgress = "Reset ho raha hai — purana model delete, dobara copy…"
-                            kokoroScope.launch {
-                                val ok = TtsProcessClient.reset(kokoroContext) { stage, copied, total ->
-                                    kokoroScope.launch {
-                                        kokoroProgress = when (stage) {
-                                            "checking_space" -> "Storage check ho raha hai…"
-                                            "copying" -> "Dobara copy ho raha hai: $copied / $total MB."
-                                            else -> "Ready ✅"
-                                        }
-                                    }
-                                }
-                                kokoroWorking = false
-                                if (ok) {
-                                    kokoroReady = true
-                                    kokoroProgress = "Kokoro reset complete ✅ — fresh copy taiyaar."
-                                    kokoroOn = true
-                                    JarvisStateRepository.setKokoroEnabled(true)
-                                } else {
-                                    kokoroReady = false
-                                    kokoroProgress = "Kokoro reset fail ho gaya."
-                                }
+                            swaraWorking = true
+                            swaraProgress = "Swara reconnect ho raha hai…"
+                            swaraScope.launch {
+                                SwaraTtsClient.resetConnection()
+                                SwaraTtsClient.clearLatch("settings-reset")
+                                swaraProgress = "Swara reconnected ✅ — agla speak Swara se try hoga."
+                                swaraWorking = false
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
                     ) {
-                        Text("Kokoro reset — dobara copy karo")
+                        Text("Swara reconnect")
                     }
-                    // 1.4.8 (G8 F4): standalone voice test — before
-                    // this, speech was only exercisable via the
-                    // greeting or task replies, so on a
-                    // breaker-skipped launch there was no way to
-                    // test voice alone. This speaks a sample line
-                    // through the normal speak path (service
-                    // ACTION_SPEAK_TEST). Greyed out unless Kokoro
-                    // is ready AND on (OFF would refuse with
-                    // KOKORO_OFF, and the OFF card already says so).
+                    // 1.4.8 (G8 F4): standalone voice test — speaks
+                    // a sample line through the NORMAL speak path
+                    // (service ACTION_SPEAK_TEST), so it exercises
+                    // greeting/reply speech exactly. Enabled ALWAYS
+                    // except while working: Swara OFF no longer
+                    // refuses (OFF speaks via the system voice).
                     Button(
-                        enabled = kokoroReady && kokoroOn,
+                        enabled = !swaraWorking,
                         onClick = {
                             // 1.4.9 (Step 1a): Test Voice had two
                             // fully-silent stages — a greyed button
@@ -1894,13 +1687,13 @@ fun AiBrainSettingsScreen(
                             // a throw is caught + marked — a Test
                             // Voice report can always name the
                             // stage it reached.
-                            // 1.4.10 (Step 1): Test Voice is a
-                            // latch reopen — a tap retries Kokoro
-                            // even while latched (no-op if not).
-                            TtsProcessClient.clearLatch("test-voice")
+                            // 1.4.12: Test Voice is a latch reopen
+                            // — a tap retries Swara even while
+                            // latched (no-op if not latched).
+                            SwaraTtsClient.clearLatch("test-voice")
                             JarvisStateRepository.addDiagnostic(
                                 "tts", "TEST_VOICE_START",
-                                "Test Voice tapped in AI Brain Kokoro card."
+                                "Test Voice tapped in AI Brain Swara card."
                             )
                             val testIntent = Intent(
                                 aiBrainContext,
@@ -1928,8 +1721,8 @@ fun AiBrainSettingsScreen(
                     ) {
                         Text("Test Voice — sample line suno")
                     }
-                    if (!kokoroOn) {
-                        Text("Test ke liye Kokoro ON karo.", fontSize = 12.sp)
+                    if (!swaraOn) {
+                        Text("Swara OFF hai — test system voice se bolega.", fontSize = 12.sp)
                     }
                     // 1.4.11: live stage display, Test Voice button
                     // ke turant neeche, card ke andar. Live test
@@ -1944,7 +1737,7 @@ fun AiBrainSettingsScreen(
                     val stage = testVoiceStage
                     if (stage == null) {
                         Text(
-                            "Test dabao — Kokoro kahan atak raha hai, ye yahan dikhega.",
+                            "Test dabao — Swara kahan atak raha hai, ye yahan dikhega.",
                             fontSize = 12.sp
                         )
                     } else {
@@ -1984,7 +1777,7 @@ fun AiBrainSettingsScreen(
         )
 
         // 1.4.3: Deepgram STT key — SUNNE ke liye (transcription),
-        // bolne ke liye NAHI (bolna hamesha Kokoro).
+        // bolne ke liye NAHI (bolna hamesha Swara).
         // 1.4.5 FINAL policy: key khaali ho to mic bilkul nahi
         // chalega (system fallback REMOVED — koi fallback nahi).
         OutlinedTextField(
@@ -2077,10 +1870,10 @@ fun AiBrainSettingsScreen(
                     onCheckedChange = { confirmSensitive = it }
                 )
                 SettingToggleRow(
-                    title = "Kokoro Voice — hf_alpha (offline, Hindi)",
-                    subtitle = "Jarvis ki ek hi awaaz, phone par hi (bundled copy ke baad, bina key/quota)",
-                    checked = kokoroOn,
-                    onCheckedChange = { kokoroOn = it }
+                    title = "Swara Voice — hi-IN-SwaraNeural (cloud, Hindi)",
+                    subtitle = "Jarvis ki ek hi awaaz, cloud se (bina key/quota, internet chahiye; OFF par system voice bolegi)",
+                    checked = swaraOn,
+                    onCheckedChange = { swaraOn = it }
                 )
                 SettingToggleRow(
                     title = "Speak Every Step (slower)",
@@ -2114,12 +1907,12 @@ fun AiBrainSettingsScreen(
 
         // B-L12: the old Voice Speech Speed slider is REMOVED —
         // it only ever tuned system TTS, which no longer exists
-        // (Kokoro-only build, fixed speed 1.0f). A slider that
+        // (Swara build, prosody defaults +0%). A slider that
         // saves a dead pref is worse than no slider.
         Text(
-            text = "Voice speed: Kokoro fixed speed par bolta hai " +
-                "(speed slider hataya gaya — wo sirf purani system " +
-                "voice ko control karta tha, Kokoro ko nahi).",
+            text = "Voice speed: Swara prosody default par bolta hai " +
+                "(rate +0%, pitch +0Hz — speed slider hataya gaya, wo sirf purani system " +
+                "voice ko control karta tha).",
             fontSize = 13.sp
         )
 
@@ -2145,16 +1938,16 @@ fun AiBrainSettingsScreen(
                 prefs.autoAnnounceNotifications = autoAnnounceNotifs
                 prefs.confirmSensitiveActions = confirmSensitive
                 prefs.speakIntermediateSteps = speakIntermediate
-                prefs.kokoroEnabled = kokoroOn
+                prefs.swaraEnabled = swaraOn
                 prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 onSettingsUpdated()
                 // 1.4.5 (item 6): the OFF card reads this flow —
                 // Save must publish it, or the card stays stale.
-                JarvisStateRepository.setKokoroEnabled(kokoroOn)
-                // 1.4.10 (Step 1): Kokoro toggle-on reopens the
-                // latch (no-op when not latched or when OFF).
-                if (kokoroOn) TtsProcessClient.clearLatch("kokoro-toggle-on")
+                JarvisStateRepository.setSwaraEnabled(swaraOn)
+                // 1.4.12: Swara toggle-on reopens the latch
+                // (no-op when not latched or when OFF).
+                if (swaraOn) SwaraTtsClient.clearLatch("swara-toggle-on")
                 // 1.4.5 (item 4): key-change restart — only when the
                 // key actually changed AND the loop is live (the
                 // repository flag is the live-loop signal). RETRY

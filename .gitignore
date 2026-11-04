@@ -18,9 +18,6 @@ app/release.keystore
 # Sherpa-ONNX AAR (downloaded in CI, never committed)
 app/libs/
 
-# Kokoro model assets (bundled in CI from the sherpa-onnx tarball,
-# never committed — ~190 MB unpacked)
-app/src/main/assets/kokoro/
 
 # Silero VAD model (bundled in CI from the sherpa-onnx asr-models
 # release, never committed — 643,854 bytes)

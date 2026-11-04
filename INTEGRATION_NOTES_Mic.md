@@ -250,8 +250,8 @@ private suspend fun speakWrapped(text: String) {
 Notes: (a) `setSpeaking(false)` also resets the VAD so stale
 own-voice audio is dropped — do not skip the `finally`. (b) The
 "aur bolo" prompt and the post-task prompt (§5.5) go through this
-same wrapper. (c) `VoiceManager.stopSpeaking()` already stops Kokoro
-/ Deepgram / Gemini / system TTS — that is why the barge-in callback
+same wrapper. (c) `VoiceManager.stopSpeaking()` already stops Swara
+/ Deepgram / system TTS — that is why the barge-in callback
 points at it; no TTS change is needed. (d) `VoiceManager`'s own
 `startWakeWordListening()` / `listenForSingleReply()` paths are
 superseded by the mic loop for the always-on session; leave them in
@@ -305,7 +305,7 @@ Do not run both at once.
 
 ## 6. Echo gate — exactly how it works (S1 echo amendment)
 
-Kokoro speaking while the mic listens would otherwise make the VAD
+Swara speaking while the mic listens would otherwise make the VAD
 hear Jarvis's own voice as user speech. Two separate gates, both
 keyed off the single `isSpeaking` flag (§5.3):
 
@@ -424,7 +424,7 @@ SileroVadModelConfig(modelFile.absolutePath, 0.5f, 0.5f, 0.25f, 512, 15.0f))`
 — 16 kHz, 512-sample window, 1 thread implied by the default config,
 CPU provider. **But the VAD path is OPTIONAL and NOT primary, for
 three stated reasons:** (1) no `silero_vad.onnx` model file ships in
-this repo — Kokoro's models are TTS models, not a VAD model — so
+this repo — the old bundled voice's models were TTS models, not a VAD model — so
 without a coordinator-supplied model file the monitor is inert
 (`isAvailable() == false`); (2) mic sharing: `AudioRecord` running
 while `SpeechRecognizer` listens can fail with mic-busy on real
@@ -433,7 +433,7 @@ the recognizer timer untouched; (3) the build must never fail on
 VAD — all model/native work is inside `runCatching`, and the
 recognizer-only timer (primary) has no VAD dependency at runtime
 (the sherpa AAR import is compile-time only and the AAR is already
-a declared dependency for Kokoro, so no new dependency was added).
+a declared dependency for VAD, so no new dependency was added).
 **VAD segments go to STT only while a session is active:** the
 coordinator starts the monitor only after `micManager.start()`, and
 `stop()`/`release()` ends it. There is no wake word and no

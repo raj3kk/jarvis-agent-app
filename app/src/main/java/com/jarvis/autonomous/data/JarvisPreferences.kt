@@ -87,19 +87,33 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getString("api_key", "") ?: ""
         set(value) = prefs.edit().putString("api_key", value.trim()).apply()
 
-    // 1.4.0: Kokoro-only build. The old cloud-voice prefs (Gemini
-    // TTS toggle/voice, Deepgram key/toggle/voice) were deleted
-    // with their AI Brain UI — VoiceManager never reads them.
-    // Kokoro offline voice (user order 2026-11-02): Flora wali awaaz
-    // (hf_alpha, Hindi female) jo phone par hi chalti hai, bina key
-    // aur bina quota ke — sirf ek baar ~185 MB model download.
-    var kokoroEnabled: Boolean
-        get() = prefs.getBoolean("kokoro_enabled", true)
-        set(value) = prefs.edit().putBoolean("kokoro_enabled", value).apply()
+    // 1.4.12: Swara cloud voice (user order 2026-11-04: Swara
+    // primary, bundled voice fully removed). The old cloud-voice
+    // prefs (Gemini TTS toggle/voice, Deepgram key/toggle/voice)
+    // were deleted with their AI Brain UI — VoiceManager never
+    // reads them. Swara (Edge hi-IN-SwaraNeural, Hindi female)
+    // needs internet but no key and no quota; OFF means the
+    // system voice speaks (never silence — 1.4.12 behaviour
+    // change from the old OFF-refusal).
+    // MIGRATION: new key "swara_enabled" (default true). If it
+    // is absent, the old "kokoro_enabled" value (default true)
+    // is copied over once, so a 1.4.11 user who had voice OFF
+    // stays OFF (now meaning system voice, not silence).
+    var swaraEnabled: Boolean
+        get() {
+            if (prefs.contains("swara_enabled")) {
+                return prefs.getBoolean("swara_enabled", true)
+            }
+            val migrated = prefs.getBoolean("kokoro_enabled", true)
+            prefs.edit().putBoolean("swara_enabled", migrated).apply()
+            return migrated
+        }
+        set(value) = prefs.edit().putBoolean("swara_enabled", value).apply()
 
     // 1.4.3: Deepgram STT key (listening/transcription ONLY —
-    // speaking stays bundled Kokoro; Deepgram TTS/Aura is never
-    // used). Stored on the phone, never in the APK or repo, never
+    // speaking stays Swara (cloud Edge voice); Deepgram TTS/Aura
+    // is never used). Stored on the phone, never in the APK or
+    // repo, never
     // logged. 1.4.5 FINAL policy: empty = CANNOT LISTEN (system
     // fallback REMOVED entirely — no fallback exists any more).
     var deepgramApiKey: String

@@ -130,29 +130,29 @@ object JarvisStateRepository {
         _micReconnecting.value = reason
     }
 
-    // 1.4.5 part 3: Kokoro ON/OFF as Compose state. prefs
-    // .kokoroEnabled is a plain SharedPreferences read — it does
-    // NOT trigger recomposition, so the persistent Kokoro-OFF
+    // 1.4.5 part 3: Swara ON/OFF as Compose state. prefs
+    // .swaraEnabled is a plain SharedPreferences read — it does
+    // NOT trigger recomposition, so the persistent Swara-OFF
     // header card stayed stale after an AI Brain Save (the Save
     // only recomposed the settings screen, never the parent).
     // This flow is the single source the card reads; it is set
-    // from prefs at MainActivity launch and on every Save /
-    // setup / reset that changes the toggle.
-    private val _kokoroEnabled = MutableStateFlow(true)
-    val kokoroEnabled: StateFlow<Boolean> = _kokoroEnabled.asStateFlow()
+    // from prefs at MainActivity launch and on every Save that
+    // changes the toggle.
+    private val _swaraEnabled = MutableStateFlow(true)
+    val swaraEnabled: StateFlow<Boolean> = _swaraEnabled.asStateFlow()
 
     /**
-     * 1.4.10 (Step 1): Kokoro latch state for the AI Brain card.
-     * True while the bounded-recovery latch is tripped (3
+     * 1.4.12: Swara latch state for the AI Brain card. True
+     * while the bounded-recovery latch is tripped (3
      * consecutive failed speaks) — the card shows the fallback
      * banner until Test Voice / reset / toggle-on / cooldown
-     * reopens it. Set ONLY by TtsProcessClient.
+     * reopens it. Set ONLY by SwaraTtsClient.
      */
-    private val _kokoroLatched = MutableStateFlow(false)
-    val kokoroLatched: StateFlow<Boolean> = _kokoroLatched.asStateFlow()
+    private val _swaraLatched = MutableStateFlow(false)
+    val swaraLatched: StateFlow<Boolean> = _swaraLatched.asStateFlow()
 
     /**
-     * 1.4.11: Test Voice live stage display (AI Brain Kokoro
+     * 1.4.11: Test Voice live stage display (AI Brain Swara
      * card, Test Voice button ke neeche). StateFlow from
      * TestVoiceStageTracker — null until the first test tap,
      * then the live stage ("…") during a test and the frozen
@@ -164,23 +164,24 @@ object JarvisStateRepository {
         TestVoiceStageTracker.stage
 
     /**
-     * 1.4.11: :tts stage relay listener. Set ONLY by
-     * KokoroTtsService while a MSG_SPEAK runs (cleared in its
-     * finally) — it forwards :tts-side stage codes to the main
-     * process via the existing MSG_PROGRESS channel. Null in
-     * the main process (never set there), so the hook below is
-     * a no-op outside a :tts speak. Volatile: set on the
-     * service handler thread, read on speak IO threads.
+     * 1.4.12: NO :tts stage relay any more. Swara runs in the
+     * main process, so its markers flow through addDiagnostic
+     * directly (TestVoiceStageTracker.onDiagnostic) — the old
+     * ttsStageListener hook (set only by the deleted :tts
+     * service during a speak) is deleted with it. Old
+     * diagnostics history is tolerated: loadPersistedDiagnostics
+     * seeds the mirror directly and never routes through
+     * TestVoiceStageTracker, so stale markers in history can
+     * never be misread as a Swara stage.
      */
-    @Volatile
-    var ttsStageListener: ((String) -> Unit)? = null
 
-    fun setKokoroLatched(value: Boolean) {
-        _kokoroLatched.value = value
+
+    fun setSwaraLatched(value: Boolean) {
+        _swaraLatched.value = value
     }
 
-    fun setKokoroEnabled(value: Boolean) {
-        _kokoroEnabled.value = value
+    fun setSwaraEnabled(value: Boolean) {
+        _swaraEnabled.value = value
     }
 
     // 1.4.5 part 3: bounce detection as observable state
@@ -262,11 +263,10 @@ object JarvisStateRepository {
         // 1.4.11: Test Voice stage display derives from the
         // existing tts marker stream (no new speak path, no
         // polling). runCatching: display tracking must never
-        // break diagnostics. The relay listener is only set in
-        // the :tts process during a speak (null in main).
+        // break diagnostics. 1.4.12: Swara markers arrive here
+        // directly (main process — no relay any more).
         if (area == "tts") {
             runCatching { TestVoiceStageTracker.onDiagnostic(area, code, clean) }
-            runCatching { ttsStageListener?.invoke(code) }
         }
         runCatching { JarvisDiagnosticsFile.append(entry) }
         if (area == "llm") _lastLlmError.value = "$code: $clean"
@@ -284,11 +284,9 @@ object JarvisStateRepository {
         val entry = DiagnosticEntry(time, area, code, clean)
         _diagnostics.value = (_diagnostics.value + entry).takeLast(150)
         // 1.4.11: same Test Voice stage hook as addDiagnostic
-        // (stage markers use the sync variant so they survive
-        // a :tts death — the relay must see them too).
+        // (1.4.12: Swara markers arrive directly — no relay).
         if (area == "tts") {
             runCatching { TestVoiceStageTracker.onDiagnostic(area, code, clean) }
-            runCatching { ttsStageListener?.invoke(code) }
         }
         runCatching { JarvisDiagnosticsFile.appendSync(entry) }
         if (area == "llm") _lastLlmError.value = "$code: $clean"

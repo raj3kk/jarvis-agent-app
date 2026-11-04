@@ -32,7 +32,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (17 = 1.4.9-PRO) — BUMP THIS FLOOR ON
+      # last delivered vc (19 = 1.4.11-PRO) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,10 +41,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=18, previous delivered 1.4.10-PRO)"
+          echo "versionCode in tree: $VC (floor PREV_VC=19, previous delivered 1.4.11-PRO)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=18
+          PREV_VC=19
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
@@ -98,68 +98,18 @@ jobs:
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
 
-      # Sherpa-ONNX AAR for Kokoro offline voice (never committed):
+      # Sherpa-ONNX AAR for Silero VAD (never committed):
       # downloaded fresh each build, size-checked (37,631,864 bytes).
-      - name: Download Sherpa-ONNX AAR (Kokoro voice engine)
+      - name: Download Sherpa-ONNX AAR (Silero VAD engine)
         run: |
           mkdir -p app/libs
           curl -sL -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-static-link-onnxruntime-1.13.4.aar
           ls -lh app/libs/sherpa-onnx.aar
           test $(stat -c%s app/libs/sherpa-onnx.aar) -eq 37631864
 
-      # Kokoro model assets — BUNDLED IN CI, NEVER COMMITTED:
-      # downloads the sherpa-onnx kokoro-int8-multi-lang-v1_0
-      # tarball (verified 2026-11-02: HTTP 200, 132,353,410 bytes
-      # via GitHub release API + full-download size check) and
-      # extracts it into app/src/main/assets/kokoro/ BEFORE the
-      # Gradle build, so the APK carries the model. The workflow
-      # never commits these files — they exist only in this
-      # runner. Unpacked size ~190 MB (model.int8.onnx ~109 MB).
-      # If this URL 404s in future, the fallback is the HF
-      # unpacked files (csukuangfj/kokoro-int8-multi-lang-v1_0
-      # via the HF tree API, as 1.3.0 downloaded on-device) —
-      # do NOT silently switch to a different model version.
-      - name: Bundle Kokoro model assets (CI-only, never committed)
-        run: |
-          set -e
-          mkdir -p app/src/main/assets/kokoro /tmp/kokoro-unpack
-          curl -sL -o /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2
-          TARBALL_BYTES=$(stat -c%s /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2)
-          echo "Kokoro tarball bytes: $TARBALL_BYTES (expected ~132353410)"
-          test "$TARBALL_BYTES" -ge 100000000
-          tar -xjf /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2 -C /tmp/kokoro-unpack
-          MODEL_FILE=$(find /tmp/kokoro-unpack -name model.int8.onnx | head -1)
-          test -n "$MODEL_FILE"
-          MODEL_DIR=$(dirname "$MODEL_FILE")
-          echo "Kokoro model dir in tarball: $MODEL_DIR"
-          cp -r "$MODEL_DIR"/. app/src/main/assets/kokoro/
-          test -f app/src/main/assets/kokoro/model.int8.onnx
-          # 1.4.5 (item 7): PINNED sizes + SHA-256 (same pins as
-          # KokoroTtsClient). The old gate was only ">50 MB" while
-          # the model is ~109 MB expected — a truncated/corrupt
-          # voice file passed CI and died natively at Sherpa load.
-          # Any mismatch fails the build here, before Gradle runs.
-          MODEL_BYTES=$(stat -c%s app/src/main/assets/kokoro/model.int8.onnx)
-          echo "Bundled model.int8.onnx bytes: $MODEL_BYTES (expected 114202993)"
-          test "$MODEL_BYTES" -eq 114202993
-          test "$(sha256sum app/src/main/assets/kokoro/model.int8.onnx | cut -d' ' -f1)" = "75635ea3b85a32d00094dcdd61a258aba87c160f7c264c304a7b3ae9d734195e"
-          VOICES_BYTES=$(stat -c%s app/src/main/assets/kokoro/voices.bin)
-          echo "Bundled voices.bin bytes: $VOICES_BYTES (expected 28200960)"
-          test "$VOICES_BYTES" -eq 28200960
-          test "$(sha256sum app/src/main/assets/kokoro/voices.bin | cut -d' ' -f1)" = "1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29"
-          TOKENS_BYTES=$(stat -c%s app/src/main/assets/kokoro/tokens.txt)
-          echo "Bundled tokens.txt bytes: $TOKENS_BYTES (expected 687)"
-          test "$TOKENS_BYTES" -eq 687
-          test "$(sha256sum app/src/main/assets/kokoro/tokens.txt | cut -d' ' -f1)" = "6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425"
-          test -f app/src/main/assets/kokoro/voices.bin
-          test -f app/src/main/assets/kokoro/tokens.txt
-          test -d app/src/main/assets/kokoro/espeak-ng-data
-          du -sh app/src/main/assets/kokoro/
-          ls -lh app/src/main/assets/kokoro/ | head -20
-          rm -rf /tmp/kokoro-unpack /tmp/kokoro-int8-multi-lang-v1_0.tar.bz2
 
       # Silero VAD model — BUNDLED IN CI, NEVER COMMITTED:
-      # same pattern as the Kokoro bundle step. URL verified
+      # same pattern as the old bundle steps. URL verified
       # 2026-11-03 via HEAD before use: HTTP 200,
       # application/octet-stream, 643,854 bytes, from the
       # sherpa-onnx asr-models release (also referenced by
@@ -174,7 +124,7 @@ jobs:
           VAD_BYTES=$(stat -c%s app/src/main/assets/silero_vad.onnx)
           echo "Silero VAD bytes: $VAD_BYTES (expected 643854)"
           test "$VAD_BYTES" -eq 643854
-          # 1.4.5 (item 7): VAD hash pin (same pin as KokoroTtsClient).
+          # 1.4.12: VAD hash pin (mirrored in code as AlwaysOnMicManager PIN_VAD_*).
           test "$(sha256sum app/src/main/assets/silero_vad.onnx | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 
       - name: Build Debug & Release APK
@@ -217,28 +167,20 @@ jobs:
               exit 1
             fi
           fi
-          # 1.4.0 gate: the release APK MUST carry the bundled Kokoro model.
+          # 1.4.12 NEGATIVE gate: the release APK must NOT
+          # carry any bundled voice-model assets (Swara is
+          # cloud-only — no assets/kokoro/ any more).
           # 1.4.5 (item 7): IN-APK hash check — defense in depth
           # (bundle source vs shipped bytes): extract the APK's
           # assets and verify exact sizes + SHA-256 of what
-          # actually SHIPS, against the same pins.
+          # actually SHIPS, against the same pins (VAD only now).
           for APK in app/build/outputs/apk/release/*.apk; do
-            echo "Checking bundled Kokoro assets in $APK"
-            unzip -l "$APK" | grep -E "assets/kokoro/model\.int8\.onnx" || (echo "MISSING bundled Kokoro model in $APK"; exit 1)
-            unzip -l "$APK" | grep -E "assets/kokoro/voices\.bin" || (echo "MISSING bundled Kokoro voices in $APK"; exit 1)
+            echo "Checking no bundled voice assets + VAD in $APK"
+            if unzip -l "$APK" | grep -qE "assets/kokoro/"; then echo "FAIL: bundled voice assets present in $APK"; exit 1; fi
             # 1.4.0 gate: the release APK MUST carry the bundled Silero VAD model.
-            unzip -l "$APK" | grep -E "assets/silero_vad\.onnx" || (echo "MISSING bundled Silero VAD model in $APK"; exit 1)
+            unzip -l "$APK" | grep -F "assets/silero_vad.onnx" || (echo "MISSING bundled Silero VAD model in $APK"; exit 1)
             APK_TMP=$(mktemp -d)
-            unzip -p "$APK" "assets/kokoro/model.int8.onnx" > "$APK_TMP/model.int8.onnx"
-            unzip -p "$APK" "assets/kokoro/voices.bin" > "$APK_TMP/voices.bin"
-            unzip -p "$APK" "assets/kokoro/tokens.txt" > "$APK_TMP/tokens.txt"
             unzip -p "$APK" "assets/silero_vad.onnx" > "$APK_TMP/silero_vad.onnx"
-            test "$(stat -c%s "$APK_TMP/model.int8.onnx")" -eq 114202993
-            test "$(sha256sum "$APK_TMP/model.int8.onnx" | cut -d' ' -f1)" = "75635ea3b85a32d00094dcdd61a258aba87c160f7c264c304a7b3ae9d734195e"
-            test "$(stat -c%s "$APK_TMP/voices.bin")" -eq 28200960
-            test "$(sha256sum "$APK_TMP/voices.bin" | cut -d' ' -f1)" = "1c5a5b983d3d50d8586d437a51f3faa2da7919ce76a013c081e65671a3447c29"
-            test "$(stat -c%s "$APK_TMP/tokens.txt")" -eq 687
-            test "$(sha256sum "$APK_TMP/tokens.txt" | cut -d' ' -f1)" = "6ebb6bb288f20f3ae8d004d3c2ca27697da27c037d75e81a60e2a6a663f95425"
             test "$(stat -c%s "$APK_TMP/silero_vad.onnx")" -eq 643854
             test "$(sha256sum "$APK_TMP/silero_vad.onnx" | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
             echo "In-APK asset sizes + hashes verified for $APK"

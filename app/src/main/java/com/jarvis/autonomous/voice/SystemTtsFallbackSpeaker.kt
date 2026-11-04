@@ -10,18 +10,19 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 
 /**
- * 1.4.10 — Android system TextToSpeech FALLBACK speaker (Phase 1
- * audit Step 2, hybrid verdict). Kokoro (:tts) stays PRIMARY;
- * this runs ONLY when VoiceManager decides Kokoro is latched
- * (or this speak tripped the latch) — never as a silent
- * replacement, never for toggle-OFF, never alongside Kokoro.
+ * 1.4.12 — Android system TextToSpeech FALLBACK speaker (kept
+ * unchanged from 1.4.10 except this header: behaviour is
+ * identical). Swara (cloud Edge voice) stays PRIMARY; this
+ * runs when VoiceManager decides Swara is latched (or this
+ * speak tripped the latch) or the Swara toggle is OFF — never
+ * as a silent replacement, never alongside Swara.
  *
  * Why system TTS is the right fallback (audit §5): its failure
- * mode is independent of Kokoro's (the engine runs in the
- * SYSTEM process, not :tts — a system-engine death cannot kill
- * this app), it needs no permission, no FGS type, no bundle
- * and no key. What it CANNOT do: sound like hf_alpha. The
- * fallback voice is whatever the system engine offers
+ * mode is independent of Swara's (the engine runs in the
+ * SYSTEM process — a system-engine death cannot kill this
+ * app), it needs no permission, no FGS type, no bundle and
+ * no key. What it CANNOT do: sound like the primary voice.
+ * The fallback voice is whatever the system engine offers
  * (best-effort hi-IN female pick, guarantee nahi) — the
  * delivery message and the latch card say so plainly; this is
  * a stopgap, not a replacement.
@@ -43,7 +44,7 @@ object SystemTtsFallbackSpeaker {
         if (text.isBlank()) return false
         JarvisStateRepository.addDiagnostic(
             "tts", "TTS_FALLBACK_INIT",
-            "System-TTS fallback init started (Kokoro latched/unavailable)."
+            "System-TTS fallback init started (Swara latched/unavailable)."
         )
         val appContext = context.applicationContext
         val initResult = CompletableDeferred<Int>()

@@ -5,19 +5,20 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * 1.4.11: Test Voice live stage display (AI Brain Kokoro card,
+/**
+ * 1.4.12: Test Voice live stage display (AI Brain Swara card,
  * Test Voice button ke neeche). User order 2026-11-04: test ke
- * neeche dikhe Kokoro bolne me KAHAN atak raha hai — aur
- * 2026-11-04 scope addition: awaaz KYUN nahi aayi, iska kaaran
- * bhi (stage trail + stuck point + kaaran, plain Hinglish me).
+ * neeche dikhe Swara bolne me KAHAN atak raha hai — aur
+ * awaaz KYUN nahi aayi, iska kaaran bhi (stage trail + stuck
+ * point + kaaran, plain Hinglish me).
  *
  * Design (koi naya speak path nahi, koi polling nahi, koi
  * arbitrary delay nahi):
  * - Display EXISTING diagnostic markers se derive hota hai.
- *   JarvisStateRepository.addDiagnostic(Sync) har tts marker
- *   ko yahan bhejta hai (onDiagnostic), aur :tts process ke
- *   stage markers MSG_PROGRESS relay se aate hain (onTtsStage,
- *   TtsProcessClient ke SPEAK progress callback se).
+ *   JarvisStateRepository.addDiagnostic har tts marker ko
+ *   yahan bhejta hai (onDiagnostic). 1.4.12: Swara main
+ *   process me chalta hai, isliye uske stage markers seedha
+ *   addDiagnostic se aate hain — koi relay nahi hai).
  * - Ek test run TEST_VOICE_START par khulta hai aur agle
  *   TEST_VOICE_START tak terminal result FREEZE rehta hai
  *   (dusre speaks — greeting/reply — display ko chhoote
@@ -32,14 +33,12 @@ import kotlinx.coroutines.flow.asStateFlow
  *   matlab test speak ne ASAL me bolna shuru kar diya hai.
  *   In-speak markers + SPK_END terminalization sirf armed
  *   run par lagte hain.
- * - :tts death case: mara hua process kuch push nahi karta,
- *   isliye display main-process ke outcome se update hota
- *   hai — binder-death marker (NATIVE_TTS_PROCESS_DIED) +
- *   SPK_END ok=false. Relay stages sirf live trail ke liye
- *   hain; terminal hamesha main-process markers se aata hai,
- *   isliye har test ka terminal outcome display par aata hi
- *   hai (speak/bind/queue timeout paths samet — sab SPK_END
- *   likhte hain).
+ * - Swara failure case: socket fail hone par bhi display
+ *   main-process ke outcome se update hota hai — SWARA_FAILED
+ *   + SPK_END ok=false. Terminal hamesha main-process markers
+ *   se aata hai, isliye har test ka terminal outcome display
+ *   par aata hi hai (speak/queue timeout paths samet — sab
+ *   SPK_END likhte hain).
  * - Display me kabhi raw marker code, kabhi spoken text,
  *   kabhi key/token nahi dikhta — sirf plain stage labels
  *   aur kaaran. Unknown terminal par generic-cause fallback
@@ -68,6 +67,7 @@ object TestVoiceStageTracker {
         var lastStageKey = "prep"
         var pendingCause: Cause? = null
         var fallbackUsed = false
+        var fallbackReason = "latch"
         var armed = false
         var terminal = false
     }
@@ -146,10 +146,15 @@ object TestVoiceStageTracker {
                     val ok = detail.contains("ok=true")
                     if (ok) {
                         if (r.fallbackUsed) {
+                            val reasonText = if (r.fallbackReason == "off") {
+                                "Swara OFF thi, isliye system voice boli."
+                            } else {
+                                "Swara unavailable tha (latch), " +
+                                    "isliye system voice boli."
+                            }
                             _stage.value = TestVoiceStageDisplay(
                                 "System voice se bol diya — poori awaaz chali",
-                                "Kaaran: Kokoro unavailable tha (latch), " +
-                                    "isliye system voice boli. " +
+                                "Kaaran: $reasonText " +
                                     "Pahuncha: ${trailText(r)}"
                             )
                         } else {
@@ -193,23 +198,6 @@ object TestVoiceStageTracker {
                             "timeout ho gaya, isliye awaaz nahi aayi"
                     )
                 }
-                "TTS_WAIT_SETUP" -> {
-                    val r = runActive() ?: return
-                    if (!r.armed) return
-                    addTrail(r, "Setup ka intezar")
-                    r.lastStageKey = "setup"
-                    publishLive(r, "Setup ka intezar ho raha hai…")
-                }
-                "TTS_BIND_FAILED" -> {
-                    val r = runActive() ?: return
-                    if (!r.armed) return
-                    r.pendingCause = Cause(
-                        "Service se judne",
-                        "speech service se jud nahi paya, " +
-                            "isliye awaaz nahi aayi"
-                    )
-                    publishLive(r, "Service se jud nahi paya…")
-                }
                 "TTS_BUSY" -> {
                     val r = runActive() ?: return
                     if (!r.armed) return
@@ -219,42 +207,59 @@ object TestVoiceStageTracker {
                             "test refuse ho gaya aur awaaz nahi aayi"
                     )
                 }
-                "TTS_PROCESS_TIMEOUT" -> {
+                "SWARA_LATCHED_REFUSED" -> {
                     val r = runActive() ?: return
                     if (!r.armed) return
                     r.pendingCause = Cause(
-                        "Service se jawab ka intezar",
-                        "speech service se jawab nahi aaya " +
-                            "(timeout), isliye awaaz nahi aayi"
-                    )
-                }
-                "KOKORO_OFF" -> {
-                    val r = runActive() ?: return
-                    if (!r.armed) return
-                    r.pendingCause = Cause(
-                        "Kokoro OFF",
-                        "Kokoro OFF hai, isliye awaaz nahi aayi",
-                        line1Override = "Kokoro OFF hai"
-                    )
-                }
-                "KOKORO_LATCHED_REFUSED" -> {
-                    val r = runActive() ?: return
-                    if (!r.armed) return
-                    r.pendingCause = Cause(
-                        "Kokoro latch",
-                        "Kokoro unavailable hai (lagatar fail ke " +
-                            "baad latch), isliye Kokoro se awaaz " +
+                        "Swara latch",
+                        "Swara unavailable hai (lagatar fail ke " +
+                            "baad latch), isliye Swara se awaaz " +
                             "nahi aayi",
-                        line1Override = "Kokoro unavailable hai (latch)"
+                        line1Override = "Swara unavailable hai (latch)"
                     )
                 }
-                "KOKORO_UNAVAILABLE_LATCHED" -> {
+                "SWARA_UNAVAILABLE_LATCHED" -> {
                     val r = runActive() ?: return
                     if (!r.armed) return
                     publishLive(
                         r,
-                        "Kokoro unavailable hai (latch) — system " +
+                        "Swara unavailable hai (latch) — system " +
                             "voice ki taiyaari ho rahi hai…"
+                    )
+                }
+                "SWARA_CONNECT" -> {
+                    val r = runActive() ?: return
+                    if (!r.armed) return
+                    addTrail(r, "Swara connect")
+                    r.lastStageKey = "connect"
+                    publishLive(r, "Swara se jud raha hai…")
+                }
+                "SWARA_FIRST_AUDIO" -> {
+                    val r = runActive() ?: return
+                    if (!r.armed) return
+                    addTrail(r, "Pehli awaaz")
+                    r.lastStageKey = "firstAudio"
+                    publishLive(r, "Pehli awaaz aa gayi — baj rahi hai…")
+                }
+                "SWARA_STREAMING" -> {
+                    val r = runActive() ?: return
+                    if (!r.armed) return
+                    addTrail(r, "Streaming")
+                    r.lastStageKey = "stream"
+                    publishLive(r, "Streaming chal rahi hai…")
+                }
+                "SWARA_END" -> {
+                    val r = runActive() ?: return
+                    if (!r.armed) return
+                    addTrail(r, "Awaaz poori")
+                    publishLive(r, "Awaaz poori ho gayi…")
+                }
+                "SWARA_FAILED" -> {
+                    val r = runActive() ?: return
+                    if (!r.armed) return
+                    r.pendingCause = Cause(
+                        swaraStuckLabel(r),
+                        swaraCauseText(detail)
                     )
                 }
                 "TTS_FALLBACK_INIT" -> {
@@ -266,10 +271,11 @@ object TestVoiceStageTracker {
                     val r = runActive() ?: return
                     if (!r.armed) return
                     r.fallbackUsed = true
+                    r.fallbackReason = if (detail.contains("Swara OFF")) "off" else "latch"
                     addTrail(r, "System voice")
                     publishLive(
                         r,
-                        "Kokoro ke bajay system voice bol rahi hai…"
+                        "Swara ke bajay system voice bol rahi hai…"
                     )
                 }
                 "TTS_FALLBACK_FAILED" -> {
@@ -277,23 +283,15 @@ object TestVoiceStageTracker {
                     if (!r.armed) return
                     r.pendingCause = Cause(
                         "System voice",
-                        "Kokoro unavailable tha (latch) aur system " +
+                        "Swara unavailable tha (latch/OFF) aur system " +
                             "voice bhi nahi bol payi, isliye awaaz " +
                             "nahi aayi"
                     )
                 }
-                "NATIVE_TTS_PROCESS_DIED" -> {
-                    val r = runActive() ?: return
-                    if (!r.armed) return
-                    // Death ka stuck point + kaaran SPK_END par
-                    // lastStageKey se banta hai (neeche
-                    // terminalFailure me) — yahan sirf flag.
-                    r.pendingCause = Cause("DEATH", "")
-                }
                 else -> {
-                    // Baaki tts markers (FAIL_COUNT, LATCH_CLEARED,
-                    // FG markers, GREET_*, ...) display ko nahi
-                    // chhoote.
+                    // Baaki tts markers (SWARA_FAIL_COUNT,
+                    // SWARA_LATCH_CLEARED/EXPIRED, GREET_*, ...)
+                    // display ko nahi chhoote.
                 }
             }
         }
@@ -307,126 +305,36 @@ object TestVoiceStageTracker {
         }
     }
 
-    /** :tts process se relay huye stage markers (MSG_PROGRESS). */
-    fun onTtsStage(code: String) {
-        synchronized(lock) {
-            val r = runActive() ?: return
-            if (!r.armed) return
-            when (code) {
-                "TTS_ENSURE_FAILED" -> {
-                    r.pendingCause = Cause(
-                        "Voice files taiyaar karne",
-                        "voice files taiyaar nahi hui, isliye " +
-                            "awaaz nahi aayi"
-                    )
-                }
-                "SPK_ENGINE_START" -> {
-                    addTrail(r, "Engine load")
-                    r.lastStageKey = "engine"
-                    publishLive(r, "Engine load ho raha hai…")
-                }
-                "ENGINE_INIT_FAIL" -> {
-                    r.pendingCause = Cause(
-                        "Engine load",
-                        "voice engine load nahi hua, isliye " +
-                            "awaaz nahi aayi"
-                    )
-                }
-                "SPK_ENGINE_END" -> {
-                    r.lastStageKey = "engineDone"
-                    publishLive(r, "Awaaz banne ki taiyaari ho rahi hai…")
-                }
-                "SPK_GENERATE_START" -> {
-                    addTrail(r, "Generate")
-                    r.lastStageKey = "generate"
-                    publishLive(r, "Generate ho raha hai…")
-                }
-                "SPK_GENERATE_END" -> {
-                    r.lastStageKey = "playbackPrep"
-                    publishLive(r, "Playback ki taiyaari ho rahi hai…")
-                }
-                "SPK_PLAY_START" -> {
-                    addTrail(r, "Playback")
-                    r.lastStageKey = "playback"
-                    publishLive(r, "Playback chal raha hai…")
-                }
-                "EMPTY_AUDIO" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani hi nahi — khaali audio bana, " +
-                            "isliye awaaz nahi aayi"
-                    )
-                }
-                "PLAYBACK_ERROR" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par baj nahi payi — playback " +
-                            "me error aaya, isliye awaaz nahi aayi"
-                    )
-                }
-                "TTS_MINBUF_ERROR" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par baj nahi payi — audio " +
-                            "buffer nahi bana, isliye awaaz nahi aayi"
-                    )
-                }
-                "TTS_TRACK_UNINITIALIZED" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par baj nahi payi — audio " +
-                            "track taiyaar nahi hua, isliye awaaz " +
-                            "nahi aayi"
-                    )
-                }
-                "TTS_PLAY_NOT_STARTED" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par baj nahi payi — playback " +
-                            "shuru nahi hua, isliye awaaz nahi aayi"
-                    )
-                }
-                "WRITE_FAIL" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par poori baj nahi payi — " +
-                            "audio likhne me fail hua, isliye " +
-                            "awaaz nahi aayi"
-                    )
-                }
-                "TTS_DRAIN_TIMEOUT" -> {
-                    r.pendingCause = Cause(
-                        "Playback",
-                        "awaaz bani par poori baj nahi payi — " +
-                            "playback beech me atak gaya, isliye " +
-                            "awaaz nahi aayi"
-                    )
-                }
-                else -> {
-                    // FIRST_GENERATE, FG markers, ENGINE_STATE,
-                    // ... — stage display ke liye zaroori nahi.
-                }
-            }
-        }
-    }
-
-    private fun lastStageLabel(r: Run): String = when (r.lastStageKey) {
-        "engine" -> "Engine load"
-        "engineDone" -> "Generate ki taiyaari"
-        "generate" -> "Generate"
-        "playbackPrep" -> "Playback ki taiyaari"
-        "playback" -> "Playback"
-        "setup" -> "Setup ka intezar"
+    /** Swara stuck-point label + cause text from the
+     * SWARA_FAILED detail (detail carries only cause + char
+     * count — never text, codes, or keys — so the display
+     * maps the cause word to a plain Hinglish phrase). */
+    private fun swaraStuckLabel(r: Run): String = when (r.lastStageKey) {
+        "connect" -> "Swara se judne"
+        "firstAudio" -> "Pehli awaaz"
+        "stream" -> "Streaming"
         else -> "Taiyaari"
     }
 
-    private fun deathStagePhrase(r: Run): String = when (r.lastStageKey) {
-        "engine" -> "engine load"
-        "engineDone" -> "generate ki taiyaari"
-        "generate" -> "generate"
-        "playbackPrep" -> "playback ki taiyaari"
-        "playback" -> "playback"
-        else -> "bolne"
+    private fun swaraCauseText(detail: String): String = when {
+        detail.contains("cause=timeout") ->
+            "Swara se jawab nahi aaya (timeout), isliye awaaz nahi aayi"
+        detail.contains("cause=connect") ->
+            "Swara se jud nahi paya, isliye awaaz nahi aayi"
+        detail.contains("cause=no-audio") ->
+            "Swara se awaaz aayi hi nahi, isliye awaaz nahi aayi"
+        detail.contains("cause=cancelled") ->
+            "bolna beech me roka gaya, isliye awaaz poori nahi aayi"
+        else ->
+            "Swara se awaaz ban nahi payi, isliye awaaz nahi aayi"
+    }
+
+
+    private fun lastStageLabel(r: Run): String = when (r.lastStageKey) {
+        "connect" -> "Swara se judna"
+        "firstAudio" -> "Pehli awaaz"
+        "stream" -> "Streaming"
+        else -> "Taiyaari"
     }
 
     private fun terminalFailure(r: Run): TestVoiceStageDisplay {
@@ -439,12 +347,6 @@ object TestVoiceStageTracker {
                 line1 = "$label par atak gaya"
                 causeText = "kaaran marker me nahi mila — $label " +
                     "par ruk gaya, isliye awaaz nahi aayi"
-            }
-            cause.stuckLabel == "DEATH" -> {
-                line1 = "${lastStageLabel(r)} par atak gaya"
-                causeText = "${deathStagePhrase(r)} ke beech " +
-                    "speech process band ho gaya, isliye awaaz " +
-                    "nahi aayi"
             }
             cause.line1Override != null -> {
                 line1 = cause.line1Override

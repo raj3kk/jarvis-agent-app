@@ -115,7 +115,7 @@ import kotlinx.coroutines.withContext
  * terminal-stop permanent-silence design is dead. Mic off happens
  * only on the user's explicit OFF action. Trade-off (user-decided):
  * no internet = no listening; speaking still works offline via
- * bundled Kokoro.
+ * the system voice (Swara itself needs internet).
  *
  * THREADING: turn checks use [mainHandler]; Deepgram callbacks
  * arrive on OkHttp threads and are marshalled to main where
@@ -1023,7 +1023,7 @@ class AlwaysOnMicManager(
 
     /**
      * Coordinator wiring for barge-in: called with VoiceManager's
-     * stop path (it stops Kokoro / Deepgram / Gemini / system TTS).
+     * stop path (it stops Swara / Deepgram / system TTS).
      */
     fun setStopSpeakingCallback(callback: StopSpeakingCallback?) {
         stopSpeakingCallback = callback
@@ -1484,6 +1484,13 @@ class AlwaysOnMicManager(
          *  timeout existed before — a hung TCP connect left the
          *  loop "connecting" forever). */
         const val CONNECT_TIMEOUT_MS: Long = 15_000L
+        /** 1.4.12: Silero VAD model pin — CI mirror of the
+         *  workflow's VAD bundle gate (643,854 bytes). Moved
+         *  here so the pin has a code home now that the old
+         *  voice client's pins are deleted with it. The workflow
+         *  still enforces the same pin independently. */
+        const val PIN_VAD_SIZE: Long = 643_854L
+        const val PIN_VAD_SHA: String = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
         /** 1.4.5: reconnect backoff base + cap (5s, doubling to
          *  30s) — auto-revive runs forever until the user turns
          *  the mic off; only permission/key failures stop it. */
@@ -1591,7 +1598,7 @@ fun interface StopSpeakingCallback {
  * 3. NEVER FAILS THE BUILD OR THE MIC: all native/model work is
  *    inside runCatching; every failure degrades to "VAD off".
  *    (Compile-time: the sherpa AAR is already a declared
- *    dependency for Kokoro, so these imports add no new dep.)
+ *    dependency for VAD, so these imports add no new dep.)
  * 4. ECHO GATE: while [isSpeaking] is true, frames are DROPPED
  *    (never fed to Vad) and [resumeAfterSpeech] resets Vad, so
  *    Jarvis's own TTS can never be emitted as a user segment.

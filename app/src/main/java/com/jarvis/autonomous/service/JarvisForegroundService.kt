@@ -36,7 +36,7 @@ import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
 import com.jarvis.autonomous.voice.DeepgramSttClient
-import com.jarvis.autonomous.voice.TtsProcessClient
+import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.voice.VoiceManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -113,14 +113,15 @@ class JarvisForegroundService : Service() {
      */
     private var greetingDone: Boolean = false
     private var pendingGreet: Boolean = false
-    // 1.4.5: greeting-speak flight flag + deferred VAD start.
-    // The 1.4.4 bounce died during greeting native load; the
-    // pre-existing Sherpa VAD native init (startVadMonitor) must
-    // not spike native allocation at the same moment, so while
-    // a greeting speak is in flight, VAD init waits and runs
-    // right after the greeting finishes (pendingVadStart).
-    // VAD is optional (mic-busy degrades to VAD-off by design);
-    // greeting is the priority, so VAD yields, never the reverse.
+    // 1.4.12: greeting-speak flight flag + deferred VAD start.
+    // VAD init is deferred until the greeting speak completes,
+    // to avoid VAD-init vs greeting-speak contention at launch;
+    // while a greeting speak is in flight, VAD init waits and
+    // runs right after the greeting finishes (pendingVadStart).
+    // Greeting speak is fast under Swara streaming, so the
+    // window shrinks naturally. VAD is optional (mic-busy
+    // degrades to VAD-off by design); greeting is the priority,
+    // so VAD yields, never the reverse.
     @Volatile
     private var greetingSpeakInProgress: Boolean = false
     private var pendingVadStart: Boolean = false
@@ -153,11 +154,13 @@ class JarvisForegroundService : Service() {
         // utterance). Now Java throws are recorded (tts/SPK_START,
         // exact class + message, never the spoken text) and
         // degrade to "not spoken" (chat fallback) instead of a
-        // crash. What this CANNOT catch: a native crash inside
-        // Sherpa/ONNX or a system battery-kill — those leave NO
-        // Java crash entry, which is itself the diagnostic signal
-        // (SPK_START present + no SPK_END + no crash entry =
-        // native crash or system kill during speak).
+        // crash. What this CANNOT catch: a system battery-kill
+        // — that leaves NO Java crash entry, which is itself the
+        // diagnostic signal (SPK_START present + no SPK_END +
+        // no crash entry = system kill during speak). Swara runs
+        // in-process with bounded timeouts, so a hung speak
+        // returns (SPK_END is always written) instead of hanging
+        // the breaker detector.
         val startMs = System.currentTimeMillis()
         JarvisStateRepository.addDiagnostic(
             "tts", "SPK_START",
@@ -205,7 +208,7 @@ class JarvisForegroundService : Service() {
     /**
      * 1.4.3 startup greeting (FIXED local lines, LLM bypassed —
      * no network, no key, no LLM failure can swallow it). The
-     * chat line is ALWAYS posted (visible even with Kokoro OFF);
+     * chat line is ALWAYS posted (visible even with Swara OFF);
      * speech is best-effort and its failure is logged. The
      * key-prompt appends ONLY when no API key is saved.
      */
@@ -219,9 +222,9 @@ class JarvisForegroundService : Service() {
             base
         }
         JarvisStateRepository.addChatMessage("Jarvis", full)
-        // 1.4.5 CIRCUIT BREAKER (WhopClip-style catcher bridge —
-        // diagnostic + usability bridge, NOT a substitute for the
-        // isolated-process TTS fix): if the previous process died
+        // 1.4.5 CIRCUIT BREAKER (generic GREET_START-without-
+        // SPK_END detector, kept in 1.4.12): if the previous
+        // process died
         // during greeting speak (GREET_START with no SPK_END),
         // skip greeting speak for exactly ONE launch and show
         // the breaker card instead (see Command tab). Two things
@@ -265,42 +268,31 @@ class JarvisForegroundService : Service() {
             greetingSpeakInProgress = false
             // Deferred VAD init (see startVadMonitor /
             // deferVadUntilGreeting): run it now that greeting
-            // native work is done, so the two native loads never
-            // spike together at launch.
+            // speak is done (VAD init was deferred until greeting
+            // speak completes, to avoid contention at launch).
             drainPendingVad()
             if (!ok) {
-                // 1.4.6: the old "(Kokoro OFF or TTS failed)" text
-                // was ambiguous — a report could not tell which
-                // stage failed. Now the stage is named explicitly
-                // from the toggle + the TTS client's last failure
-                // (:tts-side ENGINE_INIT_FAIL / HASH_MISMATCH, if
-                // present in diagnostics, are the deeper cause
-                // under a TTS_FAILED stage).
+                // 1.4.6: the old "(OFF or TTS failed)" text was
+                // ambiguous — a report could not tell which stage
+                // failed. Now the stage is named explicitly from
+                // the toggle + the Swara client's last failure
+                // (SWARA_* markers in diagnostics are the deeper
+                // cause under a TTS_FAILED stage).
                 val stage = when {
-                    !prefs.kokoroEnabled -> "KOKORO_OFF"
-                    TtsProcessClient.lastFailure != null -> TtsProcessClient.lastFailure
+                    !prefs.swaraEnabled -> "SWARA_OFF"
+                    SwaraTtsClient.lastFailure != null -> SwaraTtsClient.lastFailure
                     else -> "TTS_FAILED"
                 }
                 JarvisStateRepository.addDiagnostic(
                     "tts", "GREET_FAIL",
                     "Startup greeting could not be spoken — stage=$stage " +
-                        "(KOKORO_OFF = toggle OFF in AI Brain; " +
-                        "TTS_BIND_FAILED = :tts bind failed; " +
-                        "NATIVE_TTS_PROCESS_DIED = :tts died; " +
-                        "TTS_PROCESS_TIMEOUT = no :tts reply; " +
-                        "TTS_BUSY = concurrent speak; TTS_FAILED = " +
+                        "(SWARA_OFF = toggle OFF in AI Brain; " +
+                        "SWARA_CONNECT_FAILED = Swara connect failed; " +
+                        "SWARA_SYNTHESIZE_FAILED = Swara synth/playback failed; " +
+                        "SWARA_NO_AUDIO = Swara sent no audio; " +
+                        "SWARA_TIMEOUT = Swara timed out; TTS_FAILED = " +
                         "other speak failure) — text shown in chat."
                 )
-                // 1.4.5 visible failure: if the isolated TTS
-                // process died mid-greeting, say so in chat
-                // (the app stayed open — that IS the fix working).
-                if (TtsProcessClient.lastFailure == TtsProcessClient.FAIL_NATIVE_DIED) {
-                    JarvisStateRepository.addChatMessage(
-                        "System",
-                        "Awaaz wala process band ho gaya, isliye greeting " +
-                            "sunai nahi di — app khula hua hai, baat chat me padh sakte ho."
-                    )
-                }
             }
         }
     }
@@ -416,15 +408,13 @@ class JarvisForegroundService : Service() {
      * A missing asset only logs — it never breaks the mic loop.
      */
     private fun startVadMonitor() {
-        // 1.4.5 serialization: while a greeting speak is in
-        // flight, its native Kokoro load is running — do not
-        // stack the Sherpa VAD native init on top of it. Defer
-        // (VAD is optional; greeting is the priority) and run
-        // right after the greeting finishes (see speakGreeting).
-        // Cross-process note: after 1.4.5 isolation, Kokoro runs
-        // in :tts and VAD in the main process, so they share no
-        // native state any more — this deferral only avoids a
-        // simultaneous native-allocation spike at launch.
+        // 1.4.12: while a greeting speak is in flight, VAD
+        // init is deferred until the greeting speak completes,
+        // to avoid VAD-init vs greeting-speak contention at
+        // launch. Defer (VAD is optional; greeting is the
+        // priority) and run right after the greeting finishes
+        // (see speakGreeting). Greeting speak is fast under
+        // Swara streaming, so the window shrinks naturally.
         if (greetingSpeakInProgress) {
             pendingVadStart = true
             JarvisStateRepository.addDiagnostic(
@@ -435,8 +425,8 @@ class JarvisForegroundService : Service() {
             return
         }
         serviceScope.launch {
-            // 1.4.5 overlap markers: VAD_INIT_START/END timestamps
-            // against SPK_ENGINE_/SPK_GENERATE_ markers show
+            // 1.4.12 overlap markers: VAD_INIT_START/END timestamps
+            // against SWARA_CONNECT/SWARA_FIRST_AUDIO markers show
             // whether VAD init overlapped greeting speak.
             JarvisStateRepository.addDiagnostic(
                 "tts", "VAD_INIT_START",
@@ -490,7 +480,7 @@ class JarvisForegroundService : Service() {
         }
         // 1.4.3: loop OFF — Deepgram one-shot FIRST (key present),
         // system single-reply second (key missing or Deepgram
-        // timeout/failure). Speaking stays Kokoro either way.
+        // timeout/failure). Speaking stays Swara either way.
         val dgKey = prefs.deepgramApiKey
         if (dgKey.isNotBlank()) {
             val heard = runCatching {
@@ -830,10 +820,10 @@ class JarvisForegroundService : Service() {
         // write; whichever runs first wins, the other rewrites the
         // identical file (idempotent). Fully best-effort: any
         // failure is swallowed, the service command continues.
-        // 1.4.5: UI + this service share the MAIN process; only
-        // Kokoro TTS runs in :tts (see KokoroTtsService). So
-        // LaunchSession flags are shared with the Activity (same
-        // process), and the :tts process never touches them.
+        // 1.4.12: UI + this service share the MAIN process, and
+        // Swara TTS now runs in the main process too (no :tts
+        // process any more). So LaunchSession flags are shared
+        // with the Activity (same process).
         // 1.4.5 (item 6): ATOMIC bounce detection — the old
         // plain-Boolean check-then-set raced across three threads
         // (Activity onCreate, this service thread, Command-tab
@@ -871,10 +861,9 @@ class JarvisForegroundService : Service() {
             // sample line through the NORMAL speak path (the
             // same speakWrapped as greetings/replies), so it
             // exercises greeting/reply speech exactly, including
-            // :tts death + breaker behavior. No-op safeguard:
-            // speakWrapped itself refuses when Kokoro is OFF
-            // (KOKORO_OFF diagnostic); the button is also greyed
-            // out when OFF in AI Brain.
+            // breaker behavior. Swara OFF never refuses: the test
+            // speaks via the system voice instead, and the button
+            // stays enabled in AI Brain.
             ACTION_SPEAK_TEST -> {
                 serviceScope.launch {
                     runCatching {

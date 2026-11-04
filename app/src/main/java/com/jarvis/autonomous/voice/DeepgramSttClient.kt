@@ -23,7 +23,7 @@ import kotlin.coroutines.resume
 /**
  * Deepgram STT (1.4.3, listening/transcription ONLY).
  *
- * Speaking stays bundled Kokoro — Deepgram TTS/Aura is NEVER used
+ * Speaking stays Swara (cloud Edge voice) — Deepgram TTS/Aura is NEVER used
  * here and no TTS code path references this client.
  *
  * Wire protocol (Deepgram streaming API):
