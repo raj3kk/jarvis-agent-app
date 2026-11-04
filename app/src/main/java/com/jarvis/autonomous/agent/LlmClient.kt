@@ -217,6 +217,17 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 } catch (e: Exception) {
                     lastError = e
                     if (candidate == candidates.last()) throw e
+                    // 1.4.13 (F-L2): fail FAST on non-retryable
+                    // errors — do NOT burn the remaining
+                    // candidates (each up to 25 s connect / 45 s
+                    // read) on a dead key or a dead endpoint.
+                    // 401 = the key is dead for EVERY candidate
+                    // (same key); 404 = the endpoint/model path
+                    // is dead. Retryable errors (429 / 5xx /
+                    // network / timeouts) still fall through to
+                    // the next candidate model, as before. Model
+                    // choice and timeout values are untouched.
+                    if (isNonRetryableLlmError(e)) throw e
                     // else: fall through to the next candidate model
                 }
             }
@@ -278,6 +289,19 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             lower.contains("app") || lower.contains("calculator") ||
             lower.contains("todo")
         return buildVerb && buildObject
+    }
+
+    /**
+     * 1.4.13 (F-L2): non-retryable LLM errors. Both API callers
+     * throw IllegalStateException("HTTP <code>: ..."), so a
+     * prefix match is exact — a "401"/"404" buried in a body
+     * string never misclassifies. Everything else (429, 5xx,
+     * SocketTimeout, unknown-host, parse errors) is retryable
+     * and still tries the next candidate model.
+     */
+    private fun isNonRetryableLlmError(e: Exception): Boolean {
+        val msg = (e.message ?: "").trim()
+        return msg.startsWith("HTTP 401") || msg.startsWith("HTTP 404")
     }
 
     private fun buildSystemPrompt(): String {

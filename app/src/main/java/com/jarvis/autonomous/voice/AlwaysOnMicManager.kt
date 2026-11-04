@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -172,6 +173,34 @@ class AlwaysOnMicManager(
     var currentSpokenText: String = ""
         private set
 
+    /**
+     * 1.4.13 (F-E1): fingerprint of the LAST spoken text, kept
+     * for the LIVE-transcript echo gate after speech ends.
+     * Set on every setSpeaking(true); cleared when the next
+     * NON-echo turn completes, when the next speak starts
+     * (overwritten), or when the loop stops. Content-gated
+     * ONLY — there is deliberately no timer and no post-speech
+     * grace window: a live transcript is dropped exactly when
+     * it is a subsequence of this text, however late it arrives
+     * (speaker drain tail), and genuine new speech is never
+     * time-blocked. Edge case, accepted by design: a user
+     * command that is VERBATIM a subsequence of the last
+     * spoken text is dropped until the next speak refreshes
+     * the fingerprint — the user rephrases, or a stop keyword
+     * still barges in during speech.
+     */
+    private var echoFingerprintText: String = ""
+
+    /**
+     * 1.4.13 (F-E5): true between a barge-in trigger and the
+     * speak coroutine's real exit (speakWrapped's finally ->
+     * setSpeaking(false)). While true, the gate stays CLOSED
+     * (isSpeaking is still true, so transcripts quarantine)
+     * and a second barge-in keyword does NOT re-fire — the
+     * real open event is the finally, never the callback.
+     */
+    private var speakStopping: Boolean = false
+
     private var stopSpeakingCallback: StopSpeakingCallback? = null
 
     // RMS baseline for the barge-in "loud" gate; tracked only while
@@ -215,9 +244,10 @@ class AlwaysOnMicManager(
     // 1.4.7 (A2): audio captured while the stream was NOT ready
     // (idle-suspended, connecting, or reconnect-backing-off) is
     // buffered, not discarded — the utterance that triggers a
-    // resume used to be lost ("kabhi nahi catch"). Capped at 80
-    // x 100ms chunks (8s, oldest dropped); flushed in order by
-    // the pump before live audio once the stream opens.
+    // resume used to be lost ("kabhi nahi catch"). Capped at
+    // MAX_SUSPEND_CHUNKS (1.4.13: 45 s, oldest dropped);
+    // flushed in order by the pump before live audio once the
+    // stream opens.
     private val suspendAudioLock = Any()
     private val suspendAudioChunks: ArrayDeque<ByteArray> = ArrayDeque()
     // 1.4.5 (FINAL policy): NO terminal-stop design any more.
@@ -377,6 +407,11 @@ class AlwaysOnMicManager(
                     val text = outcome.text
                     turnDetector.reset()
                     resetTurnAssembly()
+                    // 1.4.13 (F-E1): this turn completed, so it
+                    // was non-echo by construction (echo was
+                    // filtered at flush / dropped live) — the
+                    // last-spoken fingerprint retires here.
+                    echoFingerprintText = ""
                     resetLanguageToPrimary()
                     if (TurnDetector.isMicStopCommand(text)) {
                         // TurnDetector.check already fast-tracks
@@ -429,7 +464,12 @@ class AlwaysOnMicManager(
      * policy; no system path exists any more). Safe to call
      * twice (returns true when already enabled — the service's
      * health-restart logic decides when a re-tap forces a real
-     * restart via stop() + start()). A blank Deepgram key is a
+     * restart via stop() + start()). 1.4.13 (F-H1): this no-op
+     * is exactly why a tap on an enabled-but-SUSPENDED loop
+     * must NOT come here — the service checks suspension FIRST
+     * and calls resumeDeepgram() (as the overlay pill already
+     * did); routing a suspended tap through start() would leave
+     * the stream suspended forever. A blank Deepgram key is a
      * PERMANENT failure (banner via onMicError, never a silent
      * loop): without a key there is nothing to listen with. No
      * network at start enters RECONNECTING (visible banner +
@@ -802,6 +842,36 @@ class AlwaysOnMicManager(
             return
         }
         deepgramRecord = record
+        // 1.4.13 (F-E3): platform AEC on the pump's own
+        // AudioRecord session (VOICE_RECOGNITION capture).
+        // Created here, released in the pump finally. If the
+        // device has no AEC (create returns null) or enabling
+        // throws, the pump runs on WITHOUT it and the software
+        // echo gate stays primary — AEC absence NEVER silences
+        // the mic and NEVER drops audio. Playback stays
+        // USAGE_MEDIA (VoiceManager focus + Swara AudioTrack):
+        // switching playback to VOICE_COMMUNICATION would risk
+        // earpiece routing and hurt audibility, so it is
+        // deliberately NOT done — AEC is an enhancement on top
+        // of the software gate, not a replacement for it.
+        var pumpAec: AcousticEchoCanceler? = null
+        runCatching {
+            AcousticEchoCanceler.create(record.audioSessionId)
+        }.getOrNull().let { created ->
+            pumpAec = created
+            if (created != null) {
+                runCatching { created.setEnabled(true) }.onFailure {
+                    runCatching { created.release() }
+                    pumpAec = null
+                }
+            }
+        }
+        if (pumpAec == null) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "AEC_UNAVAILABLE",
+                "Platform AEC unavailable on this device — software echo gate stays primary (mic unaffected)."
+            )
+        }
         val thread = Thread {
             val shorts = ShortArray(1600)
             val bytes = ByteArray(3200)
@@ -867,7 +937,7 @@ class AlwaysOnMicManager(
                     // buffering. Audio streams ONLY when the
                     // stream is live AND ready (active, not
                     // suspended, not connecting, not backing
-                    // off); otherwise it is BUFFERED (cap 8s,
+                    // off); otherwise it is BUFFERED (cap 45s,
                     // oldest dropped) while the stream is merely
                     // not ready yet, and discarded only when the
                     // loop is not running at all. The pump flushes
@@ -927,6 +997,11 @@ class AlwaysOnMicManager(
                     }
                 }
             } finally {
+                // 1.4.13 (F-E3): release AEC before the record
+                // it was attached to (both runCatching — a dead
+                // pump must never throw out of its finally).
+                runCatching { pumpAec?.release() }
+                pumpAec = null
                 runCatching { record.stop() }
                 runCatching { record.release() }
                 if (deepgramRecord == record) deepgramRecord = null
@@ -1003,6 +1078,10 @@ class AlwaysOnMicManager(
         speakingDepth = 0
         isSpeaking = false
         currentSpokenText = ""
+        // 1.4.13 (F-E1/F-E5): a stopped loop holds no fingerprint
+        // and no stopping state — a later start speaks fresh.
+        echoFingerprintText = ""
+        speakStopping = false
         mainHandler.removeCallbacks(turnCheckRunnable)
         stopDeepgramStream()
         sttPathReason = "stopped"
@@ -1023,7 +1102,12 @@ class AlwaysOnMicManager(
 
     /**
      * Coordinator wiring for barge-in: called with VoiceManager's
-     * stop path (it stops Swara / Deepgram / system TTS).
+     * stop path. CORRECTION (1.4.13, F-E4): the old docstring
+     * claimed this stops "Swara / Deepgram / system TTS" — that
+     * was false twice over. VoiceManager.stopSpeaking stops
+     * Swara playback AND, since 1.4.13, the system-TTS fallback
+     * via its static stop handle — but it NEVER stops Deepgram
+     * listening. A barge-in must cut speech, never kill the mic.
      */
     fun setStopSpeakingCallback(callback: StopSpeakingCallback?) {
         stopSpeakingCallback = callback
@@ -1043,6 +1127,11 @@ class AlwaysOnMicManager(
             speakingDepth++
             isSpeaking = true
             currentSpokenText = spokenText
+            // 1.4.13 (F-E1/F-E5): a new speak refreshes the live
+            // echo fingerprint and supersedes any stopping state
+            // left by the previous speak's barge-in.
+            echoFingerprintText = spokenText
+            speakStopping = false
             vadMonitor?.pauseForSpeech()
         } else {
             if (speakingDepth > 0) speakingDepth--
@@ -1050,6 +1139,10 @@ class AlwaysOnMicManager(
             val currentSpokenTextBeforeClear = currentSpokenText
             isSpeaking = false
             currentSpokenText = ""
+            // 1.4.13 (F-E5): this is the REAL open event (the
+            // speak coroutine's finally) — the stopping window
+            // ends here, and only here, does the gate open.
+            speakStopping = false
             vadMonitor?.resumeAfterSpeech()
             // B-C3: flush quarantined transcripts now, stamped
             // with post-TTS time, so they form a turn only after
@@ -1144,7 +1237,19 @@ class AlwaysOnMicManager(
         // B-C3: barge-in is FINAL transcripts only, checked
         // first while speaking; a leading stop keyword interrupts
         // TTS and never becomes a turn by itself.
-        if (isFinal && BargeInDetector.isBargeIn(
+        // 1.4.13 (F-E5): while a speak is already stopping, a
+        // second keyword does NOT re-fire — it quarantines like
+        // any other in-flight transcript and is flushed (echo
+        // filtered) when the speak coroutine really exits. The
+        // gate opens ONLY at speakWrapped's finally, never here:
+        // this branch stops playback and marks stopping, but
+        // deliberately does NOT call setSpeaking(false) — the
+        // old immediate call reopened the gate while the
+        // playback drain tail was still sounding, so tail echo
+        // fed live turns. Pre-barge-in quarantined items are
+        // discarded here (same net effect as the old
+        // flush-then-reset): the barge-in replaces them.
+        if (isFinal && !speakStopping && BargeInDetector.isBargeIn(
                 transcript = text,
                 isSpeaking = isSpeaking,
                 spokenText = currentSpokenText,
@@ -1156,8 +1261,9 @@ class AlwaysOnMicManager(
             // (VoiceManager.stopSpeaking("barge-in keyword")) logs
             // the single SPEAK_ABORT entry. Logging here too made
             // ONE barge-in produce TWO abort entries in Diagnostics.
+            speakStopping = true
             stopSpeakingCallback?.stopSpeaking()
-            setSpeaking(false)
+            quarantinedWhileSpeaking.clear()
             val remainder = BargeInDetector.remainderAfterKeyword(text)
             if (remainder.isNotEmpty()) {
                 // "ruk, youtube band karo" -> the follow-up command
@@ -1188,6 +1294,27 @@ class AlwaysOnMicManager(
             quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
             return
         }
+        // 1.4.13 (F-E1): LIVE-transcript echo gate, content-gated
+        // NOT time-gated. After a speak ends, the speaker drain
+        // tail can still arrive as live transcripts; the old code
+        // fed them straight into the turn (only the quarantine
+        // flush filtered echo). Now a live transcript that is a
+        // subsequence of the last spoken text is dropped — no
+        // grace timer, no silence window, so genuine speech is
+        // never time-blocked and tail echo is never time-let-in.
+        // Finals get one diagnostic line (bounded, one per echo
+        // utterance); interims drop silently like the flush.
+        if (echoFingerprintText.isNotBlank() &&
+            isEchoOfSpoken(text, echoFingerprintText)
+        ) {
+            if (isFinal) {
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "ECHO_DROPPED_LIVE",
+                    "Live transcript dropped as echo of last spoken text (content gate, no timer)."
+                )
+            }
+            return
+        }
         // 1.4.7 (A1): Deepgram segments are assembled into the
         // cumulative turn text (see feedAssembled) — the old
         // isNewSession flag never changed in the Deepgram loop
@@ -1198,23 +1325,17 @@ class AlwaysOnMicManager(
     }
 
     /**
-     * Echo test for the quarantine flush (1.4.5 item 4): true when
-     * the held transcript is (a) contained as a string in the
-     * spoken text, or (b) a contiguous token-subsequence of the
-     * spoken tokens — mirroring BargeInDetector's echo guards.
-     * Normalisation: lowercase, trim, collapse whitespace.
+     * Echo test for the quarantine flush AND the live gate
+     * (1.4.13, F-E2): delegates to BargeInDetector's shared test
+     * — non-contiguous token subsequence + normalizeTokens
+     * (punctuation strip + Devanagari map). The old
+     * contiguous-only test here let mistranscribed echo
+     * ("bus karo" for spoken "bas karo") through the flush
+     * while the barge-in guard caught it — one test now, both
+     * gates.
      */
     private fun isEchoOfSpoken(held: String, spoken: String): Boolean {
-        fun norm(t: String) = t.lowercase().trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-        val heldNorm = norm(held)
-        val spokenNorm = norm(spoken)
-        if (heldNorm.isEmpty() || spokenNorm.isEmpty()) return false
-        if (spoken.lowercase().contains(held.lowercase().trim())) return true
-        if (heldNorm.size > spokenNorm.size) return false
-        for (start in 0..(spokenNorm.size - heldNorm.size)) {
-            if (spokenNorm.subList(start, start + heldNorm.size) == heldNorm) return true
-        }
-        return false
+        return BargeInDetector.isEchoTranscript(held, spoken)
     }
 
     // ---- Wake-word session (Deepgram-only, loop OFF only) ----
@@ -1507,9 +1628,15 @@ class AlwaysOnMicManager(
         /** 1.4.8: hysteresis — never suspend within this long
          *  of a resume (see the flap mechanism below). */
         const val IDLE_RESUME_GRACE_MS: Long = 30_000L
-        /** 1.4.7 (A2): not-ready audio buffer cap — 80 x 100ms
-         *  chunks = 8s (256KB), oldest dropped. */
-        const val MAX_SUSPEND_CHUNKS: Int = 80
+        /** 1.4.13 (F-H2): not-ready audio buffer cap — sized
+         *  from the reconnect budget it must cover, not a
+         *  guess: max backoff 30 s (RECONNECT_MAX_MS) + connect
+         *  timeout 15 s (CONNECT_TIMEOUT_MS) = 45 s. 450 x
+         *  100 ms chunks = 45 s of 16 kHz mono 16-bit PCM
+         *  (~1.44 MB: 450 x 3200 bytes), oldest dropped, flushed
+         *  in order. The old 8 s cap dropped the very utterance
+         *  that triggered a slow resume. */
+        const val MAX_SUSPEND_CHUNKS: Int = 450
 
     }
 }

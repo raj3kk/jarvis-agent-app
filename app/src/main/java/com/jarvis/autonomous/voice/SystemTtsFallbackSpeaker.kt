@@ -40,6 +40,24 @@ object SystemTtsFallbackSpeaker {
 
     private const val INIT_TIMEOUT_MS = 10_000L
 
+    /**
+     * 1.4.13 (F-E4): the CURRENTLY speaking engine, if any.
+     * speak() used to hold its TextToSpeech locally with no
+     * static handle, so its tts.stop() fired only on internal
+     * timeout — VoiceManager.stopSpeaking could NOT cut a
+     * fallback utterance, and the old claim that the barge-in
+     * callback "stops system TTS" was false. Now stop() below
+     * cuts it from anywhere; the field is cleared in speak()'s
+     * finally so a stale engine is never stopped twice.
+     */
+    @Volatile
+    private var currentTts: TextToSpeech? = null
+
+    /** Cuts the fallback utterance in flight, if any (no-op otherwise). */
+    fun stop() {
+        runCatching { currentTts?.stop() }
+    }
+
     suspend fun speak(context: Context, text: String): Boolean {
         if (text.isBlank()) return false
         JarvisStateRepository.addDiagnostic(
@@ -51,6 +69,9 @@ object SystemTtsFallbackSpeaker {
         val tts = runCatching {
             TextToSpeech(appContext) { status -> initResult.complete(status) }
         }.getOrNull()
+        // 1.4.13 (F-E4): publish the live engine so stop() can
+        // cut it; cleared in the finally below.
+        if (tts != null) currentTts = tts
         if (tts == null) {
             JarvisStateRepository.addDiagnostic(
                 "tts", "TTS_FALLBACK_FAILED",
@@ -82,6 +103,18 @@ object SystemTtsFallbackSpeaker {
                 override fun onError(utteranceId: String?) {
                     done.complete(false)
                 }
+
+                // 1.4.13 (F-E4): stop() must free the speak
+                // coroutine promptly, not hang it to the timeout
+                // — a barge-in cut during a fallback utterance
+                // completes here as "not fully spoken" (false),
+                // so the VM slot + FGS mutex release at once.
+                // (minSdk 26, so onStop exists on every device
+                // this build runs on; the timeout below stays
+                // as the backstop if a platform skips it.)
+                override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                    done.complete(false)
+                }
             })
             val speakResult = tts.speak(
                 text, TextToSpeech.QUEUE_FLUSH, null,
@@ -111,6 +144,7 @@ object SystemTtsFallbackSpeaker {
             )
             return true
         } finally {
+            if (currentTts === tts) currentTts = null
             runCatching { tts.shutdown() }
         }
     }

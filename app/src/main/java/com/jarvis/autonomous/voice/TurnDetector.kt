@@ -213,6 +213,12 @@ class TurnDetector {
     /**
      * Why [text] looks incomplete, or null if it looks complete.
      * Rules, in order:
+     * 0. 1.4.13 (F-L1): ends with '?' — a QUESTION, not a
+     *    fragment. The old code stripped '?' before checking,
+     *    so "aur price?" (no verb, no question word) paid the
+     *    ~9 s "aur bolo" + 5 s-window penalty for asking a
+     *    question. A trailing '?' now completes the turn
+     *    outright, including follow-up shapes ("aur X?").
      * 1. Ends with a conjunction / preposition / subordinating word
      *    (Hinglish + English) — the sentence is mid-phrase.
      * 2. Two or more words, no verb token, and no question word —
@@ -225,6 +231,7 @@ class TurnDetector {
     fun incompleteReason(text: String): String? {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return null
+        if (trimmed.endsWith("?")) return null
         val tokens = trimmed.lowercase()
             .replace("?", " ")
             .replace("।", " ")
@@ -511,20 +518,42 @@ object BargeInDetector {
         // token ("ruk gaya" echo must not barge-in). A keyword +
         // follow-up command is only echo when the whole
         // transcript sits inside Jarvis's spoken text.
+        // 1.4.13 (F-E2): this guard is the SHARED echo test
+        // ([isEchoTranscript]) — the quarantine flush and the
+        // live-transcript echo gate use the same test, so a
+        // mistranscribed echo cannot pass one gate and fail the
+        // other.
         val spokenTokens = TurnDetector.normalizeTokens(spokenText)
-        val spokenJoined = spokenTokens.joinToString(" ")
-        val transcriptJoined = tokens.joinToString(" ")
-        if (spokenJoined.isNotEmpty() && spokenJoined.contains(transcriptJoined)) return false
-        // 1.4.3 fuzzy echo: a MISTRANSCRIBED echo ("bus karo"
-        // for spoken "bas karo") still sits inside Jarvis's words
-        // IN ORDER, even when the strings differ — a token
-        // subsequence check catches it where contains() cannot.
-        if (spokenTokens.isNotEmpty() && isTokenSubsequence(tokens, spokenTokens)) return false
+        if (isEchoTranscript(transcript, spokenText)) return false
         if (remainderTokens.isEmpty() && keyword in spokenTokens) return false
         // Loud gate: KNOWN values only, never skipped on unknown.
         if (rmsDb == null || rmsBaselineDb == null) return false
         if (rmsDb < rmsBaselineDb + LOUD_MARGIN_DB) return false
         return true
+    }
+
+    /**
+     * 1.4.13 (F-E2) — the ONE shared echo test, used by the
+     * barge-in guard above, by the quarantine flush, and by the
+     * live-transcript echo gate (AlwaysOnMicManager). True when
+     * the transcript's normalised tokens are contained as a
+     * string in the spoken text OR appear inside the spoken
+     * tokens IN ORDER but not necessarily adjacent (the 1.4.3
+     * fuzzy echo check: a mistranscribed echo — "bus karo" for
+     * spoken "bas karo" — still sits inside Jarvis's words in
+     * order where contains() cannot see it). Normalisation is
+     * [TurnDetector.normalizeTokens]: lowercase, punctuation
+     * stripped, Devanagari keywords mapped, fillers dropped.
+     * Content-gated only — never a timer, never a grace window.
+     */
+    fun isEchoTranscript(transcript: String, spokenText: String): Boolean {
+        val tokens = TurnDetector.normalizeTokens(transcript)
+        val spokenTokens = TurnDetector.normalizeTokens(spokenText)
+        if (tokens.isEmpty() || spokenTokens.isEmpty()) return false
+        val spokenJoined = spokenTokens.joinToString(" ")
+        val transcriptJoined = tokens.joinToString(" ")
+        if (spokenJoined.contains(transcriptJoined)) return true
+        return isTokenSubsequence(tokens, spokenTokens)
     }
 
     /** True when [needle] appears inside [haystack] in order

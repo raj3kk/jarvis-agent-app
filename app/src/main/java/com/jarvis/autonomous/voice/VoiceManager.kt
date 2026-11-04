@@ -100,7 +100,13 @@ class VoiceManager(
     private val startWakeSession: (((String) -> Unit) -> Unit) = { },
     private val stopWakeSession: (() -> Unit) = { },
     private val listenOnceSession: (((String?) -> Unit) -> Unit) = { },
-    private val cancelListenOnceSession: (() -> Unit) = { }
+    private val cancelListenOnceSession: (() -> Unit) = { },
+    /**
+     * 1.4.13 (F-E6): fired on EVERY explicit stopSpeaking, so
+     * the coordinator can drop speaks still waiting on ITS
+     * own mutex (the VM epoch alone cannot reach them).
+     */
+    private val onStop: (() -> Unit)? = null
 ) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -399,10 +405,20 @@ class VoiceManager(
                 "tts", "SPEAK_ABORT", "Speech stopped: $reason"
             )
         }
+        // 1.4.13 (F-E6): tell the coordinator this stop
+        // happened, so ITS mutex waiters drop too (they cannot
+        // see the VM epoch bump above).
+        onStop?.invoke()
         // 1.4.12: playback lives in the main process
         // (SwaraTtsClient) — stop it there: socket closed,
         // track stopped, decoder flushed, generation bumped.
         SwaraTtsClient.stop()
+        // 1.4.13 (F-E4): the system-TTS fallback finally has a
+        // static stop handle — a barge-in cut during a fallback
+        // utterance stops it here instead of letting it play
+        // out (its old tts.stop() fired only on internal
+        // timeout). Deepgram listening is untouched by design.
+        SystemTtsFallbackSpeaker.stop()
     }
 
     /** B-M13: transient focus for one utterance; null if unavailable. */
@@ -468,18 +484,25 @@ class VoiceManager(
             )
             return null
         }
+        // 1.4.13 (F-H3): the 12 s timeout used to start at call
+        // entry and INCLUDE the up-to-8 s wait for playing TTS
+        // to finish (200 ms polls) — a tap mid-speak left only
+        // ~4 s of listen window. Now the wait runs FIRST (same
+        // 8 s bound, same polls), and the 12 s timeout starts
+        // only when the wait ENDS — the wait end is the event,
+        // so the user always gets the full 12 s to answer.
+        val waitStart = System.currentTimeMillis()
+        while (speakInProgress &&
+            System.currentTimeMillis() - waitStart < 8_000L
+        ) {
+            delay(200L)
+        }
         return withTimeoutOrNull(12_000L) {
             // 1.4.3: queue BEHIND any playing TTS instead of
             // cutting it — the old stopSpeaking() here was why
             // Jarvis "bolti hi nahi / band ho jati hai" when the
-            // user tapped mic mid-speech. Wait up to 8s for the
-            // utterance to finish, then listen without stopping.
-            val waitStart = System.currentTimeMillis()
-            while (speakInProgress &&
-                System.currentTimeMillis() - waitStart < 8_000L
-            ) {
-                delay(200L)
-            }
+            // user tapped mic mid-speech. The wait above already
+            // ran; this block only listens, without stopping.
             suspendCancellableCoroutine { cont ->
             mainHandler.post {
                 // Deepgram-only single shot (1.4.5): stop any wake

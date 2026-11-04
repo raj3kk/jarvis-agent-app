@@ -59,8 +59,16 @@ import okio.ByteString
  * - SSML shape (edge-tts hardcodes xml:lang='en-US'
  *   regardless of voice — replicated, not a mistake):
  *   <speak version='1.0' ... xml:lang='en-US'><voice
- *   name='hi-IN-SwaraNeural'><prosody pitch='+0Hz'
+ *   name='hi-IN-SwaraNeural'><prosody pitch='-12%'
  *   rate='+0%' volume='+0%'>ESCAPED_TEXT</prosody></voice>
+ *   1.4.13 (Part B2, deep voice): pitch -12% is the user's
+ *   standing "deep romantic female" spec — a moderate
+ *   deepening (~2 semitones down: 0.88x frequency), clearly
+ *   deeper without sounding slowed or unnatural, on the SAME
+ *   SSML message and socket (no extra round trip, no
+ *   first-audio regression). Rate stays +0% so fast reply
+ *   pacing is untouched; final depth verdict is the user's
+ *   ear on the phone.
  *   </speak>. SSML X-Timestamp carries the trailing Z (a
  *   Microsoft Edge bug replicated by edge-tts); speech.config
  *   uses the date string WITHOUT the trailing Z.
@@ -435,7 +443,7 @@ object SwaraTtsClient {
         // hardcoded 'en-US' by edge-tts regardless of voice.
         val ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
             "<voice name='$VOICE_NAME'>" +
-            "<prosody pitch='+0Hz' rate='+0%' volume='+0%'>$escapedChunk</prosody>" +
+            "<prosody pitch='-12%' rate='+0%' volume='+0%'>$escapedChunk</prosody>" +
             "</voice></speak>"
         return "X-RequestId:$reqId\r\n" +
             "Content-Type:application/ssml+xml\r\n" +

@@ -137,6 +137,17 @@ class JarvisForegroundService : Service() {
     /** B-M13: serialises speakWrapped so setSpeaking(true/false)
      * pairs never interleave across concurrent speaks. */
     private val speakMutex = kotlinx.coroutines.sync.Mutex()
+    /**
+     * 1.4.13 (F-E6): FGS-layer stop epoch, mirroring the VM
+     * queue epoch. Bumped on every VoiceManager stop (via the
+     * onStop wiring below); a speak still waiting on the FGS
+     * mutex at stop time sees the change after acquiring and
+     * drops instead of speaking after the stop. @Volatile
+     * because stops arrive from mic/UI threads while speaks
+     * run on the service scope.
+     */
+    @Volatile
+    private var fgsSpeakEpoch: Long = 0L
 
     /**
      * 1.4.0 echo gate: EVERY speak goes through here so the
@@ -166,7 +177,33 @@ class JarvisForegroundService : Service() {
             "tts", "SPK_START",
             "Speak started (origin=$origin, chars=${text.length})."
         )
+        // 1.4.13 (F-E6): capture the stop epoch BEFORE waiting
+        // — a stop during the wait must drop this speak.
+        val epochAtEntry = fgsSpeakEpoch
         val ok = speakMutex.withLock {
+            // 1.4.13 (F-L3): POST-mutex speak marker. SPK_START
+            // above is pre-mutex and therefore misleading as a
+            // speak duration (it includes queue waiting behind
+            // a running speak); this marker fires only once the
+            // mutex is actually held, so SPK_END total minus
+            // this wait = real playback time, and
+            // SWARA_CONNECT -> SWARA_FIRST_AUDIO stays readable
+            // against it. No Swara-path change, markers only.
+            JarvisStateRepository.addDiagnostic(
+                "tts", "SPK_ACQUIRED",
+                "Speak acquired the FGS mutex after " +
+                    "${System.currentTimeMillis() - startMs}ms queue wait (origin=$origin)."
+            )
+            // 1.4.13 (F-E6): stopped while waiting — drop
+            // instead of speaking after the stop. SPK_END below
+            // still logs (ok=false), so the drop is visible.
+            if (fgsSpeakEpoch != epochAtEntry) {
+                JarvisStateRepository.addDiagnostic(
+                    "tts", "SPK_DROPPED",
+                    "Speak dropped: stop arrived while waiting for the FGS speak mutex (origin=$origin)."
+                )
+                return@withLock false
+            }
             // 1.4.11: Test Voice stage arming — POST-mutex, so
             // a test queued behind a running speak arms only
             // when its OWN speak actually starts. SPK_START is
@@ -422,6 +459,25 @@ class JarvisForegroundService : Service() {
                 "Sherpa VAD init deferred until greeting speak " +
                     "finishes (native loads serialized at launch)."
             )
+            // 1.4.13 (F-H2): this defer previously had NO
+            // fallback timer (unlike deferVadUntilGreeting's
+            // 5 s fallback) — if the greeting completion never
+            // drained it, VAD stayed deferred forever. Now it
+            // gets the same 5 s fallback: the runnable retries
+            // startVadMonitor, which re-defers while greeting
+            // still speaks (re-arming the fallback) and starts
+            // VAD the moment greeting ends. drainPendingVad
+            // cancels the runnable on the normal path.
+            vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+            val runnable = Runnable {
+                vadFallbackRunnable = null
+                if (pendingVadStart) {
+                    pendingVadStart = false
+                    startVadMonitor()
+                }
+            }
+            vadFallbackRunnable = runnable
+            wakeLockHandler.postDelayed(runnable, 5_000L)
             return
         }
         serviceScope.launch {
@@ -575,7 +631,10 @@ class JarvisForegroundService : Service() {
                     micManager.cancelListenOnce()
                     refreshForegroundTypes()
                 }
-            }
+            },
+            // 1.4.13 (F-E6): every VM stop bumps the FGS epoch
+            // so FGS-mutex waiters drop (see speakWrapped).
+            onStop = { fgsSpeakEpoch++ }
         )
 
         // 1.4.0 always-on mic (service-owned, never Activity-owned):
@@ -776,6 +835,21 @@ class JarvisForegroundService : Service() {
                     "Persisted mic loop restoring (service onCreate) — VAD deferred until greeting."
                 )
                 if (micManager.start()) {
+                    // 1.4.13 (Part A 4c): restore MUST publish
+                    // the loop flag, like a tap start does. The
+                    // old restore never called
+                    // setMicLoopEnabled(true), so after every
+                    // service recreation the manager loop ran
+                    // (DEEPGRAM_OPEN, listening YES) while the
+                    // header, the Command-tab button and the
+                    // overlay pill all read loop=OFF / mode=off
+                    // — the 2026-11-04 report's self-contradiction
+                    // (listening YES + mode off). This publishes
+                    // what restore already did; it changes NO
+                    // policy (restore still runs only when the
+                    // user-enabled flag persisted).
+                    JarvisStateRepository.setMicLoopEnabled(true)
+                    JarvisStateRepository.setMicFatal(null)
                     if (greetingDone) {
                         startVadMonitor()
                     } else {
@@ -897,6 +971,29 @@ class JarvisForegroundService : Service() {
                         }
                     }
                     voiceManager.stopListeningInternal()
+                    // 1.4.13 (F-H1): SUSPENDED-FIRST. A tap on an
+                    // enabled-but-suspended loop must RESUME it
+                    // (as the overlay pill already does) — the
+                    // old path fell through to start(), which is
+                    // a no-op when already enabled, so the tap
+                    // did nothing and the stream stayed suspended
+                    // (the "tap karta hoon, phir bhi nahi sunta"
+                    // deaf trap). isLoopHealthy counts
+                    // suspended-with-live-pump as healthy (resume
+                    // paths exist), so it must NOT be consulted
+                    // before this check — it would mask the
+                    // suspended state from the tap.
+                    if (micManager.isEnabled() && micManager.isDeepgramSuspended()) {
+                        micManager.resumeDeepgram("command-tab-tap")
+                        setMicLoopPersisted(true)
+                        JarvisStateRepository.setMicFatal(null)
+                        JarvisStateRepository.setMicLoopEnabled(true)
+                        refreshForegroundTypes()
+                        // The when is the last statement of
+                        // onStartCommand, so returning its value
+                        // here is the branch's early exit.
+                        return START_STICKY
+                    }
                     // 1.4.5 (item 4): DEAD-WHILE-ENABLED revival.
                     // The old handler called micManager.start(),
                     // which is a no-op when already enabled — so a
