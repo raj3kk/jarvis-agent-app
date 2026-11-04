@@ -184,8 +184,12 @@ class JarvisForegroundService : Service() {
     private var liveCaptureRunning: Boolean = false
     private var liveCaptureThread: Thread? = null
     private var liveTrack: AudioTrack? = null
-    private val livePlaybackQueue: ArrayDeque<ByteArray> = ArrayDeque()
-    private val livePlaybackLock: Any = Any()
+    // 1.4.17: model-PCM queue. A LinkedBlockingQueue (NOT a
+    // synchronized list + wait/notify): Kotlin's Any hides
+    // wait/notify/notifyAll, so that shape does not compile —
+    // the queue's poll timeout is the wake mechanism instead.
+    private val livePlaybackQueue: java.util.concurrent.LinkedBlockingQueue<ByteArray> =
+        java.util.concurrent.LinkedBlockingQueue()
     @Volatile
     private var livePlaybackRunning: Boolean = false
     private var livePlaybackThread: Thread? = null
@@ -1597,10 +1601,7 @@ class JarvisForegroundService : Service() {
 
         override fun onAudioFrame(pcm: ByteArray) {
             if (!liveActive) return
-            synchronized(livePlaybackLock) {
-                livePlaybackQueue.addLast(pcm)
-                livePlaybackLock.notifyAll()
-            }
+            livePlaybackQueue.offer(pcm)
             if (!liveModelSpeaking) {
                 liveModelSpeaking = true
                 JarvisStateRepository.setPlaybackState(
@@ -1800,10 +1801,7 @@ class JarvisForegroundService : Service() {
         runCatching { liveCaptureThread?.join(1000L) }
         liveCaptureThread = null
         livePlaybackRunning = false
-        synchronized(livePlaybackLock) {
-            livePlaybackQueue.clear()
-            livePlaybackLock.notifyAll()
-        }
+        livePlaybackQueue.clear()
         val track = liveTrack
         liveTrack = null
         runCatching { track?.stop() }
@@ -1948,22 +1946,18 @@ class JarvisForegroundService : Service() {
         val track = liveTrack ?: return
         livePlaybackRunning = true
         val thread = Thread {
-            while (true) {
-                val chunk: ByteArray? = synchronized(livePlaybackLock) {
-                    while (livePlaybackQueue.isEmpty() && livePlaybackRunning) {
-                        runCatching { livePlaybackLock.wait() }
-                    }
-                    if (!livePlaybackRunning) null
-                    else livePlaybackQueue.removeFirst()
-                } ?: break
+            while (livePlaybackRunning) {
+                val chunk = runCatching {
+                    livePlaybackQueue.poll(
+                        100, java.util.concurrent.TimeUnit.MILLISECONDS
+                    )
+                }.getOrNull() ?: continue
                 runCatching { track.write(chunk, 0, chunk.size) }
-                synchronized(livePlaybackLock) {
-                    if (livePlaybackQueue.isEmpty() && liveModelSpeaking) {
-                        liveModelSpeaking = false
-                        JarvisStateRepository.setPlaybackState(
-                            com.jarvis.autonomous.data.PlaybackState.IDLE
-                        )
-                    }
+                if (livePlaybackQueue.isEmpty() && liveModelSpeaking) {
+                    liveModelSpeaking = false
+                    JarvisStateRepository.setPlaybackState(
+                        com.jarvis.autonomous.data.PlaybackState.IDLE
+                    )
                 }
             }
         }
@@ -1981,9 +1975,7 @@ class JarvisForegroundService : Service() {
      */
     private fun interruptLivePlayback() {
         val track = liveTrack ?: return
-        synchronized(livePlaybackLock) {
-            livePlaybackQueue.clear()
-        }
+        livePlaybackQueue.clear()
         runCatching { track.stop() }
         runCatching { track.flush() }
         runCatching { track.play() }
