@@ -1335,6 +1335,14 @@ class JarvisForegroundService : Service() {
                     "Foreground start failed even with specialUse-only (${it.javaClass.simpleName}) — service continues without foreground state."
                 )
             }
+            // 1.4.13 G8 note: total failure leaves NO foreground
+            // state, so record null (the docstring above already
+            // promises this) instead of retaining the previous
+            // set, which would suppress the next recovery's
+            // change-only FGS_TYPES_APPLIED marker. Nothing
+            // reads lastFgsTypes as truth beyond that marker's
+            // prev comparison, so this is marker-only.
+            lastFgsTypes = null
             return null
         }
     }
@@ -1495,6 +1503,27 @@ class JarvisForegroundService : Service() {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         }
         JarvisStateRepository.setForegroundRunning(false)
+        // 1.4.13 G8 MINOR: reset playback state on destroy.
+        // speakWrapped sets PREPARING before waiting on
+        // speakMutex; a speak cancelled while QUEUED (this
+        // serviceScope.cancel() above, in the destroy path)
+        // never reaches the in-mutex clears or the
+        // post-withLock clear, so PREPARING would otherwise
+        // survive in the singleton repository and MainActivity
+        // could show "BOLNE KI TAYYARI…" with no audio until
+        // the next speak. An outer try/finally around withLock
+        // was NOT used: withLock releases the mutex before an
+        // outer finally runs, so a queued successor could
+        // acquire and re-assert PREPARING in that window and
+        // the predecessor's finally would then clobber it to
+        // IDLE mid-speak, and a wait-cancel clear without the
+        // mutex could clobber the running holder's state.
+        // Destroy is terminal — no successor can re-assert
+        // after this point, and every speak finally clears to
+        // IDLE anyway — so this reset cannot clobber anyone.
+        JarvisStateRepository.setPlaybackState(
+            com.jarvis.autonomous.data.PlaybackState.IDLE
+        )
         super.onDestroy()
     }
 
