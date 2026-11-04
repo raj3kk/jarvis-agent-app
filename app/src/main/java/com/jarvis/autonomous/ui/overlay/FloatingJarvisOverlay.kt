@@ -175,15 +175,26 @@ class FloatingJarvisOverlay(
                 // 1.4.8: the pill now also follows the LIVE mic
                 // loop state (toggle + status need it) — agent
                 // state alone cannot tell "mic OFF" from "idle".
+                // WAVE-2 (§D-8) FIX for the 6-flow combine:
+                // combine(agentState, …, playbackState) with six
+                // typed flows does NOT resolve on this toolchain
+                // (CI compileDebugKotlin: the call collapsed to
+                // the vararg Array overload and inference failed
+                // for every lambda parameter). So the five
+                // original flows combine as before, and the
+                // playback flow joins via the 2-flow
+                // Flow.combine extension, which resolves
+                // cleanly. Same collected values, same HUD call.
                 combine(
                     JarvisStateRepository.agentState,
                     JarvisStateRepository.currentStepInfo,
                     JarvisStateRepository.micLoopEnabled,
                     JarvisStateRepository.micListening,
-                    JarvisStateRepository.micReconnecting,
-                    JarvisStateRepository.playbackState
-                ) { state, step, loopOn, listening, reconnecting, playback ->
-                    Quint(state, step, loopOn, listening, reconnecting, playback)
+                    JarvisStateRepository.micReconnecting
+                ) { state, step, loopOn, listening, reconnecting ->
+                    Quint(state, step, loopOn, listening, reconnecting)
+                }.combine(JarvisStateRepository.playbackState) { quint, playback ->
+                    quint.copy(playback = playback)
                 }.collect { (state, step, loopOn, listening, reconnecting, playback) ->
                     updateHudAppearance(state, step, loopOn, listening, reconnecting, playback)
                 }
