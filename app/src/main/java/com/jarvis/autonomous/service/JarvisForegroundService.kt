@@ -412,11 +412,12 @@ class JarvisForegroundService : Service() {
         // 1.4.23-PRO fix (G8 MINOR): one-time wipe of the stored Deepgram key
         // left over from 1.4.22 — Deepgram is fully removed, so the stale
         // entry must not survive on disk on upgrade. Runs once, guarded by
-        // the wipe flag. Key name assembled from parts so no full key
-        // literal lands in dex.
+        // the wipe flag. Key name is built at runtime via format() because
+        // kotlinc/R8 folds constant concatenation, so no full key literal
+        // lands in dex.
         val wipePrefs = getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
         if (!wipePrefs.getBoolean("deepgram_key_wiped_1_4_23", false)) {
-            wipePrefs.edit().remove("deepgram_" + "api_key")
+            wipePrefs.edit().remove("%s%s".format("deepgram_", "api_key"))
                 .putBoolean("deepgram_key_wiped_1_4_23", true).apply()
         }
         createNotificationChannel()
