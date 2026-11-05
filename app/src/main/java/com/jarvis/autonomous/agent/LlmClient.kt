@@ -42,7 +42,14 @@ data class AgentDecision(
     val browserSpeakSummary: Boolean = true,
     val browserShowPage: Boolean = false,
     val askUser: Boolean = false,
-    val isCompleted: Boolean = true,
+    // 1.4.23-PRO Item 2 (C3): isCompleted defaults FALSE. A step
+    // without an explicit completion flag must NOT end the task —
+    // the engine exits DONE only when the action's evidence check
+    // passes (JarvisAgentEngine verified-exit), never on the
+    // model's word alone. (parseDecisionJson keeps its own
+    // NONE-default below: a pure chat turn completes on its reply,
+    // which is the whole outcome — nothing to verify.)
+    val isCompleted: Boolean = false,
     // A-C6: explicit decision kind. "OK" = normal; "ERROR" = API /
     // config failure (never complete, never persist, never index);
     // "PARSE_ERROR" = truncated / multi-object JSON (retry once);
@@ -320,12 +327,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
 
             You are JARVIS, an autonomous Android OS agent with full Accessibility Service control, Multimodal Vision Sight, AND a warm, friendly human-like companion.
             You operate in a multi-step ReAct loop:
-            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE" and isCompleted=true.
+            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE".
             2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
             5. ${WebsiteBuildSpec.BUILDER_PROMPT_FRAGMENT}
-            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps with isCompleted=false then true. The new page MUST carry the SAME shared nav snippet as the other pages, and index.html's nav MUST link to it (validation fails on a page missing nav or linking a missing page). Set isCompleted=true on the last edit step and reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho".
+            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps. The new page MUST carry the SAME shared nav snippet as the other pages, and index.html's nav MUST link to it (validation fails on a page missing nav or linking a missing page). On the last edit step, reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho". NEVER set isCompleted=true on an edit step — Jarvis checks the written files and the preview itself and only then says the change is done.
             7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS STEPS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):

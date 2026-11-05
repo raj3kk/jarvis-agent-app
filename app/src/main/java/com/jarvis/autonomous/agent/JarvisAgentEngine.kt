@@ -14,6 +14,7 @@ import com.jarvis.autonomous.data.LearnedRoutine
 import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.MemoryIndex
+import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
@@ -32,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -126,6 +128,13 @@ class JarvisAgentEngine(
     // validation implementation.
     private var lastBuildValidation: ProjectStore.ProjectValidation? = null
     private var lastBuildProject: String = ""
+
+    // 1.4.23-PRO Item 2 (C1): outcome of the most recent
+    // executeBrowserLoad call — the OPEN_BROWSER branch reads it
+    // AFTER the load returns, so the ActionResult carries the
+    // load's own success instead of a stale value. Same side-effect
+    // pattern as lastBuildWritten above.
+    private var lastBrowserLoadOk: Boolean = false
 
     private fun isOnline(): Boolean {
         return try {
@@ -257,6 +266,24 @@ class JarvisAgentEngine(
     // gate implementation exists.
     internal enum class GateOutcome { ALLOW, BLOCK_STEP, PAUSE_TASK, ABORT_TASK }
 
+    // 1.4.23-PRO Item 2 (C1): the step return type. `ok` is the
+    // action's own success signal (the accessibility call's
+    // Boolean, the build validation, the write result) — the loop
+    // may only exit DONE when the evidence check on this result
+    // passes. `summary` is the human/log line (what the old
+    // String return carried). planExecuteDecision() still exposes
+    // the summary String so AgentPlanExecutor is untouched.
+    data class ActionResult(val ok: Boolean, val summary: String)
+
+    // 1.4.23-PRO Item 2 — evidence verdicts. VERIFIED = the
+    // action's evidence passed, the loop may exit DONE. FAILED =
+    // the action definitely did not achieve its outcome: stop the
+    // task with the fixed failure line (no routine, no memory
+    // index, no "Task Completed"). AMBIGUOUS = evidence could
+    // neither pass nor fail (adopted default, veto open): continue
+    // the loop / ask, never fail outright, never report success.
+    private enum class StepEvidence { VERIFIED, FAILED, AMBIGUOUS }
+
     private val PAY_SEND_KEYWORDS = listOf(
         "pay", "payment", "upi", "checkout", "place order", "confirm order",
         "buy now", "send", "bhej"
@@ -380,7 +407,7 @@ class JarvisAgentEngine(
     internal suspend fun planAsk(prompt: String): String? = askUserVoice(prompt)
     internal fun planIsOnline(): Boolean = isOnline()
     internal suspend fun planExecuteDecision(d: AgentDecision): String =
-        executeDecisionAction(d, JarvisAccessibilityService.instance)
+        executeDecisionAction(d, JarvisAccessibilityService.instance).summary
     internal fun planLastBuildWritten(): Boolean = lastBuildWritten
     internal fun planLastBuildValidation(): ProjectStore.ProjectValidation? = lastBuildValidation
     internal fun planLastBuildProject(): String = lastBuildProject
@@ -743,30 +770,34 @@ class JarvisAgentEngine(
                 return true
             }
             // Media: play/pause/next/previous
+            // 1.4.23-PRO Item 2 (C7): controlMediaPlayback's
+            // Boolean IS the result — a false return is a failed
+            // action, never a success claim. Speak the failure,
+            // not "kar diya", when the call reports false.
             if (lower.contains("music pause") || lower.contains("gaana roko") ||
                 lower.contains("song pause")
             ) {
-                acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { speak("Music pause kar diya.") }
+                val ok = acc.controlMediaPlayback("PLAY_PAUSE")
+                scope.launch { speak(if (ok) "Music pause kar diya." else "Music pause nahi ho paya.") }
                 return true
             }
             if (lower.contains("music play") || lower.contains("gaana chalao") ||
                 lower.contains("song play")
             ) {
-                acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { speak("Music play kar diya.") }
+                val ok = acc.controlMediaPlayback("PLAY_PAUSE")
+                scope.launch { speak(if (ok) "Music play kar diya." else "Music play nahi ho paya.") }
                 return true
             }
             if (lower.contains("next song") || lower.contains("agla gaana") ||
                 lower.contains("next gaana")
             ) {
-                acc.controlMediaPlayback("NEXT")
-                scope.launch { speak("Agla gaana chala diya.") }
+                val ok = acc.controlMediaPlayback("NEXT")
+                scope.launch { speak(if (ok) "Agla gaana chala diya." else "Agla gaana nahi chal paya.") }
                 return true
             }
             if (lower.contains("previous song") || lower.contains("pichla gaana")) {
-                acc.controlMediaPlayback("PREVIOUS")
-                scope.launch { speak("Pichla gaana chala diya.") }
+                val ok = acc.controlMediaPlayback("PREVIOUS")
+                scope.launch { speak(if (ok) "Pichla gaana chala diya." else "Pichla gaana nahi chal paya.") }
                 return true
             }
             // Direct call: "<name> ko call karo/lagao"
@@ -1476,20 +1507,35 @@ class JarvisAgentEngine(
                 // Speaking every step serialises seconds of TTS in front of
                 // the next action and is the biggest perceived slowdown.
                 // Final answers, questions and casual chat are always spoken.
+                // 1.4.23-PRO Item 2 (C2): a completion claim is HELD,
+                // not spoken — when the model says the task is done on
+                // a step that takes a real action, its reply is neither
+                // posted to chat nor spoken until the action's evidence
+                // has been checked at the exit below. Speaking it now
+                // would present the LLM's word as Jarvis's claim before
+                // any check. A question (askUser) and a pure chat turn
+                // (NONE) are not completion claims and speak as before.
                 var replyWasSpoken = false
+                var deferredCompletionReply: String? = null
+                val isCompletionClaim = decision.isCompleted &&
+                    decision.action != "NONE" && !decision.askUser
                 if (decision.reply.isNotBlank()) {
-                    JarvisStateRepository.addChatMessage("Jarvis", decision.reply)
-                    persistChat()
-                    val shouldSpeak = decision.isCompleted || decision.askUser ||
-                        decision.action == "NONE" || prefs.speakIntermediateSteps
-                    if (shouldSpeak) {
-                        JarvisStateRepository.setAgentState(
-                            AgentRunState.SPEAKING,
-                            "Speaking: ${decision.reply}"
-                        )
-                        replyWasSpoken = speak(decision.reply, alreadyPostedToChat = true)
+                    if (isCompletionClaim) {
+                        deferredCompletionReply = decision.reply
+                    } else {
+                        JarvisStateRepository.addChatMessage("Jarvis", decision.reply)
+                        persistChat()
+                        val shouldSpeak = decision.isCompleted || decision.askUser ||
+                            decision.action == "NONE" || prefs.speakIntermediateSteps
+                        if (shouldSpeak) {
+                            JarvisStateRepository.setAgentState(
+                                AgentRunState.SPEAKING,
+                                "Speaking: ${decision.reply}"
+                            )
+                            replyWasSpoken = speak(decision.reply, alreadyPostedToChat = true)
+                        }
                     }
-                } else if (decision.isCompleted || decision.askUser) {
+                } else if ((decision.isCompleted || decision.askUser) && !isCompletionClaim) {
                     // 1.4.3: a FINAL answer / question that arrives
                     // BLANK must not pass in silence (the old
                     // guard-only path). Speak a fixed fallback line
@@ -1579,13 +1625,18 @@ class JarvisAgentEngine(
                 }
 
                 // Execute the chosen action
+                // 1.4.23-PRO Item 2 (C1): the step result is kept for
+                // the evidence check at the exit below — a failed
+                // action (ok=false) must never be exited as DONE.
+                var stepResult: ActionResult? = null
                 if (decision.action != "NONE") {
                     JarvisStateRepository.setAgentState(
                         AgentRunState.EXECUTING_STEP,
                         "Step $step: Executing ${decision.action}..."
                     )
-                    val actionSummary = executeDecisionAction(decision, accService)
-                    previousActions.add("Step $step: $actionSummary")
+                    val actionResult = executeDecisionAction(decision, accService)
+                    stepResult = actionResult
+                    previousActions.add("Step $step: ${actionResult.summary}")
                     recordLoopStep(decision)
                     lastExecutedAction = decision.action
                 }
@@ -1628,55 +1679,132 @@ class JarvisAgentEngine(
                     return
                 }
 
-                // A-H2: exit the loop on isCompleted ONLY. NONE +
-                // not-completed stays in the loop and re-observes
-                // instead of silently completing.
+                // 1.4.23-PRO Item 2 — VERIFIED EXIT (replaces the
+                // old A-H2 "exit on isCompleted ONLY"). The model's
+                // isCompleted word alone NEVER ends the task now:
+                // the loop exits DONE only when the action's
+                // evidence check passes (C1). An unverified exit
+                // persists nothing and indexes nothing (C4).
                 if (decision.isCompleted) {
-                    // Builder §6: validated build summary, spoken
-                    // AND in chat — unless the LLM's own reply
-                    // already is that summary (same files + preview
-                    // line), in which case speaking it twice would
-                    // just be noise.
-                    if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE") &&
-                        lastBuildValidation?.ok == true && lastBuildWritten
-                    ) {
-                        val projectName = ProjectStore.sanitizeProjectName(
-                            decision.projectName.ifBlank { lastBuildProject.ifBlank { "jarvis-site" } }
+                    // C6 approval guard: a step awaiting approval
+                    // (the model's own askUser question, or a browser
+                    // approval the action just asked — "Ye link
+                    // kholun?") goes to WAITING_USER_REPLY, never
+                    // DONE. Task state is deliberately NOT cleared
+                    // here: the pending browser approval stays set
+                    // for the next user command to answer, and the
+                    // next loop start clears task state anyway.
+                    if (decision.askUser || pendingBrowserApprovalUrl != null) {
+                        JarvisStateRepository.setAgentState(
+                            AgentRunState.WAITING_USER_REPLY,
+                            "Waiting for your approval..."
                         )
-                        val builtFiles = ProjectStore.listProjects(context)
-                            .firstOrNull { it.name == projectName }?.files ?: emptyList()
-                        if (!decision.reply.contains("Browser me kholo")) {
-                            val summary = "Ho gaya bhai! Project '$projectName' ban gaya — " +
-                                "files: ${builtFiles.joinToString(", ")}. " +
-                                "Preview: ${ProjectStore.localhostUrl(projectName)} — " +
-                                "Projects tab me Preview dabao, ya Browser me kholo (full-screen, wahi preview)."
-                            JarvisStateRepository.addChatMessage("Jarvis", summary)
-                            speak(summary, alreadyPostedToChat = true)
+                        JarvisStateRepository.setCurrentGoal("")
+                        return
+                    }
+                    when (verifyStepEvidence(decision, stepResult, accService)) {
+                        StepEvidence.VERIFIED -> {
+                            // The held completion reply (C2) may be
+                            // spoken now — the evidence backs it.
+                            // Builder §6: validated build summary,
+                            // spoken AND in chat — unless the LLM's own
+                            // reply already is that summary (same files
+                            // + preview line), in which case speaking
+                            // it twice would just be noise.
+                            if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE") &&
+                                lastBuildValidation?.ok == true && lastBuildWritten
+                            ) {
+                                val projectName = ProjectStore.sanitizeProjectName(
+                                    decision.projectName.ifBlank { lastBuildProject.ifBlank { "jarvis-site" } }
+                                )
+                                val builtFiles = ProjectStore.listProjects(context)
+                                    .firstOrNull { it.name == projectName }?.files ?: emptyList()
+                                if (!decision.reply.contains("Browser me kholo")) {
+                                    deferredCompletionReply?.let {
+                                        JarvisStateRepository.addChatMessage("Jarvis", it)
+                                        persistChat()
+                                    }
+                                    val summary = "Ho gaya bhai! Project '$projectName' ban gaya — " +
+                                        "files: ${builtFiles.joinToString(", ")}. " +
+                                        "Preview: ${ProjectStore.localhostUrl(projectName)} — " +
+                                        "Projects tab me Preview dabao, ya Browser me kholo (full-screen, wahi preview)."
+                                    JarvisStateRepository.addChatMessage("Jarvis", summary)
+                                    speak(summary, alreadyPostedToChat = true)
+                                } else {
+                                    deferredCompletionReply?.let {
+                                        JarvisStateRepository.addChatMessage("Jarvis", it)
+                                        persistChat()
+                                        speak(it, alreadyPostedToChat = true)
+                                    }
+                                }
+                            } else {
+                                deferredCompletionReply?.let {
+                                    JarvisStateRepository.addChatMessage("Jarvis", it)
+                                    persistChat()
+                                    speak(it, alreadyPostedToChat = true)
+                                }
+                            }
+                            // Verified completion: persist the learned
+                            // routine + index this turn for memory-first
+                            // lookup, then the post-task prompt. The mic
+                            // loop (service-owned) is NEVER stopped here —
+                            // it keeps listening for the answer.
+                            val finishedRoutine = learnedRoutineStore.finishRoutine(initialGoal, verified = true)
+                            if (finishedRoutine != null) {
+                                maybeUploadLearnedPattern(finishedRoutine)
+                            }
+                            val lastReply = JarvisStateRepository.chatHistory.value
+                                .lastOrNull { it.sender == "Jarvis" }?.message ?: ""
+                            memoryIndex.indexTurn(
+                                System.currentTimeMillis().toString(),
+                                ChatSummary.summarize(initialGoal, lastReply)
+                            )
+                            JarvisStateRepository.setAgentState(
+                                AgentRunState.IDLE,
+                                "Task Completed — Ready for next command"
+                            )
+                            JarvisStateRepository.setCurrentGoal("")
+                            clearTaskScopedState()
+                            speak("Aur kya karna hai?")
+                            return
+                        }
+                        StepEvidence.FAILED -> {
+                            // C4: definite failure — fixed line, no
+                            // routine persisted, no memory indexed, no
+                            // "Task Completed" wording anywhere. The
+                            // detail goes to chat only, never spoken.
+                            val detail = "Step $step: ${stepResult?.summary ?: decision.action} — evidence fail"
+                            JarvisStateRepository.addChatMessage(
+                                "Jarvis",
+                                "Bhai, kaam poora nahi ho paya — dobara batao to phir se koshish karunga. ($detail)"
+                            )
+                            persistChat()
+                            JarvisStateRepository.addLog("Item 2: unverified exit blocked — $detail")
+                            JarvisStateRepository.setAgentState(
+                                AgentRunState.IDLE,
+                                "Task not verified — stopped"
+                            )
+                            JarvisStateRepository.setCurrentGoal("")
+                            clearTaskScopedState()
+                            speak(
+                                "Bhai, kaam poora nahi ho paya — dobara batao to phir se koshish karunga.",
+                                alreadyPostedToChat = true
+                            )
+                            return
+                        }
+                        StepEvidence.AMBIGUOUS -> {
+                            // Adopted default: ambiguous evidence —
+                            // continue the loop / ask, never fail
+                            // outright, never report success. The next
+                            // step re-observes, and the model sees the
+                            // note instead of a success claim.
+                            previousActions.add(
+                                "Step $step: verification unclear (${stepResult?.summary ?: decision.action}) — success mat bolo, dobara check karo."
+                            )
+                            step++
+                            continue
                         }
                     }
-                    // Verified completion: persist the learned
-                    // routine + index this turn for memory-first
-                    // lookup, then the post-task prompt. The mic
-                    // loop (service-owned) is NEVER stopped here —
-                    // it keeps listening for the answer.
-                    val finishedRoutine = learnedRoutineStore.finishRoutine(initialGoal, verified = true)
-                    if (finishedRoutine != null) {
-                        maybeUploadLearnedPattern(finishedRoutine)
-                    }
-                    val lastReply = JarvisStateRepository.chatHistory.value
-                        .lastOrNull { it.sender == "Jarvis" }?.message ?: ""
-                    memoryIndex.indexTurn(
-                        System.currentTimeMillis().toString(),
-                        ChatSummary.summarize(initialGoal, lastReply)
-                    )
-                    JarvisStateRepository.setAgentState(
-                        AgentRunState.IDLE,
-                        "Task Completed — Ready for next command"
-                    )
-                    JarvisStateRepository.setCurrentGoal("")
-                    clearTaskScopedState()
-                    speak("Aur kya karna hai?")
-                    return
                 }
 
                 // Wait for UI to settle before next observation
@@ -1689,13 +1817,99 @@ class JarvisAgentEngine(
                 AgentRunState.IDLE,
                 "Reached max steps ($maxSteps). Ready."
             )
-            speak("Bhai, maine $maxSteps steps complete kiye. Aur kya karna hai?")
+            // 1.4.23-PRO Item 2 (C5): the old line claimed the steps
+            // were "complete" for a task that did NOT complete. The
+            // replacement states the non-completion, no success claim.
+            speak("Bhai, kaam $maxSteps steps me poora nahi ho paya — dobara batao to phir se koshish karunga.")
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
             clearTaskScopedState()
             JarvisStateRepository.addLog("Agent Loop Error: ${e.message}")
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Error: ${e.localizedMessage}")
+        }
+    }
+
+    // ---- 1.4.23-PRO Item 2: verified-exit evidence table ----
+
+    /**
+     * Evidence table for the verified exit (C1/C4/C7). Decides
+     * whether a step the model marked isCompleted may end the
+     * task. Per-action evidence:
+     * - NONE: no action taken, the reply IS the outcome — vacuous.
+     * - CREATE_PROJECT / WRITE_PROJECT_FILE: validation OK +
+     *   written + preview GET 200 (verifyBuildEvidence).
+     * - UI actions: action ok=true PLUS one verification snapshot
+     *   taken AFTER the action ran (non-empty tree). ok=false is a
+     *   definite failure; a missing/empty snapshot is ambiguous.
+     * - FLASHLIGHT / VOLUME / MEDIA_CONTROL / WAIT / SAVE_MEMORY:
+     *   screen-invariant (same set the stuck detector uses) — the
+     *   action's own Boolean is the whole evidence, no snapshot.
+     * Ambiguous evidence continues the loop (adopted default),
+     * never fails outright, never reports success.
+     */
+    private suspend fun verifyStepEvidence(
+        decision: AgentDecision,
+        result: ActionResult?,
+        accService: JarvisAccessibilityService?
+    ): StepEvidence {
+        if (decision.action == "NONE") return StepEvidence.VERIFIED
+        if (result == null) return StepEvidence.AMBIGUOUS
+        if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE")) {
+            return verifyBuildEvidence()
+        }
+        // A definite failure is never a success, whatever the
+        // model claimed (C1). The media Boolean arrives here as
+        // ok (C7 loop side).
+        if (!result.ok) return StepEvidence.FAILED
+        if (decision.action in setOf("FLASHLIGHT", "VOLUME", "MEDIA_CONTROL", "WAIT", "SAVE_MEMORY")) {
+            return StepEvidence.VERIFIED
+        }
+        val verifySnapshot = accService?.captureScreenSnapshot()
+        return if (verifySnapshot != null && verifySnapshot.elements.isNotEmpty()) {
+            StepEvidence.VERIFIED
+        } else {
+            StepEvidence.AMBIGUOUS
+        }
+    }
+
+    /**
+     * Build evidence (mirrors AgentPlanExecutor.verifyBuildPreview):
+     * validation OK + written + preview GET 200. A validation /
+     * write failure is definite (FAILED); a preview server that
+     * will not start, or a GET that throws / times out, is
+     * AMBIGUOUS (the build may be fine — the check itself could
+     * not run); a running server answering non-200 does NOT serve
+     * the preview, so that is FAILED.
+     */
+    private suspend fun verifyBuildEvidence(): StepEvidence {
+        val v = lastBuildValidation
+        if (v == null || !v.ok || !lastBuildWritten) return StepEvidence.FAILED
+        val project = lastBuildProject.ifBlank { return StepEvidence.FAILED }
+        val (_, ready) = ProjectPreviewServer.ensureRunningReady(context)
+        if (!ready) return StepEvidence.AMBIGUOUS
+        return when (previewGetStatus(ProjectStore.localhostUrl(project))) {
+            200 -> StepEvidence.VERIFIED
+            -1 -> StepEvidence.AMBIGUOUS
+            else -> StepEvidence.FAILED
+        }
+    }
+
+    /** Plain GET status on IO (the loop runs on Main). -1 = the
+     *  request itself failed (no server / timeout) — callers treat
+     *  that as ambiguous, never as a served status. */
+    private suspend fun previewGetStatus(url: String): Int = withContext(Dispatchers.IO) {
+        try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.requestMethod = "GET"
+            conn.connect()
+            val code = conn.responseCode
+            conn.disconnect()
+            code
+        } catch (e: Exception) {
+            -1
         }
     }
 
@@ -1706,6 +1920,12 @@ class JarvisAgentEngine(
      * interrupted / failed loads speak exactly that.
      */
     private suspend fun executeBrowserLoad(url: String, speakSummary: Boolean): String {
+        // 1.4.23-PRO Item 2 (C1): every return path sets
+        // lastBrowserLoadOk, so the OPEN_BROWSER branch can carry
+        // the load's own outcome in its ActionResult. Defaults to
+        // false — a deferred / interrupted / failed load is never
+        // a success.
+        lastBrowserLoadOk = false
         // B-M3: never hijack the visible page. When the host says
         // the Browser tab is visible, queue/defer — never navigate
         // the shared WebView away silently. (Null host signal =
@@ -1726,6 +1946,7 @@ class JarvisAgentEngine(
         val result = JarvisBackgroundBrowser.browse(context, url)
         return when (result.status) {
             BrowserBrowseStatus.COMPLETED -> {
+                lastBrowserLoadOk = true
                 if (result.isNonHttps) {
                     speak(
                         "Note: ye page secure (https) nahi hai, " +
@@ -1757,24 +1978,27 @@ class JarvisAgentEngine(
         }
     }
 
+    // 1.4.23-PRO Item 2 (C1): returns ActionResult, not a bare
+    // String — the loop's evidence check needs the action's own
+    // success signal, not a log line it would have to re-parse.
     private suspend fun executeDecisionAction(
         d: AgentDecision,
         acc: JarvisAccessibilityService?
-    ): String {
+    ): ActionResult {
         return when (d.action) {
             "OPEN_APP" -> {
                 val ok = acc?.launchApp(d.appName) ?: false
                 // 1.4.7 (B): no 800ms blind wait — the next loop
                 // step re-snapshots and observes the cold start
                 // (the old comment said exactly this).
-                "OPEN_APP('${d.appName}') -> success=$ok"
+                ActionResult(ok, "OPEN_APP('${d.appName}') -> success=$ok")
             }
 
             "YOUTUBE_SEARCH" -> {
                 val ok = acc?.searchYouTube(d.text.ifBlank { d.appName }) ?: false
                 // 1.4.7 (B): no 900ms blind wait — the next loop
                 // step re-snapshots and observes the results.
-                "YOUTUBE_SEARCH('${d.text}') -> success=$ok"
+                ActionResult(ok, "YOUTUBE_SEARCH('${d.text}') -> success=$ok")
             }
 
             "YOUTUBE_PLAY" -> {
@@ -1786,7 +2010,7 @@ class JarvisAgentEngine(
                 // inside findFirstYouTubeVideo covers the load.
                 val video = acc?.findFirstYouTubeVideo()
                 val ok = if (video != null) acc.tapNode(video.id) else false
-                "YOUTUBE_PLAY('$query') -> opened=$opened, video='${video?.text?.ifBlank { video?.contentDesc }}', played=$ok"
+                ActionResult(opened && ok, "YOUTUBE_PLAY('$query') -> opened=$opened, video='${video?.text?.ifBlank { video?.contentDesc }}', played=$ok")
             }
 
             "WHATSAPP_SEND" -> {
@@ -1794,7 +2018,7 @@ class JarvisAgentEngine(
                 // explicitly said send; the voice routine path confirms
                 // first. A sent message cannot be unsent reliably.
                 val ok = acc?.sendWhatsAppMessage(d.contact, d.text) ?: false
-                "WHATSAPP_SEND(to='${d.contact}') -> success=$ok"
+                ActionResult(ok, "WHATSAPP_SEND(to='${d.contact}') -> success=$ok")
             }
 
             "OPEN_URL" -> {
@@ -1805,7 +2029,7 @@ class JarvisAgentEngine(
                 // accessibility openUrlOrDeepLink hardens this again.
                 val url = normalizeBrowserUrl(d.text)
                 if (url.isEmpty()) {
-                    "OPEN_URL blocked: sirf http/https allowed hai (upi:/tel:/sms:/intent: blocked)"
+                    ActionResult(false, "OPEN_URL blocked: sirf http/https allowed hai (upi:/tel:/sms:/intent: blocked)")
                 } else {
                     val kind = browserApprovalKind(url)
                     if (kind == null) {
@@ -1813,92 +2037,92 @@ class JarvisAgentEngine(
                         pendingBrowserOpenExternal = true
                         pendingBrowserShowPage = false
                         speak("Ye link kholun? $url")
-                        "OPEN_URL awaiting approval for '$url'"
+                        ActionResult(false, "OPEN_URL awaiting approval for '$url'")
                     } else {
                         val ok = acc?.openUrlOrDeepLink(url) ?: false
                         // 1.4.7 (B): no 800ms blind wait — the next
                         // loop step re-snapshots the opened page.
-                        "OPEN_URL('$url') -> success=$ok ($kind)"
+                        ActionResult(ok, "OPEN_URL('$url') -> success=$ok ($kind)")
                     }
                 }
             }
 
             "REPLY_NOTIFICATION" -> {
                 val ok = JarvisNotificationService.sendDirectReply(d.contact, d.text)
-                "REPLY_NOTIFICATION(to='${d.contact}', msg='${d.text}') -> success=$ok"
+                ActionResult(ok, "REPLY_NOTIFICATION(to='${d.contact}', msg='${d.text}') -> success=$ok")
             }
 
             "TAP_NODE" -> {
                 val ok = acc?.tapNode(d.nodeId) ?: false
-                "TAP_NODE(${d.nodeId}) -> success=$ok"
+                ActionResult(ok, "TAP_NODE(${d.nodeId}) -> success=$ok")
             }
 
             "TAP_XY" -> {
                 val ok = acc?.tapCoordinates(d.x, d.y) ?: false
-                "TAP_XY(${d.x}, ${d.y}) -> success=$ok"
+                ActionResult(ok, "TAP_XY(${d.x}, ${d.y}) -> success=$ok")
             }
 
             "LONG_PRESS_XY" -> {
                 val ok = acc?.longPressCoordinates(d.x, d.y) ?: false
-                "LONG_PRESS_XY(${d.x}, ${d.y}) -> success=$ok"
+                ActionResult(ok, "LONG_PRESS_XY(${d.x}, ${d.y}) -> success=$ok")
             }
 
             "TYPE_TEXT" -> {
                 val nodeId = if (d.nodeId > 0) d.nodeId else null
                 val ok = acc?.typeText(nodeId, d.text, d.pressEnter) ?: false
-                "TYPE_TEXT(node=$nodeId, text='${d.text}', enter=${d.pressEnter}) -> success=$ok"
+                ActionResult(ok, "TYPE_TEXT(node=$nodeId, text='${d.text}', enter=${d.pressEnter}) -> success=$ok")
             }
 
             "SCROLL" -> {
                 val ok = acc?.scrollScreen(d.direction) ?: false
-                "SCROLL(${d.direction}) -> success=$ok"
+                ActionResult(ok, "SCROLL(${d.direction}) -> success=$ok")
             }
 
             "NAVIGATE" -> {
                 val ok = acc?.performSystemNavigation(d.navTarget) ?: false
-                "NAVIGATE(${d.navTarget}) -> success=$ok"
+                ActionResult(ok, "NAVIGATE(${d.navTarget}) -> success=$ok")
             }
 
             "MEDIA_CONTROL" -> {
                 val ok = acc?.controlMediaPlayback(d.text) ?: false
-                "MEDIA_CONTROL(${d.text}) -> success=$ok"
+                ActionResult(ok, "MEDIA_CONTROL(${d.text}) -> success=$ok")
             }
 
             "COPY_CLIPBOARD" -> {
                 val ok = acc?.copyToClipboard(d.text) ?: false
-                "COPY_CLIPBOARD('${d.text.take(25)}') -> success=$ok"
+                ActionResult(ok, "COPY_CLIPBOARD('${d.text.take(25)}') -> success=$ok")
             }
 
             "WAIT" -> {
                 delay(1000L)
-                "WAIT(1000ms)"
+                ActionResult(true, "WAIT(1000ms)")
             }
 
             "FLASHLIGHT" -> {
                 val ok = acc?.toggleFlashlight(d.enableFlag) ?: false
-                "FLASHLIGHT(${d.enableFlag}) -> success=$ok"
+                ActionResult(ok, "FLASHLIGHT(${d.enableFlag}) -> success=$ok")
             }
 
             "VOLUME" -> {
                 val ok = acc?.setMediaVolumePercent(d.volumePercent) ?: false
-                "VOLUME(${d.volumePercent}%) -> success=$ok"
+                ActionResult(ok, "VOLUME(${d.volumePercent}%) -> success=$ok")
             }
 
             "CALL" -> {
                 // C-B13: the summary carries the distinct reason —
                 // permission-denied is never reported as not-found.
                 val (ok, reason) = acc?.makePhoneCallWithReason(d.contact) ?: (false to "dial_failed")
-                "CALL('${d.contact}') -> success=$ok reason=$reason"
+                ActionResult(ok, "CALL('${d.contact}') -> success=$ok reason=$reason")
             }
 
             "SET_ALARM" -> {
                 val ok = acc?.setSystemAlarm(d.alarmHour, d.alarmMinute, d.text.ifBlank { "Jarvis Alarm" }) ?: false
-                "SET_ALARM(${d.alarmHour}:${d.alarmMinute}) -> success=$ok"
+                ActionResult(ok, "SET_ALARM(${d.alarmHour}:${d.alarmMinute}) -> success=$ok")
             }
 
             "SAVE_MEMORY" -> {
                 prefs.addMemory(d.memoryNote)
-                "SAVE_MEMORY('${d.memoryNote}')"
+                ActionResult(true, "SAVE_MEMORY('${d.memoryNote}')")
             }
 
             "CREATE_PROJECT" -> {
@@ -1911,9 +2135,12 @@ class JarvisAgentEngine(
                 val files = ProjectStore.listProjects(context)
                     .firstOrNull { it.name == ProjectStore.sanitizeProjectName(name) }
                     ?.files ?: emptyList()
-                "CREATE_PROJECT('$name') -> files=[${files.joinToString(", ")}], " +
-                    "validation=${if (v.ok) "OK" else "FAILED missing=${v.missingFiles} empty=${v.emptyFiles}"}, " +
-                    "preview at ${ProjectStore.localhostUrl(name)}"
+                ActionResult(
+                    v.ok,
+                    "CREATE_PROJECT('$name') -> files=[${files.joinToString(", ")}], " +
+                        "validation=${if (v.ok) "OK" else "FAILED missing=${v.missingFiles} empty=${v.emptyFiles}"}, " +
+                        "preview at ${ProjectStore.localhostUrl(name)}"
+                )
             }
 
             "WRITE_PROJECT_FILE" -> {
@@ -1933,7 +2160,7 @@ class JarvisAgentEngine(
                 if (name.isBlank()) {
                     lastBuildValidation = null
                     lastBuildWritten = false
-                    "WRITE_PROJECT_FILE blocked: project naam nahi mila (written=false)"
+                    ActionResult(false, "WRITE_PROJECT_FILE blocked: project naam nahi mila (written=false)")
                 } else {
                     val file = d.fileName.ifBlank { "index.html" }
                     val written = ProjectStore.writeFile(context, name, file, d.fileContent)
@@ -1941,9 +2168,12 @@ class JarvisAgentEngine(
                     lastBuildValidation = v
                     lastBuildWritten = written
                     lastBuildProject = name
-                    "WRITE_PROJECT_FILE('$name/$file', written=$written, ${d.fileContent.length} chars) -> " +
-                        "validation=${if (v.ok) "OK" else "FAILED missing=${v.missingFiles} empty=${v.emptyFiles}"}, " +
-                        "preview at ${ProjectStore.localhostUrl(name)}"
+                    ActionResult(
+                        written && v.ok,
+                        "WRITE_PROJECT_FILE('$name/$file', written=$written, ${d.fileContent.length} chars) -> " +
+                            "validation=${if (v.ok) "OK" else "FAILED missing=${v.missingFiles} empty=${v.emptyFiles}"}, " +
+                            "preview at ${ProjectStore.localhostUrl(name)}"
+                    )
                 }
             }
 
@@ -1962,32 +2192,41 @@ class JarvisAgentEngine(
                 val raw = d.browserUrl
                 val url = browserTargetForInput(raw)
                 if (url.isEmpty()) {
-                    "OPEN_BROWSER blocked: empty/blocked URL"
+                    ActionResult(false, "OPEN_BROWSER blocked: empty/blocked URL")
                 } else {
                     val kind = browserApprovalKind(url)
                     if (kind == null) {
                         pendingBrowserApprovalUrl = url
                         pendingBrowserShowPage = d.browserShowPage
                         speak("Ye page kholun? $url")
-                        "OPEN_BROWSER awaiting approval for '$url'"
+                        ActionResult(false, "OPEN_BROWSER awaiting approval for '$url'")
                     } else if (d.browserShowPage) {
                         if (onShowBrowserPage != null) {
                             onShowBrowserPage?.invoke(url)
-                            "OPEN_BROWSER foreground show '$url' ($kind)"
+                            ActionResult(true, "OPEN_BROWSER foreground show '$url' ($kind)")
                         } else {
                             // No foreground host (app UI not alive):
                             // fall back to the background answer
                             // rather than dropping the request.
-                            executeBrowserLoad(url, speakSummary = d.browserSpeakSummary) +
-                                " (foreground host unavailable, background answer diya)"
+                            // NOTE: the load runs FIRST — lastBrowserLoadOk
+                            // is only meaningful after it returns.
+                            val loadSummary = executeBrowserLoad(url, speakSummary = d.browserSpeakSummary)
+                            ActionResult(
+                                lastBrowserLoadOk,
+                                loadSummary + " (foreground host unavailable, background answer diya)"
+                            )
                         }
                     } else {
-                        executeBrowserLoad(url, speakSummary = d.browserSpeakSummary) + " ($kind)"
+                        val loadSummary = executeBrowserLoad(url, speakSummary = d.browserSpeakSummary)
+                        ActionResult(
+                            lastBrowserLoadOk,
+                            loadSummary + " ($kind)"
+                        )
                     }
                 }
             }
 
-            else -> "UNKNOWN_ACTION(${d.action})"
+            else -> ActionResult(false, "UNKNOWN_ACTION(${d.action})")
         }
     }
 }
