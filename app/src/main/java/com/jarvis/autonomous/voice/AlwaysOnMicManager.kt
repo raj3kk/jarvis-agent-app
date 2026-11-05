@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import androidx.core.content.ContextCompat
+import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.SpeechSegment
@@ -609,6 +610,12 @@ class AlwaysOnMicManager(
         reconnectAttempt = 0
         quarantinedWhileSpeaking.clear()
         turnDetector.reset()
+        // 1.4.19: clear any stale user direction on start —
+        // a loop-OFF wake that left the flag set must not let
+        // the next loop's first unrelated turn consume it.
+        // Safe by ordering: tap/retry paths mark AFTER start()
+        // returns; restore never marks.
+        userDirectedTurnPending = false
         resetTurnAssembly()
         resetLanguageToPrimary()
         deepgramFallbackTried = false
@@ -1495,6 +1502,34 @@ class AlwaysOnMicManager(
                 val nowMs = System.currentTimeMillis()
                 for (item in held) {
                     if (echoFingerprintStack.any { isEchoOfSpoken(item.text, it) }) continue
+                    // 1.4.19: same shared wake matcher as the
+                    // live path, applied to every held item
+                    // (flush items are already-finalized
+                    // history, so the live finals-only rule
+                    // does not apply here). Bare wake sets the
+                    // directed flag + LISTENING visual and drops
+                    // the item (no spoken filler, no feed);
+                    // wake + remainder feeds the remainder as
+                    // the turn (flag persists until that turn
+                    // completes, as in the live path).
+                    val wakeMatched = TurnDetector.matchWakeTrigger(item.text)
+                    if (wakeMatched != null) {
+                        val (_, wakeRemainder) = wakeMatched
+                        JarvisStateRepository.addDiagnostic(
+                            "stt", "LOOP_WAKE_MATCHED",
+                            "Loop wake trigger matched in speak-quarantine flush (content-free; trigger not logged)."
+                        )
+                        userDirectedTurnPending = true
+                        if (wakeRemainder.isEmpty()) {
+                            JarvisStateRepository.setAgentState(
+                                AgentRunState.LISTENING,
+                                "Listening... बोलो भाई क्या करना है?"
+                            )
+                            continue
+                        }
+                        feedAssembled(wakeRemainder, item.isFinal, nowMs)
+                        continue
+                    }
                     // 1.4.7 (A1): held items go through the same
                     // segment assembler as live transcripts, so
                     // the post-speech turn continues from them
@@ -1643,6 +1678,54 @@ class AlwaysOnMicManager(
             quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
             return
         }
+        // 1.4.19 (LOOP WAKE): loop-ON wake matching, AFTER the
+        // speaking-quarantine branch above and BEFORE the media
+        // gate below — gate order is deliberately unchanged
+        // (media/echo gates are NOT reordered). Gated to finals
+        // only + turn-inactive (TurnDetector current text
+        // blank) + not livePaused (already early-returned at
+        // the top of this function). Echo exclusion FIRST: if
+        // the raw transcript is an echo of any stacked spoken
+        // text, matching is SKIPPED entirely and the transcript
+        // falls through to the existing echo drop below — a
+        // wake word inside Jarvis's own TTS output never
+        // self-triggers. Matched WITH remainder: the directed
+        // flag is set, the local text is replaced by the
+        // remainder, and execution falls through — the media
+        // gate below sees the bypass and consumes the flag at
+        // turn start, and the echo gate still applies to the
+        // remainder. Matched BARE: the directed flag is set +
+        // the same LISTENING visual as VoiceManager's mic tap,
+        // nothing is fed, return — NO spoken filler (no
+        // greeting speak, no "main sun raha hoon" line), visual
+        // only. The flag persists until the next turn
+        // start/completion or loop stop — identical to existing
+        // loop-enable-tap semantics; NO timer is introduced.
+        // The loop-OFF wake session in VoiceManager is
+        // UNCHANGED by this block (coordinator Reading A).
+        var effectiveText = text
+        if (isFinal && turnDetector.currentText().isBlank()) {
+            val rawIsEcho = echoFingerprintStack.any { isEchoOfSpoken(text, it) }
+            if (!rawIsEcho) {
+                val wakeMatched = TurnDetector.matchWakeTrigger(text)
+                if (wakeMatched != null) {
+                    val (_, wakeRemainder) = wakeMatched
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "LOOP_WAKE_MATCHED",
+                        "Loop wake trigger matched (content-free; trigger/remainder not logged)."
+                    )
+                    userDirectedTurnPending = true
+                    if (wakeRemainder.isEmpty()) {
+                        JarvisStateRepository.setAgentState(
+                            AgentRunState.LISTENING,
+                            "Listening... बोलो भाई क्या करना है?"
+                        )
+                        return
+                    }
+                    effectiveText = wakeRemainder
+                }
+            }
+        }
         // 1.4.18 (SCREEN/MEDIA GATING): turn-START gate only,
         // here in handleTranscript (main thread, where turn
         // state lives) — never in the pump thread. When no turn
@@ -1695,7 +1778,7 @@ class AlwaysOnMicManager(
         // retires the stack, as does any non-echo FINAL even
         // without a boundary. No timer or grace window is added.
         val echoMatch = echoFingerprintStack.any { entry ->
-            isEchoOfSpoken(text, entry)
+            isEchoOfSpoken(effectiveText, entry)
         }
         if (echoMatch) {
             if (isFinal) {
@@ -1742,7 +1825,10 @@ class AlwaysOnMicManager(
         // (currentSessionId is never incremented), so a later
         // segment's interim replaced the buffer and the first
         // segment's words were lost.
-        feedAssembled(text, isFinal, System.currentTimeMillis())
+        // 1.4.19: feed the wake remainder (or the original text
+        // when no wake matched) — effectiveText is the remainder
+        // after a loop-wake match, else identical to text.
+        feedAssembled(effectiveText, isFinal, System.currentTimeMillis())
     }
 
     /**

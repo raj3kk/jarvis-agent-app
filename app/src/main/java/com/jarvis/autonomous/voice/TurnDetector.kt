@@ -295,6 +295,46 @@ class TurnDetector {
             return false
         }
 
+        /**
+         * 1.4.19: wake-trigger matcher, MOVED here verbatim from
+         * VoiceManager.matchWakeTrigger (ZERO behavior change —
+         * same triggers, same object-marker veto, same
+         * normalizeTokens) so the loop-ON path in
+         * AlwaysOnMicManager can share the ONE matcher with the
+         * loop-OFF wake session in VoiceManager (which now
+         * delegates here). Returns (trigger, remainder) when
+         * [text] is addressed to Jarvis, else null. Valid
+         * forms, longest trigger first: "hey jarvis" /
+         * "ok jarvis" / "sun jarvis" / "jarvis", either bare
+         * or at the START followed by a command. A trigger in
+         * the middle never matches, and a postposition right
+         * after the trigger ("jarvis KO mat bulao" — Jarvis as
+         * grammatical object, not addressee) never matches
+         * either. "ok jarvis" / "sun jarvis" are KEPT: removing
+         * them would be an unauthorized removal.
+         */
+        fun matchWakeTrigger(text: String): Pair<String, String>? {
+            val tokens = normalizeTokens(text)
+            if (tokens.isEmpty()) return null
+            val joined = tokens.joinToString(" ")
+            val triggers = listOf("hey jarvis", "ok jarvis", "sun jarvis", "jarvis")
+            for (trigger in triggers) {
+                if (joined == trigger) return trigger to ""
+                if (joined.startsWith("$trigger ")) {
+                    val remainderTokens = tokens.drop(trigger.split(" ").size)
+                    // Talking ABOUT Jarvis, not TO Jarvis.
+                    if (remainderTokens.firstOrNull() in WAKE_OBJECT_MARKERS) return null
+                    return trigger to remainderTokens.joinToString(" ")
+                }
+            }
+            return null
+        }
+
+        /** Postpositions marking Jarvis as object, not addressee. */
+        private val WAKE_OBJECT_MARKERS: Set<String> = setOf(
+            "ko", "ka", "ki", "ke", "se", "mein", "me", "par", "tak"
+        )
+
         /** Lowercase, punctuation -> space, fillers dropped.
          *  1.4.3: Devanagari tokens are transliterated to Latin
          *  BEFORE keyword matching (see DEVANAGARI_KEYWORDS) — a

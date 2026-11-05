@@ -338,6 +338,10 @@ class VoiceManager(
             "Swara unavailable — nothing spoken " +
                 "(latch not tripped: fallback runs only when Swara is latched or OFF)."
         )
+        // 1.4.19: restart wake on EVERY speak exit, not only on
+        // ok — a failed speak used to strand wake (no restart,
+        // no listening) until the next successful speak.
+        restartWakeIfNeeded()
         return false
     }
 
@@ -352,7 +356,13 @@ class VoiceManager(
             speakInProgress = false
             abandonFocus(focus)
         }
-        if (ok) restartWakeIfNeeded()
+        // 1.4.19: restart wake on EVERY fallback exit, not only
+        // on ok — same failed-speak stranding fix as speakLocked.
+        // Every speakLocked exit path restarts: ok path above,
+        // fallback paths here (unconditional), failed-Swara path
+        // above. Wake is never (re)started mid-speak: this runs
+        // only after playback/failure has fully exited.
+        restartWakeIfNeeded()
         return ok
     }
 
@@ -620,31 +630,13 @@ class VoiceManager(
     }
 
     /**
-     * A-M4: returns (trigger, remainder) when [text] is addressed
-     * to Jarvis, else null. Normalised first (punctuation stripped,
-     * case folded). Valid forms, longest trigger first:
-     * "hey jarvis" / "ok jarvis" / "sun jarvis" / "jarvis", either
-     * bare or at the START followed by a command. A trigger in the
-     * middle ("aaj jarvis ko mat bulao") never matches, and a
-     * postposition right after the trigger ("jarvis KO mat bulao"
-     * — Jarvis as grammatical object, not addressee) never
-     * matches either.
+     * 1.4.19: delegate to the ONE shared matcher in
+     * TurnDetector (moved verbatim — ZERO behavior change to
+     * the loop-OFF path). See TurnDetector.matchWakeTrigger
+     * for the trigger / object-marker rules.
      */
     private fun matchWakeTrigger(text: String): Pair<String, String>? {
-        val tokens = TurnDetector.normalizeTokens(text)
-        if (tokens.isEmpty()) return null
-        val joined = tokens.joinToString(" ")
-        val triggers = listOf("hey jarvis", "ok jarvis", "sun jarvis", "jarvis")
-        for (trigger in triggers) {
-            if (joined == trigger) return trigger to ""
-            if (joined.startsWith("$trigger ")) {
-                val remainderTokens = tokens.drop(trigger.split(" ").size)
-                // Talking ABOUT Jarvis, not TO Jarvis.
-                if (remainderTokens.firstOrNull() in WAKE_OBJECT_MARKERS) return null
-                return trigger to remainderTokens.joinToString(" ")
-            }
-        }
-        return null
+        return TurnDetector.matchWakeTrigger(text)
     }
 
     fun stopListeningInternal() {
@@ -672,10 +664,6 @@ class VoiceManager(
     }
 
     companion object {
-        /** Postpositions marking Jarvis as object, not addressee. */
-        private val WAKE_OBJECT_MARKERS: Set<String> = setOf(
-            "ko", "ka", "ki", "ke", "se", "mein", "me", "par", "tak"
-        )
         /** 1.4.10 (Step 3): bounded-queue capacity (waiters) +
          * acquisition timeout. 5 absorbs greeting + reply +
          * prompt bursts; 120 s covers a multi-chunk reply
