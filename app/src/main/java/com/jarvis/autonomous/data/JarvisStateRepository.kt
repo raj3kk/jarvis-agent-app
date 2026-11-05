@@ -274,6 +274,7 @@ object JarvisStateRepository {
         out = out.replace(Regex("JARVIS-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}"), "[licence-redacted]")
         out = out.replace(Regex("(?i)(api[_-]?key|deepgram[_-]?key|password|passwd|secret|auth[_-]?token|github[_-]?pat|supabase[_-]?pat|supabase[_-]?project[_-]?ref|vercel[_-]?token)\\s*[:=]\\s*[^\\s,;]+"), "$1=[redacted]")
         out = out.replace(Regex("ghp_[A-Za-z0-9]{16,}"), "[github-pat-redacted]")
+        out = out.replace(Regex("github_pat_[A-Za-z0-9_]{16,}"), "[github-pat-redacted]")
         out = out.replace(Regex("sbp_[A-Za-z0-9]{16,}"), "[supabase-pat-redacted]")
         out = out.replace(Regex("(?i)(/(?:token|key|auth)/)[^/\\s]+"), "$1[redacted]")
         return out.take(500)

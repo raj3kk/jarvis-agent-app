@@ -1056,7 +1056,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         if (stepsArr.length() == 0) throw PlanParseException("Plan me koi step nahi hai")
         if (stepsArr.length() > 8) throw PlanParseException("Plan me 8 se zyada steps hain (${stepsArr.length()}) — chhota plan banao")
         val allowedKinds = setOf(
-            "PLAN", "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK"
+            "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK"
         )
         val steps = mutableListOf<PlanStepDraft>()
         for (i in 0 until stepsArr.length()) {

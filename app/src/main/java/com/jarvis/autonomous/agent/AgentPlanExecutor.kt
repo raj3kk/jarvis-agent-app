@@ -57,6 +57,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         data class Failed(val reason: String) : StepOutcome
         /** Question already asked (missing info) or gate paused — park as BLOCKED. */
         data class Blocked(val reason: String) : StepOutcome
+        /** Decline (incl. gate ABORT_TASK) — abortPlan already ran
+         *  inside the step; runPlan must just stop, never park/re-ask. */
+        data object Aborted : StepOutcome
     }
 
     private sealed interface AskResult {
@@ -357,6 +360,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         parkBlocked(current, step, outcome.reason)
                         return
                     }
+                    is StepOutcome.Aborted -> {
+                        // Decline: abortPlan already ran inside the
+                        // step (plan terminal, user told). Just stop.
+                        return
+                    }
                 }
             }
             finishPlan(current, allDone = true)
@@ -554,7 +562,6 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun executeStep(step: PlanStep, plan: AgentPlan): StepOutcome {
         return when (step.kind) {
-            "PLAN" -> StepOutcome.Done("plan parsed: ${plan.steps.size} steps")
             "BUILD" -> executeBuild(step, plan)
             "GITHUB_PUSH" -> executeGithubPush(step, plan)
             "SUPABASE_TABLES" -> executeSupabaseTables(step, plan)
@@ -568,15 +575,27 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun executeBuild(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
-        var projectName = parseDetailValue(step.detail, "project")
+        // MINOR-2: "?" is the planner's unknown-name sentinel, not a
+        // name — treat it as missing so the user is asked.
+        var projectName = parseDetailValue(step.detail, "project")?.takeUnless { it == "?" }
         if (projectName.isNullOrBlank()) projectName = engine.planLastBuildProject().takeIf { it.isNotBlank() }
         if (projectName.isNullOrBlank()) {
             when (val ans = askStepQuestion("Website kis naam se banau? Project ka naam bolo.")) {
                 is AskResult.Answered -> {
+                    // A "?" answer is still "missing" — park so the
+                    // resume path re-asks, never invent a default.
+                    if (ans.answer.trim() == "?") {
+                        return StepOutcome.Blocked("Project naam nahi mila — '?' naam nahi ho sakta.")
+                    }
                     projectName = ProjectStore.sanitizeProjectName(ans.answer)
                     engine.planRecordClarification("Q: project naam? -> A: $projectName")
                 }
-                is AskResult.Declined -> return StepOutcome.Blocked("User ne project naam dene se mana kar diya.")
+                // MINOR-1: decline aborts the whole plan (§3g), it
+                // must not park as BLOCKED and be re-asked on resume.
+                is AskResult.Declined -> {
+                    abortPlan(plan, step, "User ne project naam dene se mana kar diya.")
+                    return StepOutcome.Aborted
+                }
                 is AskResult.NoReply -> return StepOutcome.Blocked("Project naam nahi mila — user se poocha, jawab nahi aaya.")
             }
         }
@@ -591,10 +610,16 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             )) {
                 is AskResult.Answered -> {
                     if (!engine.planIsYes(ans.answer)) {
-                        return StepOutcome.Blocked("User ne existing project overwrite karne se mana kar diya.")
+                        // MINOR-1: a "no" to the overwrite question is
+                        // a decline — abort the plan, do not park it.
+                        abortPlan(plan, step, "User ne existing project overwrite karne se mana kar diya.")
+                        return StepOutcome.Aborted
                     }
                 }
-                is AskResult.Declined -> return StepOutcome.Blocked("User ne existing project overwrite karne se mana kar diya.")
+                is AskResult.Declined -> {
+                    abortPlan(plan, step, "User ne existing project overwrite karne se mana kar diya.")
+                    return StepOutcome.Aborted
+                }
                 is AskResult.NoReply -> return StepOutcome.Blocked("Existing project overwrite ka sawal poocha, jawab nahi aaya.")
             }
         }
@@ -647,7 +672,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 )) {
                     is AskResult.Answered -> {
                         if (engine.planIsDecline(ans.answer)) {
-                            return StepOutcome.Blocked("User ne build ke sawal par mana kar diya.")
+                            // MINOR-1: decline aborts the plan (§3g).
+                            abortPlan(plan, step, "User ne build ke sawal par mana kar diya.")
+                            return StepOutcome.Aborted
                         }
                         engine.planRecordClarification("Q: ${decision.reply} -> A: ${ans.answer}")
                         goal = "$goal (User clarified: ${ans.answer})"
@@ -655,7 +682,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         stepNo++
                         continue
                     }
-                    is AskResult.Declined -> return StepOutcome.Blocked("User ne build ke sawal par mana kar diya.")
+                    is AskResult.Declined -> {
+                        abortPlan(plan, step, "User ne build ke sawal par mana kar diya.")
+                        return StepOutcome.Aborted
+                    }
                     is AskResult.NoReply -> return StepOutcome.Blocked(
                         "Build ke sawal ka jawab nahi aaya: ${decision.reply.take(120)}"
                     )
@@ -664,6 +694,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             if (decision.action != "NONE") {
                 val (gateOutcome, gateReason) = engine.planCheckGate(decision)
                 if (gateOutcome != JarvisAgentEngine.GateOutcome.ALLOW) {
+                    if (gateOutcome == JarvisAgentEngine.GateOutcome.ABORT_TASK) {
+                        // MINOR-1: a gate ABORT_TASK is the user
+                        // declining the gate confirmation — abort the
+                        // plan, never Failed (which would re-ask
+                        // "dobara koshish karun?").
+                        abortPlan(plan, step, "Build step gate ne roka: $gateReason")
+                        return StepOutcome.Aborted
+                    }
                     return StepOutcome.Failed("Build step gate ne roka: $gateReason")
                 }
                 engine.planExecuteDecision(decision)
@@ -733,20 +771,31 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 "GitHub PAT saved nahi hai — AI Brain > Agent Mode — Connected accounts me GitHub PAT daalo (fine-grained, Contents read+write)."
             )
         }
-        var repo = parseDetailValue(step.detail, "repo")
+        // MINOR-2: "repo=?" is the planner's unknown-name sentinel,
+        // not a name — fall through to the ask below.
+        var repo = parseDetailValue(step.detail, "repo")?.takeUnless { it == "?" }
         if (repo.isNullOrBlank()) repo = resolveRepoFromClarifications(plan)
         if (repo.isNullOrBlank()) {
             when (val ans = askStepQuestion("GitHub repo ka naam kya rakhu? (naya repo banega to wahi naam use hoga)")) {
                 is AskResult.Answered -> {
+                    if (ans.answer.trim() == "?") {
+                        return StepOutcome.Blocked("Repo naam nahi mila — '?' naam nahi ho sakta.")
+                    }
                     repo = sanitizeRepoName(ans.answer)
                     engine.planRecordClarification("Q: GitHub repo naam? -> A: $repo")
                 }
-                is AskResult.Declined -> return StepOutcome.Blocked("User ne repo naam dene se mana kar diya.")
+                // MINOR-1: decline aborts the whole plan (§3g).
+                is AskResult.Declined -> {
+                    abortPlan(plan, step, "User ne repo naam dene se mana kar diya.")
+                    return StepOutcome.Aborted
+                }
                 is AskResult.NoReply -> return StepOutcome.Blocked("Repo naam nahi mila — user se poocha, jawab nahi aaya.")
             }
         }
         repo = sanitizeRepoName(repo!!)
-        if (repo.isBlank()) return StepOutcome.Failed("Repo naam khaali hai.")
+        // MINOR-2: blank-after-sanitize is still "missing" — park so
+        // the resume path re-asks, never Failed("Repo naam khaali hai.").
+        if (repo.isBlank()) return StepOutcome.Blocked("Repo naam khaali hai — naam batao to phir se koshish karunga.")
         val projectName = resolveProjectName(step, plan)
             ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD step complete hona chahiye.")
         val project = ProjectStore.listProjects(context).firstOrNull { it.name == projectName }
@@ -1220,7 +1269,6 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
      *  null otherwise (caller then executes it). */
     private suspend fun verifyStep(step: PlanStep, plan: AgentPlan): StepOutcome? {
         return when (step.kind) {
-            "PLAN" -> StepOutcome.Done("plan parsed: ${plan.steps.size} steps")
             "BUILD" -> {
                 val project = resolveProjectName(step, plan) ?: return null
                 when (val v = verifyBuildPreview(project)) {
@@ -1351,26 +1399,40 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     }
 
     /** Project name: this step's detail, else the plan's BUILD
-     *  step detail, else the last built project. */
+     *  step detail, else the last built project. MINOR-2: a "?"
+     *  sentinel is missing, never the invented "jarvis-project"
+     *  default that sanitizeProjectName falls back to. */
     private fun resolveProjectName(step: PlanStep, plan: AgentPlan): String? {
-        parseDetailValue(step.detail, "project")?.let { return ProjectStore.sanitizeProjectName(it) }
+        parseDetailValue(step.detail, "project")?.takeUnless { it == "?" }?.let { return ProjectStore.sanitizeProjectName(it) }
         plan.steps.firstOrNull { it.kind == "BUILD" }?.let { buildStep ->
-            parseDetailValue(buildStep.detail, "project")?.let {
+            parseDetailValue(buildStep.detail, "project")?.takeUnless { it == "?" }?.let {
                 return ProjectStore.sanitizeProjectName(it)
             }
         }
         return engine.planLastBuildProject().takeIf { it.isNotBlank() }
     }
 
-    /** Repo name from answered clarifications ("repo=<name>" or a
-     *  bare single-token answer to the repo question). */
+    /** Repo name from answered clarifications — ONLY when the
+     *  answer was given to the repo-name question, or the entry
+     *  carries an explicit "repo=<name>". MAJOR-1: a bare
+     *  single-token answer to ANY other question (a "haan" to a
+     *  retry/overwrite ask, a project name given for BUILD) is
+     *  NOT a repo name — accepting it would create a private repo
+     *  with an invented name, without asking. Such entries fall
+     *  through (null) so the caller asks for the repo name. */
     private fun resolveRepoFromClarifications(plan: AgentPlan): String? {
         for (entry in plan.answeredClarifications.asReversed()) {
-            parseDetailValue(entry, "repo")?.let { return sanitizeRepoName(it) }
-            val answer = entry.substringAfter("-> A: ", "").trim()
-            if (answer.matches(Regex("[A-Za-z0-9._-]+")) && answer.length in 2..100) {
-                return sanitizeRepoName(answer)
+            parseDetailValue(entry, "repo")?.let { raw ->
+                val name = sanitizeRepoName(raw)
+                if (name.isNotBlank()) return name
             }
+            val question = entry.substringBefore("-> A:", "").trim()
+            if (!question.contains("repo", ignoreCase = true)) continue
+            val answer = entry.substringAfter("-> A: ", "").trim()
+            if (answer.isBlank() || answer == "?") continue
+            if (!answer.matches(Regex("[A-Za-z0-9._-]+")) || answer.length !in 2..100) continue
+            val name = sanitizeRepoName(answer)
+            if (name.isNotBlank()) return name
         }
         return null
     }
