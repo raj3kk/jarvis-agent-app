@@ -533,10 +533,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         )
         val (outcome, reason) = engine.planCheckGate(synthetic)
         when (outcome) {
-            GateOutcome.ABORT_TASK -> return GateResult.Abort
-            GateOutcome.PAUSE_TASK -> return GateResult.Pause("gate question nahi boli ja saki: $reason")
-            GateOutcome.BLOCK_STEP -> return GateResult.Block("Gate ne step block kiya: $reason")
-            GateOutcome.ALLOW -> Unit
+            JarvisAgentEngine.GateOutcome.ABORT_TASK -> return GateResult.Abort
+            JarvisAgentEngine.GateOutcome.PAUSE_TASK -> return GateResult.Pause("gate question nahi boli ja saki: $reason")
+            JarvisAgentEngine.GateOutcome.BLOCK_STEP -> return GateResult.Block("Gate ne step block kiya: $reason")
+            JarvisAgentEngine.GateOutcome.ALLOW -> Unit
         }
         if (step.needsGate) {
             return when (val ans = askStepQuestion(
@@ -663,7 +663,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             }
             if (decision.action != "NONE") {
                 val (gateOutcome, gateReason) = engine.planCheckGate(decision)
-                if (gateOutcome != GateOutcome.ALLOW) {
+                if (gateOutcome != JarvisAgentEngine.GateOutcome.ALLOW) {
                     return StepOutcome.Failed("Build step gate ne roka: $gateReason")
                 }
                 engine.planExecuteDecision(decision)
