@@ -110,16 +110,6 @@ class JarvisPreferences(context: Context) {
         }
         set(value) = prefs.edit().putBoolean("swara_enabled", value).apply()
 
-    // 1.4.3: Deepgram STT key (listening/transcription ONLY —
-    // speaking stays Swara (cloud Edge voice); Deepgram TTS/Aura
-    // is never used). Stored on the phone, never in the APK or
-    // repo, never
-    // logged. 1.4.5 FINAL policy: empty = CANNOT LISTEN (system
-    // fallback REMOVED entirely — no fallback exists any more).
-    var deepgramApiKey: String
-        get() = prefs.getString("deepgram_api_key", "") ?: ""
-        set(value) = prefs.edit().putString("deepgram_api_key", value.trim()).apply()
-
     // 1.4.17: Live mode (Gemini real-time conversation) toggle.
     // Persisted ONLY by the AI Brain Save button, like every
     // other setting here — flipping the toggle alone changes

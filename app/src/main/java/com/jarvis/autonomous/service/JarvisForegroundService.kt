@@ -546,6 +546,20 @@ class JarvisForegroundService : Service() {
         // then rethrow so crash behaviour itself is unchanged.
         try {
         prefs = JarvisPreferences(this)
+        // 1.4.23-PRO step 2a (Item 1 staged): one-time wipe of the
+        // stored Deepgram key. The Deepgram client is deleted and
+        // the key property is gone from JarvisPreferences, so any
+        // key saved on the phone is cleared once here and never
+        // read again. Same SharedPreferences file ("jarvis_agent_prefs")
+        // and key ("deepgram_api_key") the property used; guarded
+        // by a flag so it runs a single time.
+        val wipePrefs = getSharedPreferences("jarvis_agent_prefs", MODE_PRIVATE)
+        if (!wipePrefs.getBoolean("deepgram_key_wiped_1_4_23", false)) {
+            wipePrefs.edit()
+                .remove("deepgram_api_key")
+                .putBoolean("deepgram_key_wiped_1_4_23", true)
+                .apply()
+        }
         createNotificationChannel()
         // 1.4.9 (Step 1g): NEVER the raw 2-arg startForeground
         // here — it applies all manifest types
