@@ -177,6 +177,13 @@ object AgentPlanStore {
     const val FILE_NAME = "agent_plan.json"
     private const val TMP_NAME = "agent_plan.json.tmp"
 
+    // 1.4.22 (item 5d): load() runs on every FGS recreation,
+    // demote, plan start and MainActivity resume — a corrupt file
+    // must log PLAN_CORRUPT only once per file version, not on
+    // every load. Signature = file length + last-modified.
+    @Volatile
+    private var lastCorruptSignature: String? = null
+
     /** Atomic write: tmp file + rename. Every write goes through here. */
     fun save(context: Context, plan: AgentPlan) {
         runCatching {
@@ -207,10 +214,16 @@ object AgentPlanStore {
         val raw = runCatching { file.readText() }.getOrNull() ?: return null
         val plan = AgentPlan.fromJson(raw)
         if (plan == null) {
-            JarvisStateRepository.addDiagnostic(
-                "plan", "PLAN_CORRUPT",
-                "agent_plan.json corrupt/unparseable hai — plan resume nahi hoga."
-            )
+            val signature = "${file.length()}:${file.lastModified()}"
+            if (signature != lastCorruptSignature) {
+                lastCorruptSignature = signature
+                JarvisStateRepository.addDiagnostic(
+                    "plan", "PLAN_CORRUPT",
+                    "agent_plan.json corrupt/unparseable hai — plan resume nahi hoga."
+                )
+            }
+        } else {
+            lastCorruptSignature = null
         }
         return plan
     }

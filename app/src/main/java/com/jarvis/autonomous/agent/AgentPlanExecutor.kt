@@ -50,6 +50,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         .writeTimeout(25, TimeUnit.SECONDS)
         .build()
 
+    // 1.4.22 (item 5a): detail of the last Supabase column
+    // mismatch, set by verifySupabaseTablesNow alongside the
+    // SUPABASE_VERIFY_COLUMNS diagnostic so the caller can put
+    // the table + missing columns in the Failed message. Reset
+    // at the start of every verify call (never stale).
+    private var lastSupabaseVerifyMismatch: String? = null
+
     // ---- Outcomes ----
 
     private sealed interface StepOutcome {
@@ -212,11 +219,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         continue
                     }
                     PlanState.FAILED -> {
-                        // Interrupted before the terminal finish —
-                        // give it one more run instead of dropping it.
-                        current = updateStep(current, step.id) { it.copy(state = PlanState.PENDING) }
-                        saveAndPublish(current)
-                        continue
+                        // 1.4.22 (item 5c): a FAILED step in a
+                        // non-completed plan means the process was
+                        // killed between the FAILED save and
+                        // finishPlan — never silently re-run it.
+                        // finishPlan surfaces the stored failure
+                        // evidence in its summary + planSpeak.
+                        finishPlan(current, allDone = false)
+                        return
                     }
                     PlanState.BLOCKED -> {
                         // Resume path: re-ask the stored question ONCE.
@@ -765,12 +775,6 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun executeGithubPush(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
-        val token = AgentSecrets.get(context, AgentSecrets.KEY_GITHUB_PAT)
-        if (token.isBlank()) {
-            return StepOutcome.Blocked(
-                "GitHub PAT saved nahi hai — AI Brain > Agent Mode — Connected accounts me GitHub PAT daalo (fine-grained, Contents read+write)."
-            )
-        }
         // MINOR-2: "repo=?" is the planner's unknown-name sentinel,
         // not a name — fall through to the ask below.
         var repo = parseDetailValue(step.detail, "repo")?.takeUnless { it == "?" }
@@ -803,6 +807,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val files = project.files.filter { ProjectStore.readFile(context, projectName, it).isNotBlank() }
         if (files.isEmpty()) return StepOutcome.Failed("Project '$projectName' me koi file nahi mili.")
         return withContext(Dispatchers.IO) {
+            // 1.4.22 (item 5b): token read is blocking keystore /
+            // disk I/O — it happens on IO, never on Main.
+            val token = AgentSecrets.get(context, AgentSecrets.KEY_GITHUB_PAT)
+            if (token.isBlank()) {
+                return@withContext StepOutcome.Blocked(
+                    "GitHub PAT saved nahi hai — AI Brain > Agent Mode — Connected accounts me GitHub PAT daalo (fine-grained, Contents read+write)."
+                )
+            }
             try {
                 val result = pushToGithub(token, repo, projectName, files, context)
                 // Full SHA in evidence (verify-before-re-run needs
@@ -994,29 +1006,33 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun executeSupabaseTables(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
-        val token = AgentSecrets.get(context, AgentSecrets.KEY_SUPABASE_PAT)
-        val ref = AgentSecrets.get(context, AgentSecrets.KEY_SUPABASE_PROJECT_REF)
-        if (token.isBlank()) {
-            return StepOutcome.Blocked(
-                "Supabase PAT saved nahi hai — AI Brain > Agent Mode me Supabase PAT daalo."
-            )
-        }
-        if (ref.isBlank()) {
-            return StepOutcome.Blocked(
-                "Supabase project ref khaali hai — AI Brain > Agent Mode me project ref daalo (Project Settings se)."
-            )
-        }
         val projectName = resolveProjectName(step, plan)
             ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD step complete hona chahiye.")
         val schema = ProjectStore.readFile(context, projectName, "backend/schema.sql")
         if (schema.isBlank()) {
             return StepOutcome.Failed("backend/schema.sql nahi mila — BUILD step me backend files bane hone chahiye.")
         }
-        val tables = parseCreateTables(schema)
-        if (tables.isEmpty()) {
+        // 1.4.22 (item 5a): expected schema is table -> columns,
+        // not just table names — verification compares column sets.
+        val expected = parseSchemaColumns(schema)
+        if (expected.isEmpty()) {
             return StepOutcome.Failed("schema.sql me koi CREATE TABLE nahi mila — schema invent nahi kar sakta.")
         }
         return withContext(Dispatchers.IO) {
+            // 1.4.22 (item 5b): token reads are blocking keystore /
+            // disk I/O — they happen on IO, never on Main.
+            val token = AgentSecrets.get(context, AgentSecrets.KEY_SUPABASE_PAT)
+            if (token.isBlank()) {
+                return@withContext StepOutcome.Blocked(
+                    "Supabase PAT saved nahi hai — AI Brain > Agent Mode me Supabase PAT daalo."
+                )
+            }
+            val ref = AgentSecrets.get(context, AgentSecrets.KEY_SUPABASE_PROJECT_REF)
+            if (ref.isBlank()) {
+                return@withContext StepOutcome.Blocked(
+                    "Supabase project ref khaali hai — AI Brain > Agent Mode me project ref daalo (Project Settings se)."
+                )
+            }
             try {
                 // One retry per statement, network/5xx only — a
                 // 4xx is the true answer (bad SQL / bad scope).
@@ -1026,13 +1042,15 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         requireOk(code, body, "Supabase SQL")
                     }
                 }
-                val verified = verifySupabaseTablesNow(token, ref, tables)
+                val verified = verifySupabaseTablesNow(token, ref, expected)
                 if (verified == null) {
+                    val detail = lastSupabaseVerifyMismatch
+                        ?: "tables missing/empty: ${expected.keys.joinToString(", ")}"
                     return@withContext StepOutcome.Failed(
-                        "Supabase verify fail: tables missing/empty: ${tables.joinToString(", ")}"
+                        "Supabase verify fail: $detail. BUILD dobara chalao ya schema.sql check karo."
                     )
                 }
-                StepOutcome.Done("tables: ${tables.joinToString(", ")} (project $ref)")
+                StepOutcome.Done("tables: ${expected.keys.joinToString(", ")} (project $ref)")
             } catch (e: IllegalStateException) {
                 StepOutcome.Failed("Supabase ${e.message?.take(200)}")
             } catch (e: IOException) {
@@ -1043,22 +1061,44 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }
     }
 
-    /** Runs the verification query; returns the per-table column
-     *  counts, or null when it cannot be confirmed. */
+    /** Runs the verification query; returns the per-table live
+     *  column sets, or null when it cannot be confirmed.
+     *  1.4.22 (item 5a): exact set equality per table against the
+     *  expected schema — a missing/extra column is a mismatch,
+     *  logged as SUPABASE_VERIFY_COLUMNS (table + column names
+     *  only, no data) and returned as null ("cannot confirm"). */
     private fun verifySupabaseTablesNow(
         token: String,
         ref: String,
-        tables: List<String>
-    ): Map<String, Int>? {
+        expected: Map<String, Set<String>>
+    ): Map<String, Set<String>>? {
+        lastSupabaseVerifyMismatch = null
         return try {
             withOneRetryOnNetworkOr5xx {
-                val inList = tables.joinToString(",") { "'$it'" }
+                val inList = expected.keys.joinToString(",") { "'$it'" }
                 val sql = "SELECT table_name, column_name FROM information_schema.columns " +
                     "WHERE table_schema = 'public' AND table_name IN ($inList)"
                 val (code, body) = supabaseQuery(token, ref, sql)
                 requireOk(code, body, "Supabase verify")
-                val counts = parseInformationSchemaColumns(body)
-                if (tables.all { (counts[it] ?: 0) >= 1 }) counts else null
+                val live = parseInformationSchemaColumns(body)
+                for ((table, expectedCols) in expected) {
+                    val liveCols = live[table] ?: emptySet()
+                    if (liveCols != expectedCols) {
+                        val missing = (expectedCols - liveCols).sorted()
+                        val extra = (liveCols - expectedCols).sorted()
+                        val detail = buildString {
+                            append("$table ke columns schema se match nahi karte (missing: ${missing.joinToString(", ").ifBlank { "—" }}")
+                            if (extra.isNotEmpty()) append("; extra: ${extra.joinToString(", ")}")
+                            append(")")
+                        }
+                        lastSupabaseVerifyMismatch = detail
+                        JarvisStateRepository.addDiagnostic(
+                            "supabase", "SUPABASE_VERIFY_COLUMNS", detail
+                        )
+                        return@withOneRetryOnNetworkOr5xx null
+                    }
+                }
+                live
             }
         } catch (e: Exception) {
             null
@@ -1074,13 +1114,21 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         )
     }
 
-    private fun parseInformationSchemaColumns(body: String): Map<String, Int> {
-        val counts = mutableMapOf<String, Int>()
+    /** Live column sets per table (table + column names
+     *  lowercased — Postgres folds unquoted identifiers; the
+     *  builder emits lowercase).
+     *  1.4.22 (item 5a): was per-table row counts only. */
+    private fun parseInformationSchemaColumns(body: String): Map<String, Set<String>> {
+        val columns = mutableMapOf<String, MutableSet<String>>()
         fun absorb(arr: JSONArray?) {
             if (arr == null) return
             for (i in 0 until arr.length()) {
-                val t = arr.optJSONObject(i)?.optString("table_name", "") ?: ""
-                if (t.isNotBlank()) counts[t] = (counts[t] ?: 0) + 1
+                val obj = arr.optJSONObject(i) ?: continue
+                val t = obj.optString("table_name", "").lowercase()
+                val c = obj.optString("column_name", "").lowercase()
+                if (t.isNotBlank() && c.isNotBlank()) {
+                    columns.getOrPut(t) { mutableSetOf() }.add(c)
+                }
             }
         }
         runCatching {
@@ -1094,19 +1142,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 absorb(obj.optJSONArray("result"))
             }
         }
-        return counts
+        return columns
     }
 
     // ---- VERCEL_DEPLOY (REST API, project linked to the GitHub repo) ----
 
     private suspend fun executeVercelDeploy(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
-        val token = AgentSecrets.get(context, AgentSecrets.KEY_VERCEL_TOKEN)
-        if (token.isBlank()) {
-            return StepOutcome.Blocked(
-                "Vercel token saved nahi hai — AI Brain > Agent Mode me Vercel token daalo (Settings → Tokens)."
-            )
-        }
         val pushStep = plan.steps.firstOrNull { it.kind == "GITHUB_PUSH" }
         if (pushStep == null || pushStep.state != PlanState.DONE) {
             return StepOutcome.Failed("GitHub push pehle complete hona chahiye — Vercel deploy uske bina nahi ho sakta.")
@@ -1117,6 +1159,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val projectName = resolveProjectName(step, plan) ?: repo
         val vercelName = sanitizeVercelName(projectName)
         return withContext(Dispatchers.IO) {
+            // 1.4.22 (item 5b): token read is blocking keystore /
+            // disk I/O — it happens on IO, never on Main.
+            val token = AgentSecrets.get(context, AgentSecrets.KEY_VERCEL_TOKEN)
+            if (token.isBlank()) {
+                return@withContext StepOutcome.Blocked(
+                    "Vercel token saved nahi hai — AI Brain > Agent Mode me Vercel token daalo (Settings → Tokens)."
+                )
+            }
             try {
                 // 1. Create (or confirm) the Vercel project linked
                 // to the GitHub repo.
@@ -1333,11 +1383,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 val projectName = resolveProjectName(step, plan) ?: return@withContext null
                 val schema = ProjectStore.readFile(context, projectName, "backend/schema.sql")
                 if (schema.isBlank()) return@withContext null
-                val tables = parseCreateTables(schema)
-                if (tables.isEmpty()) return@withContext null
-                val counts = verifySupabaseTablesNow(token, ref, tables) ?: return@withContext null
+                val expected = parseSchemaColumns(schema)
+                if (expected.isEmpty()) return@withContext null
+                val counts = verifySupabaseTablesNow(token, ref, expected) ?: return@withContext null
                 if (counts.isEmpty()) return@withContext null
-                StepOutcome.Done("verified after kill: tables: ${tables.joinToString(", ")} (project $ref)")
+                StepOutcome.Done("verified after kill: tables: ${expected.keys.joinToString(", ")} (project $ref)")
             } catch (e: Exception) {
                 null
             }
@@ -1461,6 +1511,75 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     private fun parseCreateTables(schema: String): List<String> {
         val regex = Regex("""(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([A-Za-z_][A-Za-z0-9_]*)""")
         return regex.findAll(schema).map { it.groupValues[1] }.distinct().toList()
+    }
+
+    /** 1.4.22 (item 5a): expected schema as table -> column set,
+     *  parsed from the CREATE TABLE blocks. Per block, the
+     *  parenthesised body is split on top-level commas; the first
+     *  identifier of each part is a column, except constraint
+     *  lines (PRIMARY KEY / FOREIGN KEY / UNIQUE / CHECK /
+     *  CONSTRAINT), which are skipped. Quotes/backticks are
+     *  stripped and both sides lowercased (Postgres folds
+     *  unquoted identifiers; builder-generated schemas are
+     *  lowercase). NOTED LIMITATION (not fixed): a quoted
+     *  mixed-case column in hand-edited schema.sql would
+     *  false-mismatch. */
+    private fun parseSchemaColumns(schema: String): Map<String, Set<String>> {
+        val result = mutableMapOf<String, Set<String>>()
+        val headRegex = Regex("""(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([A-Za-z_][A-Za-z0-9_]*)["`]?\s*\(""")
+        for (match in headRegex.findAll(schema)) {
+            val table = match.groupValues[1].lowercase()
+            var depth = 1
+            var i = match.range.last + 1
+            val bodyStart = i
+            var bodyEnd = -1
+            var inSingleQuote = false
+            while (i < schema.length) {
+                val ch = schema[i]
+                if (ch == '\'') inSingleQuote = !inSingleQuote
+                if (!inSingleQuote) {
+                    if (ch == '(') depth++
+                    if (ch == ')') {
+                        depth--
+                        if (depth == 0) { bodyEnd = i; break }
+                    }
+                }
+                i++
+            }
+            if (bodyEnd < 0) continue
+            val body = schema.substring(bodyStart, bodyEnd)
+            val columns = mutableSetOf<String>()
+            var partStart = 0
+            var d = 0
+            var q = false
+            fun flushPart(end: Int) {
+                val part = body.substring(partStart, end).trim()
+                if (part.isNotEmpty()) {
+                    val first = Regex("""^["`]?([A-Za-z_][A-Za-z0-9_]*)""")
+                        .find(part)?.groupValues?.get(1)
+                    if (first != null &&
+                        first.uppercase() !in setOf("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT")
+                    ) {
+                        columns.add(first.lowercase())
+                    }
+                }
+                partStart = end + 1
+            }
+            var j = 0
+            while (j < body.length) {
+                val ch = body[j]
+                if (ch == '\'') q = !q
+                if (!q) {
+                    if (ch == '(') d++
+                    if (ch == ')') d--
+                    if (ch == ',' && d == 0) flushPart(j)
+                }
+                j++
+            }
+            flushPart(body.length)
+            if (columns.isNotEmpty()) result[table] = columns
+        }
+        return result
     }
 
     private fun splitSqlStatements(schema: String): List<String> {

@@ -492,9 +492,24 @@ class JarvisAgentEngine(
      * longer word cannot false-match.
      */
     private fun isCurrentInfoQuestion(lower: String): Boolean {
+        // 1.4.22 (item 2): task/memory turns ("aaj mere kaam kya
+        // hain", "kal ki baat yaad hai?") and app-self turns
+        // ("live preview kaisa hai", "jarvis ka voice kaisa hai")
+        // are NOT current-info questions — they keep the memory /
+        // app path. "app" is a TOKEN match only: substring would
+        // match "whatsapp" and break WhatsApp routines.
         if (lower.contains("website") || lower.contains("banao") ||
             lower.contains("banado") || lower.contains("kholo") ||
-            lower.contains("chalao") || lower.contains("dikhao")
+            lower.contains("chalao") || lower.contains("dikhao") ||
+            lower.contains("kaam") || lower.contains("task") ||
+            lower.contains("yaad") || lower.contains("bhool") ||
+            lower.contains("routine") || lower.contains("plan") ||
+            lower.contains("schedule") || lower.contains("timetable") ||
+            lower.contains("preview") || lower.contains("project") ||
+            lower.contains("jarvis") || lower.contains("mic") ||
+            lower.contains("screen") || lower.contains("notification") ||
+            lower.contains("battery") || lower.contains("live mode") ||
+            Regex("\\bapp\\b").containsMatchIn(lower)
         ) {
             return false
         }
@@ -674,10 +689,22 @@ class JarvisAgentEngine(
                             // item-3 search rule), LABELED as
                             // scraped snippets, not a grounded
                             // answer — weaker, and said so.
-                            val label = "Live search nahi mila (${result.reason.take(120)}). " +
-                                "Google search page se dekh raha hoon — ye grounded answer nahi hai, scraped snippets hain."
-                            JarvisStateRepository.addChatMessage("Jarvis", label)
-                            speak(label)
+                            // 1.4.22 (item 4): the HTTP code/body
+                            // snippet in result.reason is NEVER
+                            // spoken. Spoken = fixed sentence;
+                            // chat = the same label minus the
+                            // (${reason}) snippet; the reason is
+                            // logged as a diagnostic, URLs stripped.
+                            val sanitizedReason = result.reason
+                                .replace(Regex("https?://\\S+"), "")
+                                .take(200)
+                            JarvisStateRepository.addDiagnostic(
+                                "llm", "LIVE_SEARCH_FAILED", sanitizedReason
+                            )
+                            val spoken = "Live search nahi mila — Google search page se dekh raha hoon."
+                            val chat = "Live search nahi mila. Google search page se dekh raha hoon — ye grounded answer nahi hai, scraped snippets hain."
+                            JarvisStateRepository.addChatMessage("Jarvis", chat)
+                            speak(spoken)
                             val searchUrl = browserTargetForInput(trimmed)
                             if (searchUrl.isNotBlank()) {
                                 executeBrowserLoad(searchUrl, speakSummary = true)

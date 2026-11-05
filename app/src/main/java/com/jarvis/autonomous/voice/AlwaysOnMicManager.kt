@@ -972,7 +972,16 @@ class AlwaysOnMicManager(
      */
     fun resumeDeepgram(reason: String = "manual") {
         if (!enabled || !deepgramSuspended) return
-        deepgramSuspended = false
+        // 1.4.22 (item 1a): flag order — the pump (another thread,
+        // 100 ms poll, @Volatile flags) must never observe
+        // suspended=false + connecting=false (stale) + the old
+        // client still non-null, or it drains the suspend buffer
+        // against a closing/closed client. So connecting=true and
+        // the old client close/null happen FIRST; suspended=false
+        // is LAST, just before the new client connects.
+        deepgramConnecting = true
+        runCatching { deepgramClient?.close() }
+        deepgramClient = null
         // 1.4.8 — flap fix, part 1: the resume trigger IS speech
         // (an RMS spike / VAD segment), so the silence clock
         // restarts here. Without this, the pump's suspend check
@@ -996,11 +1005,9 @@ class AlwaysOnMicManager(
             "stt", "IDLE_RESUME",
             "Deepgram stream resuming (reason=$reason)."
         )
-        runCatching { deepgramClient?.close() }
-        deepgramClient = null
-        deepgramConnecting = true
         val client = DeepgramSttClient(key)
         deepgramClient = client
+        deepgramSuspended = false
         client.connect(deepgramListener)
         scheduleConnectTimeout()
         // WAVE-2 (§A): pump resumes (rms_spike / vad_segment)
@@ -1033,18 +1040,36 @@ class AlwaysOnMicManager(
      * ONLY from the pump thread when the stream is ready, so
      * ordering against live chunks is exact. One diagnostic
      * line proves the flush on the phone.
+     * 1.4.22 (item 1b): only chunks sendPcm accepts leave the
+     * buffer — at the first refusal the unsent tail goes back at
+     * the FRONT of the deque (oldest-first, still capped at
+     * MAX_SUSPEND_CHUNKS) for the next pump iteration to retry,
+     * with one SUSPEND_AUDIO_RETAINED diagnostic (count only).
      */
     private fun drainSuspendBufferToStream() {
+        val client = deepgramClient ?: return
         val chunks: List<ByteArray>
         synchronized(suspendAudioLock) {
             if (suspendAudioChunks.isEmpty()) return
             chunks = suspendAudioChunks.toList()
             suspendAudioChunks.clear()
         }
-        val client = deepgramClient ?: return
         var sent = 0
         for (chunk in chunks) {
-            if (client.sendPcm(chunk, chunk.size)) sent++
+            if (client.sendPcm(chunk, chunk.size)) sent++ else break
+        }
+        val retained = chunks.size - sent
+        if (retained > 0) {
+            synchronized(suspendAudioLock) {
+                suspendAudioChunks.addAll(0, chunks.subList(sent, chunks.size))
+                while (suspendAudioChunks.size > MAX_SUSPEND_CHUNKS) {
+                    suspendAudioChunks.removeFirst()
+                }
+            }
+            JarvisStateRepository.addDiagnostic(
+                "stt", "SUSPEND_AUDIO_RETAINED",
+                "Retained $retained buffered chunks after a failed drain — next pump iteration retries them."
+            )
         }
         if (sent > 0) {
             JarvisStateRepository.addDiagnostic(

@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
+import com.jarvis.autonomous.data.WebsiteBuildSpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -349,6 +350,29 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+
+        // 1.4.22 (item 3): user-facing website build checklist —
+        // WebsiteBuildSpec.CHECKLIST_TEXT verbatim. Editor mode
+        // only: preview mode is a non-scrolling WebView container
+        // with no room for it.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Website Build Checklist (har build par lagti hai)",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFB85C38)
+                )
+                Text(
+                    text = WebsiteBuildSpec.CHECKLIST_TEXT,
+                    fontSize = 12.sp,
+                    color = Color(0xFF8A7A70)
+                )
+            }
+        }
 
         // New project
         Card(
