@@ -1583,7 +1583,7 @@ class JarvisForegroundService : Service() {
         override fun onSetupComplete() {
             JarvisStateRepository.addDiagnostic(
                 "live", "LIVE_STARTED",
-                "Live session ready (model gemini-3.8-live) — conversation only, no phone actions."
+                "Live session ready (model gemini-2.5-flash-native-audio-dialog) — conversation only, no phone actions."
             )
             serviceScope.launch {
                 startLiveCapture()
@@ -1629,9 +1629,15 @@ class JarvisForegroundService : Service() {
     /**
      * 1.4.17: starts a Live session. Gates (refusals only log
      * + reset the persisted toggle — they never speak, except
-     * the cooldown refusal which speaks its exact string):
-     * already live, provider != GEMINI or blank Gemini key, mic
-     * loop off, or within 60 s of a fallback end. On the normal
+     * the cooldown and task-running refusals, which speak
+     * their exact strings):
+     * already live, a task already running, provider != GEMINI
+     * or blank Gemini key, mic loop off, or within 60 s of a
+     * fallback end. A task-running refusal never cancels the
+     * running task. The task gate is also re-checked inside
+     * the start coroutine just before pauseForLive(), to close
+     * the race where a task starts during the "Live mode on
+     * hai" speak window. On the normal
      * path the LIVE_STARTED line is spoken FIRST via
      * speakWrapped — it serialises behind any in-flight speak,
      * so by its return VoiceManager is not mid-speak (the
@@ -1650,6 +1656,22 @@ class JarvisForegroundService : Service() {
                 "live", "LIVE_ALREADY",
                 "Live start ignored: a Live session is already active."
             )
+            return
+        }
+        if (agentEngine.isTaskRunning()) {
+            prefs.liveModeEnabled = false
+            JarvisStateRepository.addDiagnostic(
+                "live", "LIVE_TASK_RUNNING",
+                "Live refused: a task is already running — let it finish or stop it first, then turn Live on."
+            )
+            serviceScope.launch {
+                runCatching {
+                    speakWrapped(
+                        "Ek kaam abhi chal raha hai — pehle use poora hone do ya roko, phir Live on karo.",
+                        "live-task-running"
+                    )
+                }
+            }
             return
         }
         if (prefs.provider != AiProvider.GEMINI || prefs.apiKey.isBlank()) {
@@ -1699,6 +1721,25 @@ class JarvisForegroundService : Service() {
             // interleave window: everything after this point in
             // the coroutine runs synchronously on Main.
             if (!prefs.liveModeEnabled) return@launch
+            // Second task-gate check: a task may have started
+            // during the "Live mode on hai" speak above. Refuse
+            // the same way (diagnostic + spoken refusal, toggle
+            // reset, running task untouched) — no snapshot exists
+            // yet, so there is nothing to resume or abort.
+            if (agentEngine.isTaskRunning()) {
+                prefs.liveModeEnabled = false
+                JarvisStateRepository.addDiagnostic(
+                    "live", "LIVE_TASK_RUNNING",
+                    "Live refused: a task started during Live start — let it finish or stop it first, then turn Live on."
+                )
+                runCatching {
+                    speakWrapped(
+                        "Ek kaam abhi chal raha hai — pehle use poora hone do ya roko, phir Live on karo.",
+                        "live-task-running"
+                    )
+                }
+                return@launch
+            }
             val snapshot = runCatching { micManager.pauseForLive() }.getOrNull()
             if (snapshot == null) {
                 // Loop-off race, or pump-stuck abort (the pause

@@ -25,8 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * logged LIVE_TOOLCALL_DROPPED, and the session continues as
  * conversation.
  *
- * Pinned model: gemini-3.8-live (GA since 2026-09-15, Google's
- * named replacement for the retiring Live previews). Endpoint:
+ * Pinned model: gemini-2.5-flash-native-audio-dialog. Endpoint:
  * the Developer-API WebSocket BidiGenerateContent, auth via the
  * x-goog-api-key header ONLY — the key is NEVER in the URL,
  * NEVER logged, and NEVER put in a Diagnostics message (the
@@ -63,7 +62,7 @@ class GeminiLiveSession {
 
     companion object {
         /** Pinned Live model (see class doc). */
-        const val LIVE_MODEL = "gemini-3.8-live"
+        const val LIVE_MODEL = "gemini-2.5-flash-native-audio-dialog"
 
         /** Developer-API BidiGenerateContent WebSocket. */
         const val WS_URL =
