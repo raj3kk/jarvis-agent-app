@@ -60,14 +60,14 @@ import okio.ByteString
  *   regardless of voice — replicated, not a mistake):
  *   <speak version='1.0' ... xml:lang='en-US'><voice
  *   name='hi-IN-SwaraNeural'><prosody pitch='+0%'
- *   rate='+0%' volume='+0%'>ESCAPED_TEXT</prosody></voice>
+ *   rate='+10%' volume='+0%'>ESCAPED_TEXT</prosody></voice>
  *   1.4.16 (normal voice): pitch +0% is the user's current
  *   spec — Swara's normal, unmodified voice, superseding the
  *   1.4.13 deep-voice spec. No pitch
  *   shift is applied, on the SAME SSML message and socket (no
- *   extra round trip, no first-audio regression). Rate stays
- *   +0% so fast reply pacing is untouched; final voice
- *   verdict is the user's ear on the phone.
+ *   extra round trip, no first-audio regression). 1.4.18:
+ *   rate +10% — clear-fast, not rushed (pitch +0% unchanged);
+ *   final voice verdict is the user's ear on the phone.
  *   </speak>. SSML X-Timestamp carries the trailing Z (a
  *   Microsoft Edge bug replicated by edge-tts); speech.config
  *   uses the date string WITHOUT the trailing Z.
@@ -140,7 +140,7 @@ object SwaraTtsClient {
 
     const val VOICE_NAME = "hi-IN-SwaraNeural"
 
-    /** Last failure code of the most recent speak (null = last speak ok or not run). Read by speakGreeting for its visible GREET_FAIL stage. */
+    /** Last failure code of the most recent speak (null = last speak ok or not run). 1.4.18: the greeting (and its GREET_FAIL stage) is removed — this field is now read by VoiceManager's fallback diagnostic. */
     @Volatile
     var lastFailure: String? = null
         private set
@@ -442,7 +442,7 @@ object SwaraTtsClient {
         // hardcoded 'en-US' by edge-tts regardless of voice.
         val ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
             "<voice name='$VOICE_NAME'>" +
-            "<prosody pitch='+0%' rate='+0%' volume='+0%'>$escapedChunk</prosody>" +
+            "<prosody pitch='+0%' rate='+10%' volume='+0%'>$escapedChunk</prosody>" +
             "</voice></speak>"
         return "X-RequestId:$reqId\r\n" +
             "Content-Type:application/ssml+xml\r\n" +

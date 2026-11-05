@@ -17,8 +17,8 @@ package com.jarvis.autonomous.voice
  *   long after the last partial AND a sentence that looks complete
  *   ends the turn.
  * - INCOMPLETE_EXTRA_WAIT_MS (5000): after an "incomplete" signal,
- *   the caller speaks "aur bolo, poora sun raha hoon" and waits this
- *   long for continuation. If nothing more arrives, the buffered
+ *   the caller continues silently (1.4.18: no filler speak — the
+ *   listening indicator only) and waits this long for continuation. If nothing more arrives, the buffered
  *   text is emitted as a Complete turn anyway — the mic loop must
  *   never hang forever on a fragment.
  *
@@ -47,8 +47,8 @@ sealed interface TurnOutcome {
     data class Complete(val text: String) : TurnOutcome
 
     /**
-     * The utterance looks unfinished. The caller should speak the
-     * "aur bolo" prompt, then call [TurnDetector.markIncompletePromptSent].
+     * The utterance looks unfinished. The caller continues silently
+     * (1.4.18: no filler speak) and calls [TurnDetector.markIncompletePromptSent].
      * This outcome is emitted at most once per turn.
      */
     data class Incomplete(val text: String, val reason: String) : TurnOutcome
@@ -188,8 +188,9 @@ class TurnDetector {
     }
 
     /**
-     * Call this AFTER the caller has spoken the "aur bolo, poora
-     * sun raha hoon" prompt. Starts the ~5s continuation window;
+     * Call this when an Incomplete turn continues silently
+     * (1.4.18: no filler speak — the caller continues silently).
+     * Starts the ~5s continuation window;
      * [check] returns Complete (never a second Incomplete) once
      * the window expires, so a silent user still gets an answer.
      */

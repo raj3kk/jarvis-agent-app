@@ -65,6 +65,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         userGoal: String,
         stepNumber: Int,
         previousActions: List<String>,
+        answeredClarifications: List<String> = emptyList(),
         recentChat: List<String>,
         recentNotifications: List<String>,
         screenTree: String,
@@ -158,6 +159,11 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             if (previousActions.isNotEmpty()) {
                 appendLine("=== PREVIOUS STEPS TAKEN IN THIS TASK ===")
                 previousActions.takeLast(8).forEach { appendLine("- $it") }
+                appendLine()
+            }
+            if (answeredClarifications.isNotEmpty()) {
+                appendLine("=== ALREADY ANSWERED (never re-ask) ===")
+                answeredClarifications.takeLast(12).forEach { appendLine("- $it") }
                 appendLine()
             }
             if (isStuckWarning) {
@@ -313,7 +319,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
 
             You are JARVIS, an autonomous Android OS agent with full Accessibility Service control, Multimodal Vision Sight, AND a warm, friendly human-like companion.
             You operate in a multi-step ReAct loop:
-            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally like a close friend with action="NONE" and isCompleted=true.
+            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE" and isCompleted=true.
             2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
@@ -323,6 +329,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                Step 3: action="WRITE_PROJECT_FILE", same projectName, fileName="script.js", fileContent=the COMPLETE custom JS for this site (every id the HTML references must exist in the JS, every JS getElementById target must exist in the HTML). Set isCompleted=true, and your reply MUST be the build summary: files created (index.html, style.css, script.js), the project name, and "Projects tab me Preview dabao, ya Browser me kholo".
                EXCEPTION — single-file build ONLY when the user explicitly asks for one file ("sirf ek file", "single file page"): then do ONE step, action="CREATE_PROJECT" with a fully self-contained index.html (inline <style> and <script> inside the HTML, NO href="style.css" and NO src="script.js"), isCompleted=true, and say it is a single-file build. Never mix the two modes: a 3-file HTML must never reference files you did not write, and a single-file HTML must never reference external files.
             6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps with isCompleted=false then true. Set isCompleted=true on the last edit step and reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho".
+            7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS STEPS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):
             - "NONE": No screen action needed (casual chat, asking user a question, or task already complete).
@@ -353,7 +360,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             OUTPUT FORMAT:
             Respond ONLY with a valid JSON object matching this exact schema (no markdown fences):
             {
-              "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, 1-2 short sentences for step updates, never a lecture, never 'As an AI'",
+              "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, concisely: 1-2 short sentences for EVERY reply (not just step updates), never a lecture, never 'As an AI'; concise but complete — never drop file names, preview lines, or details the user asked for",
               "thought": "Your internal reasoning for this step",
               "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | YOUTUBE_PLAY | WHATSAPP_SEND | OPEN_URL | OPEN_BROWSER | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
               "appName": "",

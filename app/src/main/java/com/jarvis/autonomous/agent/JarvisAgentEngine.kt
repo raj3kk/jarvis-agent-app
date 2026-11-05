@@ -95,6 +95,15 @@ class JarvisAgentEngine(
     private var lastBuildWritten: Boolean = false
     private var lastExecutedAction: String = ""
 
+    /**
+     * 1.4.18: answered clarifications, ENGINE-LIFETIME (capped
+     * last 12, "Q -> A" strings) — deliberately NOT cleared by
+     * clearTaskScopedState: surviving across tasks is the point,
+     * so the model never re-asks an answered question in a later
+     * task. In-task currentGoal accumulation stays as-is.
+     */
+    private val answeredClarifications = mutableListOf<String>()
+
     /** URLs deferred by the B-M3 visibility check (never auto-loaded). */
 
     /** Clears ALL per-attempt state (A-C7): routine buffer, browser
@@ -1185,6 +1194,7 @@ class JarvisAgentEngine(
                     },
                     stepNumber = step,
                     previousActions = previousActions,
+                    answeredClarifications = answeredClarifications,
                     recentChat = recentChat,
                     recentNotifications = recentNotifs,
                     screenTree = snapshot.formattedTree,
@@ -1295,6 +1305,13 @@ class JarvisAgentEngine(
                         persistChat()
                         currentGoal = "$currentGoal (User clarified: $userAnswer)"
                         previousActions.add("Asked user: '${decision.reply}' -> User answered: '$userAnswer'")
+                        // 1.4.18: record the answered clarification
+                        // for the ALREADY ANSWERED section (capped
+                        // last 12, engine-lifetime).
+                        answeredClarifications.add("Q: ${decision.reply} -> A: $userAnswer")
+                        while (answeredClarifications.size > 12) {
+                            answeredClarifications.removeAt(0)
+                        }
                         step++
                         continue
                     } else {

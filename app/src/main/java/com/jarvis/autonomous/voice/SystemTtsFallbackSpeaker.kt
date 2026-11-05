@@ -199,7 +199,7 @@ object SystemTtsFallbackSpeaker {
             // NEVER prefs.voicePitch/prefs.voiceSpeed, and never
             // applied to Swara (different object/path; Swara's
             // normal voice is Edge SSML prosody pitch='+0%'
-            // rate='+0%' in SwaraTtsClient).
+            // rate='+10%' in SwaraTtsClient).
             engine.setSpeechRate(0.9f)
             engine.setPitch(1.0f)
             val baseId = "jarvis-fallback-${System.currentTimeMillis()}"

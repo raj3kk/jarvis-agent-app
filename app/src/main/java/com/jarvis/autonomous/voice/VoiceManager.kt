@@ -75,7 +75,7 @@ import kotlin.coroutines.resume
  *
  * prefs.voiceSpeed / prefs.voicePitch are no longer applied here:
  * they only ever tuned system TTS. Swara speaks at Edge prosody
- * defaults (rate +0%, pitch +0%, volume +0%). The prefs fields
+ * defaults (rate +10%, pitch +0%, volume +0%). The prefs fields
  * themselves live in JarvisPreferences (outside this worker's
  * ownership) and are listed as dead in the integration notes
  * until the coordinator removes or rewires the slider.

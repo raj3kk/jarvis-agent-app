@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -238,7 +239,37 @@ class AlwaysOnMicManager(
      * keyword still barges in during speech.
      */
     private val echoFingerprintStack: ArrayDeque<String> = ArrayDeque()
-    private val ECHO_STACK_MAX = 5
+    private val ECHO_STACK_MAX = 6
+    /**
+     * 1.4.18 (SCREEN/MEDIA GATING): fresh user direction — set
+     * on loop-enable tap and on wake-trigger match, consumed
+     * exactly once by the next turn start (or on turn
+     * completion), never left sticky. Restore does NOT set it
+     * (restore is not a fresh user direction). While set, the
+     * media gate at turn start never drops the turn.
+     */
+    private var userDirectedTurnPending: Boolean = false
+
+    /** 1.4.18: service-supplied media-gate bypass, evaluated at
+     * transcript-arrival time: true while a mid-task voice
+     * reply is pending or an engine task is running. State
+     * flags only, never timers. */
+    var mediaGateBypass: (() -> Boolean)? = null
+
+    /** 1.4.18: mark the next turn as user-directed (see above). */
+    fun markUserDirectedTurn() {
+        userDirectedTurnPending = true
+    }
+
+    /** 1.4.18: media-playback signal for the turn-start gate —
+     * AudioManager.isMusicActive() sampled at transcript
+     * arrival, no listener, no timer, no new permission. */
+    private fun isMusicActive(): Boolean {
+        val audioManager = runCatching {
+            appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        }.getOrNull()
+        return audioManager?.isMusicActive == true
+    }
     /** Armed by a dropped speechFinal final; cleared on retire. */
     private var echoSegmentBoundaryPending: Boolean = false
     /** Optional resume callback (WAVE-2 §A): fired by
@@ -484,6 +515,9 @@ class AlwaysOnMicManager(
                     val text = outcome.text
                     turnDetector.reset()
                     resetTurnAssembly()
+                    // 1.4.18: a completed turn consumes any
+                    // pending user direction (never left sticky).
+                    userDirectedTurnPending = false
                     // 1.4.13 (F-E1): this turn completed, so it
                     // was non-echo by construction (echo was
                     // filtered at flush / dropped live) — the
@@ -1134,7 +1168,14 @@ class AlwaysOnMicManager(
         }.getOrNull().let { created ->
             pumpAec = created
             if (created != null) {
-                runCatching { created.setEnabled(true) }.onFailure {
+                // 1.4.18: the setEnabled return value is CHECKED
+                // (the old code ignored it and only caught
+                // throws) — anything but SUCCESS releases AEC
+                // and emits the same AEC_UNAVAILABLE diagnostic
+                // as the null path below.
+                val enableResult = runCatching { created.setEnabled(true) }
+                    .getOrDefault(AcousticEchoCanceler.ERROR)
+                if (enableResult != AcousticEchoCanceler.SUCCESS) {
                     runCatching { created.release() }
                     pumpAec = null
                 }
@@ -1357,6 +1398,8 @@ class AlwaysOnMicManager(
         // WAVE-2 (§B): the stack clears on stop (rule 4).
         echoFingerprintStack.clear()
         echoSegmentBoundaryPending = false
+        // 1.4.18: loop stop also clears pending user direction.
+        userDirectedTurnPending = false
         speakStopping = false
         mainHandler.removeCallbacks(turnCheckRunnable)
         stopDeepgramStream()
@@ -1405,20 +1448,13 @@ class AlwaysOnMicManager(
             currentSpokenText = spokenText
             // WAVE-2 (§B): PUSH, never overwrite — prior
             // entries keep their tail coverage (greeting +
-            // announce pair). One exception, the "retire on
-            // next speak" rule: if a dropped speechFinal final
-            // already armed a segment boundary, the prior tail
-            // segment is DONE, so the stack retires BEFORE this
-            // push (the new speak starts fresh); without a
-            // boundary, nothing is cleared here.
-            if (echoSegmentBoundaryPending) {
-                echoFingerprintStack.clear()
-                echoSegmentBoundaryPending = false
-                JarvisStateRepository.addDiagnostic(
-                    "stt", "ECHO_STACK_RETIRED",
-                    "Echo stack retired on next speak after a segment boundary (entries=0)."
-                )
-            }
+            // announce pair). 1.4.18: the old "retire on next
+            // speak" rule is DELETED — retirement stays ONLY
+            // on: non-echo transcript (live gate), turn
+            // complete, loop stop. The first genuine final
+            // retires the stack anyway; no timer/grace window
+            // is introduced by this removal.
+            // (No clear here: a new speak never erases the stack.)
             if (spokenText.isNotBlank()) {
                 echoFingerprintStack.addLast(spokenText)
                 while (echoFingerprintStack.size > ECHO_STACK_MAX) {
@@ -1432,7 +1468,6 @@ class AlwaysOnMicManager(
         } else {
             if (speakingDepth > 0) speakingDepth--
             if (speakingDepth > 0) return
-            val currentSpokenTextBeforeClear = currentSpokenText
             isSpeaking = false
             currentSpokenText = ""
             // 1.4.13 (F-E5): this is the REAL open event (the
@@ -1447,19 +1482,19 @@ class AlwaysOnMicManager(
             // now streams during speech (barge-in alive), Jarvis's
             // own voice can arrive as a quarantined transcript;
             // flushing it verbatim would make Jarvis answer its own
-            // echo. Drop held items whose normalised text is
-            // contained in the spoken text or is a token-subsequence
-            // of it — the same echo logic as BargeInDetector.
+            // echo. 1.4.18: the filter checks the WHOLE stack —
+            // a held item drops when it is an echo of ANY stacked
+            // spoken text (this subsumes the old single-text check
+            // against the just-cleared currentSpokenText).
             // Genuine user speech during TTS (non-keyword) still
             // flushes as a turn; keyword barge-in already fired
             // promptly via handleTranscript.
             if (enabled && quarantinedWhileSpeaking.isNotEmpty()) {
-                val spoken = currentSpokenTextBeforeClear
                 val held = quarantinedWhileSpeaking.toList()
                 quarantinedWhileSpeaking.clear()
                 val nowMs = System.currentTimeMillis()
                 for (item in held) {
-                    if (spoken.isNotBlank() && isEchoOfSpoken(item.text, spoken)) continue
+                    if (echoFingerprintStack.any { isEchoOfSpoken(item.text, it) }) continue
                     // 1.4.7 (A1): held items go through the same
                     // segment assembler as live transcripts, so
                     // the post-speech turn continues from them
@@ -1472,9 +1507,9 @@ class AlwaysOnMicManager(
     }
 
     /**
-     * Coordinator MUST call this after it has spoken the
-     * "aur bolo, poora sun raha hoon" prompt for an Incomplete
-     * turn. Starts the ~5s continuation window in [TurnDetector].
+     * Coordinator MUST call this for an Incomplete turn — the
+     * turn continues silently (1.4.18: no filler speak) and
+     * this starts the ~5s continuation window in [TurnDetector].
      */
     fun continueAfterIncompletePrompt() {
         turnDetector.markIncompletePromptSent(System.currentTimeMillis())
@@ -1607,6 +1642,37 @@ class AlwaysOnMicManager(
             }
             quarantinedWhileSpeaking.add(QuarantinedTranscript(text, isFinal))
             return
+        }
+        // 1.4.18 (SCREEN/MEDIA GATING): turn-START gate only,
+        // here in handleTranscript (main thread, where turn
+        // state lives) — never in the pump thread. When no turn
+        // is currently active (TurnDetector current text blank)
+        // and media is playing (isMusicActive sampled at
+        // transcript arrival), the transcript drops with a
+        // content-free MEDIA_GATED diagnostic and is never fed
+        // to TurnDetector — so idle-loop user speech while
+        // media plays is suppressed at turn start until
+        // playback pauses/stops or the user re-arms direction.
+        // Mid-turn transcripts are NEVER gated (current text
+        // non-blank skips this block). Bypasses (state flags,
+        // never timers) are NEVER gated: (i) a pending voice
+        // reply, (ii) a running engine task (both via
+        // mediaGateBypass), (iii) a fresh user direction
+        // (userDirectedTurnPending, consumed exactly once here
+        // when the turn starts). The flush path is exempt: it
+        // never passes through here and is already echo-filtered
+        // stack-wide (see setSpeaking).
+        if (turnDetector.currentText().isBlank()) {
+            val directed = userDirectedTurnPending
+            val bypassed = directed || mediaGateBypass?.invoke() == true
+            if (!bypassed && isMusicActive()) {
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "MEDIA_GATED",
+                    "Transcript dropped at turn start while media is playing (turn not fed)."
+                )
+                return
+            }
+            if (directed) userDirectedTurnPending = false
         }
         // WAVE-2 (§B): LIVE-transcript echo gate, content-gated
         // NOT time-gated — SUPERSEDES the G8 MINOR-1
@@ -2005,9 +2071,9 @@ interface AlwaysOnMicListener {
     fun onTurnComplete(text: String)
 
     /**
-     * The utterance looks incomplete. The coordinator should speak
-     * "aur bolo, poora sun raha hoon" (via VoiceManager, wrapped in
-     * setSpeaking) and then call
+     * The utterance looks incomplete. The coordinator continues
+     * silently (1.4.18: no filler speak — listening indicator
+     * only) and then calls
      * [AlwaysOnMicManager.continueAfterIncompletePrompt]. Exactly one
      * Incomplete per turn; after the ~5s window the text completes
      * via [onTurnComplete] anyway.

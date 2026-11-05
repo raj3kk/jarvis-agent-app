@@ -78,7 +78,6 @@ class JarvisForegroundService : Service() {
         const val ACTION_STOP_LIVE = "com.jarvis.autonomous.ACTION_STOP_LIVE"
         const val ACTION_RETRY_MIC = "com.jarvis.autonomous.ACTION_RETRY_MIC"
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
-        const val ACTION_GREET = "com.jarvis.autonomous.ACTION_GREET"
         const val ACTION_TEXT_COMMAND = "com.jarvis.autonomous.ACTION_TEXT_COMMAND"
         const val EXTRA_COMMAND_TEXT = "extra_command_text"
         const val ACTION_REFRESH_OVERLAY = "com.jarvis.autonomous.ACTION_REFRESH_OVERLAY"
@@ -124,33 +123,11 @@ class JarvisForegroundService : Service() {
      * (change-only marker — see there). */
     private var lastFgsTypes: Int? = null
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
-    /**
-     * 1.4.3 startup greeting: spoken ONCE per service lifetime
-     * (not on every Activity rotation or service restart —
-     * MainActivity sends ACTION_GREET on launch; a second send
-     * is a no-op). If the greet arrives before init finishes
-     * (defensive — onCreate always precedes onStartCommand),
-     * [pendingGreet] replays it after init.
-     */
-    private var greetingDone: Boolean = false
-    private var pendingGreet: Boolean = false
-    // 1.4.12: greeting-speak flight flag + deferred VAD start.
-    // VAD init is deferred until the greeting speak completes,
-    // to avoid VAD-init vs greeting-speak contention at launch;
-    // while a greeting speak is in flight, VAD init waits and
-    // runs right after the greeting finishes (pendingVadStart).
-    // Greeting speak is fast under Swara streaming, so the
-    // window shrinks naturally. VAD is optional (mic-busy
-    // degrades to VAD-off by design); greeting is the priority,
-    // so VAD yields, never the reverse.
-    @Volatile
-    private var greetingSpeakInProgress: Boolean = false
-    private var pendingVadStart: Boolean = false
-    // 1.4.5 (item 3): fallback for a deferred VAD start whose
-    // greeting never arrives (service start with no UI greeting):
-    // after 5 s VAD starts anyway, so the restore path can never
-    // leave VAD permanently deferred. Cancelled by drainPendingVad.
-    private var vadFallbackRunnable: Runnable? = null
+    // 1.4.18: the startup greeting is REMOVED (no greeting speak,
+    // no greeting chat line) — VAD inits immediately on service
+    // create when the loop restores, with no greeting branch and
+    // no greeting deferral. The 5 s fallback survives ONLY as an
+    // init watchdog inside startVadMonitor (see there).
     // 1.4.4: true once the persistent notification has been
     // re-issued WITH the "Share bounce report" action, so later
     // service starts don't re-issue it pointlessly.
@@ -336,98 +313,6 @@ class JarvisForegroundService : Service() {
     }
 
     /**
-     * 1.4.3 startup greeting (FIXED local lines, LLM bypassed —
-     * no network, no key, no LLM failure can swallow it). The
-     * chat line is ALWAYS posted (visible even with Swara OFF);
-     * speech is best-effort and its failure is logged. The
-     * key-prompt appends ONLY when no API key is saved.
-     */
-    private fun speakGreeting() {
-        if (greetingDone) return
-        greetingDone = true
-        val base = "Namaste, main Jarvis hoon. Main sun raha hoon — bolo, kya karna hai?"
-        val full = if (prefs.apiKey.isBlank()) {
-            "$base Baat karne ke liye AI Brain me apni API key daalo aur Save dabao."
-        } else {
-            base
-        }
-        JarvisStateRepository.addChatMessage("Jarvis", full)
-        // 1.4.5 CIRCUIT BREAKER (generic GREET_START-without-
-        // SPK_END detector, kept in 1.4.12): if the previous
-        // process died
-        // during greeting speak (GREET_START with no SPK_END),
-        // skip greeting speak for exactly ONE launch and show
-        // the breaker card instead (see Command tab). Two things
-        // happen at once: (a) if the app then stays open, that
-        // PROVES greeting speak was the trigger; (b) the user
-        // gets a readable catcher (banner + full report + Copy)
-        // while the app stays open. Self-clearing: a skipped
-        // greeting writes no GREET_START, so the next launch
-        // cannot trip again and greeting resumes normally.
-        // The skip itself is recorded as GREET_SKIPPED_AFTER_SPK_DEATH.
-        if (wasLastDeathDuringGreetingSpeak()) {
-            JarvisStateRepository.addDiagnostic(
-                "tts", "GREET_SKIPPED_AFTER_SPK_DEATH",
-                "Previous session died during greeting speak — " +
-                    "greeting speak skipped once so the app stays open " +
-                    "(circuit breaker; next launch greets normally)."
-            )
-            JarvisStateRepository.setGreetSkippedAfterSpeakDeath(true)
-            JarvisStateRepository.addChatMessage(
-                "System",
-                "Pichhli baar greeting bolte waqt app band hua, " +
-                    "isliye is baar greeting skip ki gayi taaki app khula rahe."
-            )
-            // 1.4.5 (item 3): no greeting speak will happen on this
-            // launch, so a deferred VAD start must NOT wait for it.
-            drainPendingVad()
-            return
-        }
-        // 1.4.5 GREET_START: the greeting-specific start marker.
-        // speakWrapped writes SPK_END unconditionally, so the
-        // breaker detector reads GREET_START-without-SPK_END as
-        // death-during-greeting. Written BEFORE the speak launch
-        // so even a death before speakWrapped starts is caught.
-        JarvisStateRepository.addDiagnostic(
-            "tts", "GREET_START",
-            "Startup greeting speak started."
-        )
-        greetingSpeakInProgress = true
-        serviceScope.launch {
-            val ok = runCatching { speakWrapped(full, "greeting") }.getOrDefault(false)
-            greetingSpeakInProgress = false
-            // Deferred VAD init (see startVadMonitor /
-            // deferVadUntilGreeting): run it now that greeting
-            // speak is done (VAD init was deferred until greeting
-            // speak completes, to avoid contention at launch).
-            drainPendingVad()
-            if (!ok) {
-                // 1.4.6: the old "(OFF or TTS failed)" text was
-                // ambiguous — a report could not tell which stage
-                // failed. Now the stage is named explicitly from
-                // the toggle + the Swara client's last failure
-                // (SWARA_* markers in diagnostics are the deeper
-                // cause under a TTS_FAILED stage).
-                val stage = when {
-                    !prefs.swaraEnabled -> "SWARA_OFF"
-                    SwaraTtsClient.lastFailure != null -> SwaraTtsClient.lastFailure
-                    else -> "TTS_FAILED"
-                }
-                JarvisStateRepository.addDiagnostic(
-                    "tts", "GREET_FAIL",
-                    "Startup greeting could not be spoken — stage=$stage " +
-                        "(SWARA_OFF = toggle OFF in AI Brain; " +
-                        "SWARA_CONNECT_FAILED = Swara connect failed; " +
-                        "SWARA_SYNTHESIZE_FAILED = Swara synth/playback failed; " +
-                        "SWARA_NO_AUDIO = Swara sent no audio; " +
-                        "SWARA_TIMEOUT = Swara timed out; TTS_FAILED = " +
-                        "other speak failure) — text shown in chat."
-                )
-            }
-        }
-    }
-
-    /**
      * 1.4.5 (FINAL policy): reason-based mic-error speech. The old
      * code mapped system SpeechRecognizer codes (ERROR_NETWORK=2,
      * etc.) — those codes no longer exist in the app (system
@@ -481,53 +366,6 @@ class JarvisForegroundService : Service() {
     }
 
     /**
-     * 1.4.5 (item 3): drain a deferred VAD start — called from
-     * speakGreeting completion AND from the circuit-breaker skip
-     * path (no greeting speak will happen there, so VAD must
-     * start immediately, not wait for a greeting that never comes).
-     */
-    private fun drainPendingVad() {
-        if (!pendingVadStart) return
-        pendingVadStart = false
-        vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
-        vadFallbackRunnable = null
-        startVadMonitor()
-    }
-
-    /**
-     * 1.4.5 (item 3): RESTORE DEFERRAL — the onCreate persisted-mic
-     * restore path. DECISION (explicit, in code): restore + greeting
-     * speak must NOT overlap — greeting wins, VAD waits. The old
-     * part-2 deferral only covered startVadMonitor() calls made
-     * WHILE greetingSpeakInProgress was already true; at restore
-     * time that flag is still false (greeting comes later via
-     * ACTION_GREET/pendingGreet), so restore VAD init overlapped
-     * greeting speak. Now the restore path calls this instead of
-     * startVadMonitor() when greeting has not yet run: VAD waits
-     * (VAD_DEFERRED, reason restore-before-greeting) and starts on
-     * greeting completion (drainPendingVad) or after the 5 s
-     * fallback when no greeting arrives. If greeting already ran,
-     * VAD starts immediately.
-     */
-    private fun deferVadUntilGreeting() {
-        pendingVadStart = true
-        JarvisStateRepository.addDiagnostic(
-            "tts", "VAD_DEFERRED",
-            "Sherpa VAD init deferred (restore-before-greeting: greeting wins, VAD waits; 5s fallback if no greeting arrives)."
-        )
-        vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
-        val runnable = Runnable {
-            vadFallbackRunnable = null
-            if (pendingVadStart) {
-                pendingVadStart = false
-                startVadMonitor()
-            }
-        }
-        vadFallbackRunnable = runnable
-        wakeLockHandler.postDelayed(runnable, 5_000L)
-    }
-
-    /**
      * Silero VAD (1.4.0, CI-bundled asset, never committed):
      * after the mic loop starts, copy assets/silero_vad.onnx
      * to the files dir (skipped when already present at full
@@ -550,42 +388,29 @@ class JarvisForegroundService : Service() {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    // 1.4.18: VAD init watchdog state (the ONLY surviving 5 s
+    // fallback — the greeting deferral is deleted with the
+    // greeting). A single 5 s runnable retries the init ONCE
+    // if VAD_INIT_END has not fired; it is never the normal
+    // path and never a turn/echo window.
+    private var vadInitEndFired: Boolean = false
+    private var vadInitWatchdogRetried: Boolean = false
+    private var vadInitWatchdogRunnable: Runnable? = null
+
     private fun startVadMonitor() {
-        // 1.4.12: while a greeting speak is in flight, VAD
-        // init is deferred until the greeting speak completes,
-        // to avoid VAD-init vs greeting-speak contention at
-        // launch. Defer (VAD is optional; greeting is the
-        // priority) and run right after the greeting finishes
-        // (see speakGreeting). Greeting speak is fast under
-        // Swara streaming, so the window shrinks naturally.
-        if (greetingSpeakInProgress) {
-            pendingVadStart = true
-            JarvisStateRepository.addDiagnostic(
-                "tts", "VAD_DEFERRED",
-                "Sherpa VAD init deferred until greeting speak " +
-                    "finishes (native loads serialized at launch)."
-            )
-            // 1.4.13 (F-H2): this defer previously had NO
-            // fallback timer (unlike deferVadUntilGreeting's
-            // 5 s fallback) — if the greeting completion never
-            // drained it, VAD stayed deferred forever. Now it
-            // gets the same 5 s fallback: the runnable retries
-            // startVadMonitor, which re-defers while greeting
-            // still speaks (re-arming the fallback) and starts
-            // VAD the moment greeting ends. drainPendingVad
-            // cancels the runnable on the normal path.
-            vadFallbackRunnable?.let { wakeLockHandler.removeCallbacks(it) }
-            val runnable = Runnable {
-                vadFallbackRunnable = null
-                if (pendingVadStart) {
-                    pendingVadStart = false
-                    startVadMonitor()
-                }
+        // 1.4.18: no greeting branch — VAD inits immediately.
+        // Init watchdog: if VAD_INIT_END has not fired within
+        // 5 s, retry the init once, then never again.
+        vadInitWatchdogRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+        val watchdog = Runnable {
+            vadInitWatchdogRunnable = null
+            if (!vadInitEndFired && !vadInitWatchdogRetried) {
+                vadInitWatchdogRetried = true
+                startVadMonitor()
             }
-            vadFallbackRunnable = runnable
-            wakeLockHandler.postDelayed(runnable, 5_000L)
-            return
         }
+        vadInitWatchdogRunnable = watchdog
+        wakeLockHandler.postDelayed(watchdog, 5_000L)
         serviceScope.launch {
             // 1.4.12 overlap markers: VAD_INIT_START/END timestamps
             // against SWARA_CONNECT/SWARA_FIRST_AUDIO markers show
@@ -661,6 +486,11 @@ class JarvisForegroundService : Service() {
                 vadResult is VadMonitorResult.Failed -> vadResult.reason
                 else -> null
             }
+            // 1.4.18: VAD_INIT_END fired — the init watchdog
+            // stands down (no retry needed).
+            vadInitEndFired = true
+            vadInitWatchdogRunnable?.let { wakeLockHandler.removeCallbacks(it) }
+            vadInitWatchdogRunnable = null
             JarvisStateRepository.addDiagnostic(
                 "tts", "VAD_INIT_END",
                 "Sherpa VAD init finished (started=$started)" +
@@ -744,6 +574,9 @@ class JarvisForegroundService : Service() {
             context = this,
             prefs = prefs,
             onWakeCommandDetected = { spokenCommand ->
+                // 1.4.18: wake-trigger match is fresh user
+                // direction — the next turn is never media-gated.
+                if (::micManager.isInitialized) micManager.markUserDirectedTurn()
                 agentEngine.handleUserCommand(spokenCommand)
             },
             // A-H3 single-owner gate: the wake-word recognizer
@@ -813,10 +646,15 @@ class JarvisForegroundService : Service() {
             }
 
             override fun onTurnIncomplete(text: String, reason: String) {
-                serviceScope.launch {
-                    speakWrapped("Aur bolo, poora sun raha hoon.", "incomplete")
-                    micManager.continueAfterIncompletePrompt()
-                }
+                // 1.4.18: filler speak REMOVED — incomplete turns
+                // continue SILENTLY with the existing listening
+                // indicator only (overlay pill / header mic line /
+                // persona ring; no new widget, no agentState churn).
+                // continueAfterIncompletePrompt() is MANDATORY and
+                // stays: without it the incompleteEmitted &&
+                // !promptSent branch stalls to the 5 s long-silence
+                // path instead of the proper continuation window.
+                micManager.continueAfterIncompletePrompt()
             }
 
             override fun onMicStoppedByUser() {
@@ -906,6 +744,12 @@ class JarvisForegroundService : Service() {
             }
         })
         micManager.setStopSpeakingCallback { voiceManager.stopSpeaking("barge-in keyword") }
+        // 1.4.18 (SCREEN/MEDIA GATING): directed-path bypasses,
+        // evaluated live at transcript arrival — a pending
+        // mid-task voice reply, or a running engine task.
+        micManager.mediaGateBypass = {
+            pendingVoiceReply != null || agentEngine.isTaskRunning()
+        }
         // WAVE-2 (§A): pump-resume paths (rms_spike /
         // vad_segment inside the manager) call resumeDeepgram
         // directly, with no service call site to refresh from —
@@ -976,13 +820,12 @@ class JarvisForegroundService : Service() {
         }
 
         if (prefs.wakeWordEnabled) {
-            // 1.4.5 (item 3): recogniser-start marker — the service
-            // order has wake-word BEFORE greeting dispatch, but no
+            // 1.4.5 (item 3): recogniser-start marker — no
             // marker existed for it, so a launch trace could not
             // show whether wake listening started at all.
             JarvisStateRepository.addDiagnostic(
                 "mic", "WAKE_START",
-                "Wake-word listening starting (service onCreate, before greeting dispatch)."
+                "Wake-word listening starting (service onCreate)."
             )
             voiceManager.startWakeWordListening()
         }
@@ -1003,14 +846,14 @@ class JarvisForegroundService : Service() {
                 )
             } else {
                 voiceManager.stopListeningInternal()
-                // 1.4.5 (item 3): MIC_RESTORE marker + restore
-                // deferral — greeting has NOT run yet at this point
-                // (it comes via ACTION_GREET/pendingGreet below), so
-                // restore VAD init must wait for it (greeting wins,
-                // VAD waits), NOT start immediately and overlap.
+                // 1.4.18: MIC_RESTORE marker — greeting is removed,
+                // so restore calls startVadMonitor() UNCONDITIONALLY
+                // below (no greeting branch, no deferral). Restore
+                // does NOT set user-directed turn state (restore is
+                // not a fresh user direction).
                 JarvisStateRepository.addDiagnostic(
                     "mic", "MIC_RESTORE",
-                    "Persisted mic loop restoring (service onCreate) — VAD deferred until greeting."
+                    "Persisted mic loop restoring (service onCreate) — VAD starts immediately (1.4.18: greeting removed)."
                 )
                 if (micManager.start()) {
                     // 1.4.13 (Part A 4c): restore MUST publish
@@ -1028,11 +871,8 @@ class JarvisForegroundService : Service() {
                     // user-enabled flag persisted).
                     JarvisStateRepository.setMicLoopEnabled(true)
                     JarvisStateRepository.setMicFatal(null)
-                    if (greetingDone) {
-                        startVadMonitor()
-                    } else {
-                        deferVadUntilGreeting()
-                    }
+                    // 1.4.18: unconditional — see MIC_RESTORE above.
+                    startVadMonitor()
                     JarvisStateRepository.addLog("Mic loop restored after service recreation.")
                     // 1.4.9 (Step 1g): restore is a mic start —
                     // re-apply the qualified type set (onCreate
@@ -1048,11 +888,6 @@ class JarvisForegroundService : Service() {
         // 1.4.3 home-redirect gate: service lifecycle marker
         // (persisted — survives process death like all markers).
         JarvisStateRepository.addDiagnostic("nav", "SVC_CREATE", "Foreground service created.")
-        // 1.4.3: replay a greeting that arrived before init.
-        if (pendingGreet) {
-            pendingGreet = false
-            speakGreeting()
-        }
         } catch (e: Exception) {
             runCatching {
                 com.jarvis.autonomous.data.JarvisDiagnosticsFile.appendCrash("main", e)
@@ -1162,6 +997,8 @@ class JarvisForegroundService : Service() {
                     // before this check — it would mask the
                     // suspended state from the tap.
                     if (micManager.isEnabled() && micManager.isDeepgramSuspended()) {
+                        // 1.4.18: user tap re-arms direction.
+                        micManager.markUserDirectedTurn()
                         micManager.resumeDeepgram("command-tab-tap")
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
@@ -1183,6 +1020,10 @@ class JarvisForegroundService : Service() {
                         micManager.stop()
                     }
                     if (micManager.start()) {
+                        // 1.4.18: loop-enable tap is fresh user
+                        // direction — the next turn is never
+                        // media-gated.
+                        micManager.markUserDirectedTurn()
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
                         JarvisStateRepository.setMicLoopEnabled(true)
@@ -1239,6 +1080,8 @@ class JarvisForegroundService : Service() {
                     voiceManager.stopListeningInternal()
                     micManager.stop()
                     if (micManager.start()) {
+                        // 1.4.18: Retry tap is fresh user direction.
+                        micManager.markUserDirectedTurn()
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
                         JarvisStateRepository.setMicLoopEnabled(true)
@@ -1272,24 +1115,6 @@ class JarvisForegroundService : Service() {
             ACTION_STOP_TASK -> {
                 voiceManager.stopSpeaking("user STOP_TASK")
                 agentEngine.cancelActiveTask("Stopped by user.")
-            }
-
-            ACTION_GREET -> {
-                // 1.4.17: greeting suppressed while Live is
-                // active — the Live session owns the voice.
-                if (isLiveActive()) {
-                    JarvisStateRepository.addDiagnostic(
-                        "live", "LIVE_ANNOUNCE_SUPPRESSED",
-                        "Greeting suppressed during Live."
-                    )
-                    return START_STICKY
-                }
-                // 1.4.3: MainActivity sends this once on launch.
-                if (::voiceManager.isInitialized) {
-                    speakGreeting()
-                } else {
-                    pendingGreet = true
-                }
             }
 
             ACTION_TEXT_COMMAND -> {

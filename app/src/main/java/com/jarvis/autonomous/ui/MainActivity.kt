@@ -209,10 +209,9 @@ class MainActivity : ComponentActivity() {
             }
         }.start()
         startJarvisBackgroundService()
-        // 1.4.3: startup greeting — the service speaks it once
-        // per service lifetime (ACTION_GREET is a no-op on
-        // repeat); spoken from fixed local lines, LLM bypassed.
-        sendServiceAction(JarvisForegroundService.ACTION_GREET)
+        // 1.4.18: startup greeting REMOVED — no greeting speak
+        // and no greeting chat line; the service starts VAD
+        // immediately when the loop restores.
         // 1.4.3 home-redirect gate: lifecycle markers are
         // PERSISTED (addDiagnostic appends to diagnostics.jsonl),
         // so a post-death report still shows whether the activity
@@ -1984,11 +1983,11 @@ fun AiBrainSettingsScreen(
 
         // B-L12: the old Voice Speech Speed slider is REMOVED —
         // it only ever tuned system TTS, which no longer exists
-        // (Swara build, prosody rate +0%, pitch +0%).
+        // (Swara build, prosody rate +10%, pitch +0%).
         // A slider that saves a dead pref is worse than no slider.
         Text(
             text = "Voice speed: Swara prosody default par bolta hai " +
-                "(rate +0%, pitch +0% — speed slider hataya gaya, wo sirf purani system " +
+                "(rate +10%, pitch +0% — speed slider hataya gaya, wo sirf purani system " +
                 "voice ko control karta tha).",
             fontSize = 13.sp
         )

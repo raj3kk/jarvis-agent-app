@@ -202,8 +202,10 @@ private fun tsOf(line: String): String {
  * process markers exist (fresh install / first run), false.
  * Self-clearing: a skipped greeting writes NO GREET_START, so
  * the next launch's previous slice cannot trip again — the
- * breaker fires for exactly ONE launch, then normal greeting
- * resumes (see speakGreeting).
+ * breaker fires for exactly ONE launch. 1.4.18: the greeting
+ * is removed, so no new GREET_START is ever written and this
+ * detection is retained dead-but-harmless (it can no longer
+ * trip on a fresh launch).
  */
 fun wasLastDeathDuringGreetingSpeak(): Boolean {
     val lines = JarvisDiagnosticsFile.readLast(300)
