@@ -272,7 +272,9 @@ object JarvisStateRepository {
         out = out.replace(Regex("(?i)Token\\s+[A-Za-z0-9._\\-]{16,}"), "Token [redacted]")
         out = out.replace(Regex("(?i)Authorization:\\s*Bearer\\s+[^\\s]+"), "Authorization: Bearer [redacted]")
         out = out.replace(Regex("JARVIS-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}"), "[licence-redacted]")
-        out = out.replace(Regex("(?i)(api[_-]?key|deepgram[_-]?key|password|passwd|secret|auth[_-]?token)\\s*[:=]\\s*[^\\s,;]+"), "$1=[redacted]")
+        out = out.replace(Regex("(?i)(api[_-]?key|deepgram[_-]?key|password|passwd|secret|auth[_-]?token|github[_-]?pat|supabase[_-]?pat|supabase[_-]?project[_-]?ref|vercel[_-]?token)\\s*[:=]\\s*[^\\s,;]+"), "$1=[redacted]")
+        out = out.replace(Regex("ghp_[A-Za-z0-9]{16,}"), "[github-pat-redacted]")
+        out = out.replace(Regex("sbp_[A-Za-z0-9]{16,}"), "[supabase-pat-redacted]")
         out = out.replace(Regex("(?i)(/(?:token|key|auth)/)[^/\\s]+"), "$1[redacted]")
         return out.take(500)
     }
@@ -403,6 +405,16 @@ object JarvisStateRepository {
 
     fun setWakeListening(listening: Boolean) {
         _wakeListening.value = listening
+    }
+
+    private val _planState = MutableStateFlow<PlanView?>(null)
+    val planState: StateFlow<PlanView?> = _planState.asStateFlow()
+
+    /** 1.4.21 Agent Mode: publishes the current plan snapshot for
+     *  the plan card and the FGS notification. Set ONLY by the
+     *  plan executor / store load; null = no plan. */
+    fun setPlanState(view: PlanView?) {
+        _planState.value = view
     }
 
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())

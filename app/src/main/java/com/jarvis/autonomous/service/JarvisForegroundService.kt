@@ -28,6 +28,7 @@ import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.TestVoiceStageTracker
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.clearStaleBounceReport
@@ -882,6 +883,13 @@ class JarvisForegroundService : Service() {
                 }
             }
         }
+
+        // 1.4.21 Agent Mode: resume a persisted plan after service
+        // recreation / app kill (verify-before-re-run lives in the
+        // executor; this is one call, after the mic restore and
+        // before setForegroundRunning). Silent when nothing is
+        // resumable; never throws.
+        agentEngine.resumePersistedPlanIfAny()
 
         JarvisStateRepository.setForegroundRunning(true)
         JarvisStateRepository.addLog("Jarvis Foreground Service started.")
@@ -1856,6 +1864,27 @@ class JarvisForegroundService : Service() {
     }
 
     private fun buildNotification(statusText: String): Notification {
+        // 1.4.21 Agent Mode: while a plan runs, the notification
+        // shows the current plan step instead of the generic
+        // listening line (visual only, no sound/vibration change).
+        // The text is derived from the repository plan flow at
+        // build time, so every re-issue of the notification picks
+        // up the latest step; a completed plan falls back to the
+        // passed-in status text.
+        val planView = JarvisStateRepository.planState.value
+        val effectiveStatusText = if (planView != null && !planView.completed) {
+            val current = planView.steps.firstOrNull { it.state == PlanState.RUNNING }
+                ?: planView.steps.firstOrNull { it.state == PlanState.BLOCKED }
+                ?: planView.steps.firstOrNull { it.state == PlanState.PENDING }
+            if (current != null) {
+                val idx = planView.steps.indexOf(current) + 1
+                "Jarvis — Plan $idx/${planView.steps.size}: ${current.title}"
+            } else {
+                statusText
+            }
+        } else {
+            statusText
+        }
         val openAppIntent = PendingIntent.getActivity(
             this,
             0,
@@ -1915,7 +1944,7 @@ class JarvisForegroundService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_jarvis_core)
             .setContentTitle("JARVIS AI Autonomous Agent")
-            .setContentText(statusText)
+            .setContentText(effectiveStatusText)
             .setOngoing(true)
             .setContentIntent(openAppIntent)
             .addAction(0, "🎙️ Speak", listenIntent)

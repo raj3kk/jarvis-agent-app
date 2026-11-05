@@ -66,6 +66,10 @@ class JarvisAgentEngine(
     private val llmClient = LlmClient(context, prefs)
     private val learnedRoutineStore = LearnedRoutineStore(context)
     private val memoryIndex = MemoryIndex(context)
+    // 1.4.21 Agent Mode: planner + executor, owned by the engine
+    // (same ownership shape as llmClient above). Lazy so the
+    // executor receives a fully-constructed engine.
+    private val planExecutor: AgentPlanExecutor by lazy { AgentPlanExecutor(this) }
     private var activeTaskJob: Job? = null
     // 1.4.14 (D1): announce dedupe — in-memory only, dies with
     // process death, never persisted. Key = trimmed sender +
@@ -248,7 +252,10 @@ class JarvisAgentEngine(
 
     // ---- A-C2 hard pre-execution gate (code, never prompt text) ----
 
-    private enum class GateOutcome { ALLOW, BLOCK_STEP, PAUSE_TASK, ABORT_TASK }
+    // 1.4.21: internal (was private) so the Agent Mode executor can
+    // route needsGate plan steps through this SAME gate — no second
+    // gate implementation exists.
+    internal enum class GateOutcome { ALLOW, BLOCK_STEP, PAUSE_TASK, ABORT_TASK }
 
     private val PAY_SEND_KEYWORDS = listOf(
         "pay", "payment", "upi", "checkout", "place order", "confirm order",
@@ -333,6 +340,70 @@ class JarvisAgentEngine(
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, reason)
         JarvisStateRepository.setCurrentGoal("")
         JarvisStateRepository.addLog(reason)
+    }
+
+    // ---- 1.4.21 Agent Mode (planner trigger, resume, executor access) ----
+
+    /** Frozen trigger (§3h): goal names GitHub / Supabase / Vercel /
+     *  deploy, or the user says "agent mode" (Latin or
+     *  transliterated Devanagari — the same transliteration the
+     *  stop-command check uses). */
+    private fun isAgentModeCommand(goal: String): Boolean {
+        val lower = TurnDetector.transliterateDevanagariKeywords(goal.lowercase())
+        return lower.contains("github") || lower.contains("supabase") ||
+            lower.contains("vercel") || lower.contains("deploy") ||
+            lower.contains("agent mode")
+    }
+
+    /** Called once from JarvisForegroundService.onCreate, after the
+     *  mic-restore block: resumes a persisted plan after service
+     *  recreation / app kill. Never throws — the executor's resume
+     *  is defensive and a failure is a diagnostic, not a crash. */
+    fun resumePersistedPlanIfAny() {
+        scope.launch {
+            runCatching { planExecutor.resumePersistedPlan() }.onFailure { e ->
+                JarvisStateRepository.addDiagnostic(
+                    "plan", "RESUME_ERROR",
+                    "Plan resume fail hua: ${e.javaClass.simpleName}: ${(e.message ?: "").take(120)}"
+                )
+            }
+        }
+    }
+
+    // Internal accessors for AgentPlanExecutor only. The executor
+    // never reaches into engine privates directly; every crossing
+    // is one of these named functions.
+    internal fun planLlm(): LlmClient = llmClient
+    internal fun planPrefs(): JarvisPreferences = prefs
+    internal fun planContext(): Context = context
+    internal suspend fun planSpeak(text: String): Boolean = speak(text)
+    internal suspend fun planAsk(prompt: String): String? = askUserVoice(prompt)
+    internal fun planIsOnline(): Boolean = isOnline()
+    internal suspend fun planExecuteDecision(d: AgentDecision): String =
+        executeDecisionAction(d, JarvisAccessibilityService.instance)
+    internal fun planLastBuildWritten(): Boolean = lastBuildWritten
+    internal fun planLastBuildValidation(): ProjectStore.ProjectValidation? = lastBuildValidation
+    internal fun planLastBuildProject(): String = lastBuildProject
+    internal suspend fun planCheckGate(d: AgentDecision): Pair<GateOutcome, String> =
+        checkExecutionGate(d, false)
+    internal fun planAnsweredClarifications(): MutableList<String> = answeredClarifications
+    internal fun planRecordClarification(entry: String) {
+        answeredClarifications.add(entry)
+        while (answeredClarifications.size > 12) answeredClarifications.removeAt(0)
+    }
+    internal fun planRestoreClarifications(entries: List<String>) {
+        answeredClarifications.clear()
+        answeredClarifications.addAll(entries.takeLast(12))
+    }
+    internal fun planIsDecline(reply: String): Boolean = isDeclineReply(reply)
+    internal fun planIsYes(reply: String): Boolean =
+        isYesReply(reply) || isAffirmativeReply(reply.lowercase())
+    internal fun planMemoryIndex(): MemoryIndex = memoryIndex
+    internal fun planPersistChat() = persistChat()
+    internal fun planClearTaskState() = clearTaskScopedState()
+    internal fun planLaunch(job: suspend () -> Unit) {
+        activeTaskJob?.cancel()
+        activeTaskJob = scope.launch { job() }
     }
 
     /**
@@ -832,6 +903,22 @@ class JarvisAgentEngine(
             matchedRoutine.actionPrompt
         } else {
             trimmed
+        }
+
+        // 1.4.21 Agent Mode: the planner runs when the goal names
+        // an external destination (GitHub / Supabase / Vercel /
+        // deploy) or the user says "agent mode". Everything else
+        // keeps the existing runAutonomousLoop path untouched — a
+        // plain "website banao" stays on the 1.4.20 builder loop.
+        // Custom routines (above) and no-AI routines win first, so
+        // "github kholo" still opens the app, not a plan.
+        if (isAgentModeCommand(effectiveGoal)) {
+            clearTaskScopedState()
+            activeTaskJob?.cancel()
+            activeTaskJob = scope.launch {
+                planExecutor.startNewPlan(effectiveGoal)
+            }
+            return
         }
 
         // Memory-first consult before the LLM loop: past turns

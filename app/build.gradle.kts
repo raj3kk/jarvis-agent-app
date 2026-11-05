@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
-        versionName = "1.4.20-PRO"
+        versionCode = 29
+        versionName = "1.4.21-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
@@ -150,6 +150,14 @@ dependencies {
     // Coroutines & Networking
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // 1.4.21 Agent Mode: encrypted storage for write-capable
+    // provider tokens (GitHub PAT / Supabase PAT / Vercel token).
+    // EncryptedSharedPreferences (MasterKey AES256_GCM) — the ONLY
+    // new dependency in this build. If it ever fails to resolve,
+    // the build FAILS loudly; there is deliberately NO fallback
+    // to plain SharedPreferences for these tokens.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // Sherpa-ONNX (Silero VAD only in 1.4.12) — AAR is downloaded in CI,
     // never committed (37 MB, would bloat the repo). The workflow

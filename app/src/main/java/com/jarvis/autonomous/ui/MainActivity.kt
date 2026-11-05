@@ -114,8 +114,12 @@ import com.jarvis.autonomous.BuildConfig
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.LlmClient
 import com.jarvis.autonomous.agent.LocalLlmManager
+import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
+import com.jarvis.autonomous.data.AgentSecrets
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
+import com.jarvis.autonomous.data.PlanState
+import com.jarvis.autonomous.data.PlanView
 import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.data.AiProvider
@@ -171,6 +175,14 @@ class MainActivity : ComponentActivity() {
         JarvisStateRepository.setSwaraEnabled(JarvisPreferences(this).swaraEnabled)
         Thread {
             runCatching { JarvisStateRepository.loadPersistedDiagnostics() }
+        }.start()
+        // 1.4.21 Agent Mode: seed the plan card from the persisted
+        // plan file so it is correct even before the service resume
+        // runs (same background-thread pattern as diagnostics).
+        Thread {
+            runCatching {
+                AgentPlanStore.load(this)?.let { JarvisStateRepository.setPlanState(it.toView()) }
+            }
         }.start()
         // 1.4.4 out-of-app report: detection + file write ALSO run
         // here on a background thread — NOT only from the Command
@@ -564,6 +576,8 @@ fun CommandCenterScreen(
     val playbackState by JarvisStateRepository.playbackState.collectAsState()
     val currentGoal by JarvisStateRepository.currentGoal.collectAsState()
     val stepInfo by JarvisStateRepository.currentStepInfo.collectAsState()
+    // 1.4.21 Agent Mode: persisted plan snapshot for the plan card.
+    val planState by JarvisStateRepository.planState.collectAsState()
     val isAccConnected by JarvisStateRepository.isAccessibilityConnected.collectAsState()
     val chatHistory by JarvisStateRepository.chatHistory.collectAsState()
     // 1.4.2: terminal mic death banner state (service-written).
@@ -1063,6 +1077,15 @@ fun CommandCenterScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // 1.4.21 Agent Mode: plan card, directly under the
+        // telemetry card — title + numbered steps with states and
+        // one-line evidence. Reads the repository plan flow; null
+        // = no plan, no card.
+        if (planState != null) {
+            PlanCard(plan = planState!!)
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         // Whiteboard entry point (1.4.0): overlay permission is
         // NEVER bypassed — without it the system permission screen
         // opens; with it the floating board service starts.
@@ -1193,6 +1216,70 @@ fun CommandCenterScreen(
                     imageVector = if (textInput.isNotBlank()) Icons.Default.Send else Icons.Default.Mic,
                     contentDescription = "Send or Speak",
                     tint = Color.White
+                )
+            }
+        }
+    }
+}
+
+// 1.4.21 Agent Mode: plan card (Command tab, under the telemetry
+// card). Same Card style as the telemetry card. Terse Hinglish,
+// same voice as the app: title, numbered steps, per-step state +
+// one-line evidence. Silent progress is visual only — this card
+// (plus chat lines) is where a running plan is seen.
+@Composable
+fun PlanCard(plan: PlanView) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC)),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                text = "Plan: ${plan.goal}",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFB85C38),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            plan.steps.forEachIndexed { index, step ->
+                val (mark, markColor) = when (step.state) {
+                    PlanState.DONE -> "DONE ✓" to Color(0xFF2E7D5B)
+                    PlanState.RUNNING -> "RUNNING ▶" to Color(0xFFB85C38)
+                    PlanState.FAILED -> "FAILED ✗" to Color(0xFFB3261E)
+                    PlanState.BLOCKED -> "BLOCKED ⏸" to Color(0xFFB3261E)
+                    PlanState.SKIPPED -> "SKIPPED –" to Color.Gray
+                    PlanState.PENDING -> "PENDING …" to Color.Gray
+                }
+                Text(
+                    text = "${index + 1}. ${step.title} — $mark",
+                    fontSize = 12.sp,
+                    fontWeight = if (step.state == PlanState.RUNNING) FontWeight.Bold else FontWeight.SemiBold,
+                    color = Color(0xFF3B2F2A)
+                )
+                val subLine = when {
+                    step.state == PlanState.DONE && step.evidence.isNotBlank() -> step.evidence
+                    step.state == PlanState.RUNNING && step.detail.isNotBlank() -> step.detail
+                    step.state == PlanState.FAILED && step.evidence.isNotBlank() -> step.evidence
+                    step.state == PlanState.BLOCKED && step.evidence.isNotBlank() -> step.evidence
+                    else -> ""
+                }
+                if (subLine.isNotBlank()) {
+                    Text(
+                        text = subLine,
+                        fontSize = 11.sp,
+                        color = markColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            if (plan.completed) {
+                Text(
+                    text = "Plan complete — naya plan shuru karne ke liye dobara bolo.",
+                    fontSize = 11.sp,
+                    color = Color(0xFF2E7D5B)
                 )
             }
         }
@@ -2198,6 +2285,231 @@ fun AiBrainSettingsScreen(
                     if (dgResult.isNotBlank()) {
                         Text(dgResult, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
+                }
+            }
+        }
+
+        // 1.4.21 Agent Mode — Connected accounts: GitHub PAT,
+        // Supabase PAT + project ref, Vercel token. Tokens live in
+        // EncryptedSharedPreferences ("jarvis_agent_secrets") —
+        // NEVER in plain prefs, never in the APK, never logged.
+        // Fields are local remember state until THIS section's own
+        // SAVE button persists them (same save-gate rule as the
+        // settings above — flipping/editing alone changes
+        // nothing). Each Test button returns a status string only
+        // — never the token. Each field carries a one-line
+        // "where to get it" hint with minimal scopes.
+        run {
+            val agentContext = LocalContext.current
+            val agentScope = rememberCoroutineScope()
+            var githubPat by remember {
+                mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_GITHUB_PAT) }.getOrDefault(""))
+            }
+            var showGithubPat by remember { mutableStateOf(false) }
+            var githubSaved by remember {
+                mutableStateOf(runCatching { AgentSecrets.has(agentContext, AgentSecrets.KEY_GITHUB_PAT) }.getOrDefault(false))
+            }
+            var githubTest by remember { mutableStateOf("") }
+            var githubBusy by remember { mutableStateOf(false) }
+            var supabasePat by remember {
+                mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_SUPABASE_PAT) }.getOrDefault(""))
+            }
+            var showSupabasePat by remember { mutableStateOf(false) }
+            var supabaseSaved by remember {
+                mutableStateOf(runCatching { AgentSecrets.has(agentContext, AgentSecrets.KEY_SUPABASE_PAT) }.getOrDefault(false))
+            }
+            var supabaseRef by remember {
+                mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_SUPABASE_PROJECT_REF) }.getOrDefault(""))
+            }
+            var supabaseRefSaved by remember {
+                mutableStateOf(runCatching { AgentSecrets.has(agentContext, AgentSecrets.KEY_SUPABASE_PROJECT_REF) }.getOrDefault(false))
+            }
+            var supabaseTest by remember { mutableStateOf("") }
+            var supabaseBusy by remember { mutableStateOf(false) }
+            var vercelToken by remember {
+                mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_VERCEL_TOKEN) }.getOrDefault(""))
+            }
+            var showVercelToken by remember { mutableStateOf(false) }
+            var vercelSaved by remember {
+                mutableStateOf(runCatching { AgentSecrets.has(agentContext, AgentSecrets.KEY_VERCEL_TOKEN) }.getOrDefault(false))
+            }
+            var vercelTest by remember { mutableStateOf("") }
+            var vercelBusy by remember { mutableStateOf(false) }
+            var agentSaveBanner by remember { mutableStateOf("") }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Agent Mode — Connected accounts", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(
+                        text = "Agent Mode (website → GitHub → Supabase → Vercel) ke liye tokens yahan daalo. " +
+                            "Tokens encrypted save hote hain, kabhi dikhaye ya log nahi hote. " +
+                            "Koi step bina token ke nahi chalega — pehle yahan Save karo.",
+                        fontSize = 12.sp
+                    )
+                    // GitHub PAT
+                    Text("GitHub PAT", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        text = "Kahan se milega: GitHub Settings → Developer settings → Personal access tokens (fine-grained) — Contents read+write, sirf un repos par jo tum naam doge.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                    OutlinedTextField(
+                        value = githubPat,
+                        onValueChange = { githubPat = it },
+                        label = { Text("GitHub Personal Access Token", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        visualTransformation = if (showGithubPat) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showGithubPat = !showGithubPat }) {
+                                Text(if (showGithubPat) "Hide" else "Show", fontSize = 11.sp)
+                            }
+                        }
+                    )
+                    Text(
+                        text = "Saved: ${if (githubSaved) "yes" else "NO — token daalo aur SAVE dabao"}",
+                        fontSize = 12.sp
+                    )
+                    Button(
+                        enabled = !githubBusy,
+                        onClick = {
+                            githubBusy = true
+                            githubTest = "Testing…"
+                            agentScope.launch(Dispatchers.IO) {
+                                githubTest = AgentSecrets.testGithub(agentContext)
+                                githubBusy = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Test GitHub", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (githubTest.isNotBlank()) {
+                        Text(githubTest, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    // Supabase PAT + project ref
+                    Text("Supabase PAT + project ref", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        text = "Kahan se milega: Supabase Dashboard → Account → Access Tokens (PAT) + project ref Project Settings se. Tables sirf usi project me banengi — naya project nahi banega.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                    OutlinedTextField(
+                        value = supabasePat,
+                        onValueChange = { supabasePat = it },
+                        label = { Text("Supabase Personal Access Token", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        visualTransformation = if (showSupabasePat) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showSupabasePat = !showSupabasePat }) {
+                                Text(if (showSupabasePat) "Hide" else "Show", fontSize = 11.sp)
+                            }
+                        }
+                    )
+                    OutlinedTextField(
+                        value = supabaseRef,
+                        onValueChange = { supabaseRef = it },
+                        label = { Text("Supabase project ref", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    Text(
+                        text = "Saved: PAT ${if (supabaseSaved) "yes" else "NO"} · ref ${if (supabaseRefSaved) "yes" else "NO"}",
+                        fontSize = 12.sp
+                    )
+                    Button(
+                        enabled = !supabaseBusy,
+                        onClick = {
+                            supabaseBusy = true
+                            supabaseTest = "Testing…"
+                            agentScope.launch(Dispatchers.IO) {
+                                supabaseTest = AgentSecrets.testSupabase(agentContext)
+                                supabaseBusy = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Test Supabase", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (supabaseTest.isNotBlank()) {
+                        Text(supabaseTest, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    // Vercel token
+                    Text("Vercel token", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        text = "Kahan se milega: Vercel Settings → Tokens — full-account token (project banane ke liye isse narrow scope nahi hota).",
+                        fontSize = 11.sp,
+                        color = Color(0xFF8A7A70)
+                    )
+                    OutlinedTextField(
+                        value = vercelToken,
+                        onValueChange = { vercelToken = it },
+                        label = { Text("Vercel token", fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        visualTransformation = if (showVercelToken) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showVercelToken = !showVercelToken }) {
+                                Text(if (showVercelToken) "Hide" else "Show", fontSize = 11.sp)
+                            }
+                        }
+                    )
+                    Text(
+                        text = "Saved: ${if (vercelSaved) "yes" else "NO — token daalo aur SAVE dabao"}",
+                        fontSize = 12.sp
+                    )
+                    Button(
+                        enabled = !vercelBusy,
+                        onClick = {
+                            vercelBusy = true
+                            vercelTest = "Testing…"
+                            agentScope.launch(Dispatchers.IO) {
+                                vercelTest = AgentSecrets.testVercel(agentContext)
+                                vercelBusy = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Test Vercel", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (vercelTest.isNotBlank()) {
+                        Text(vercelTest, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Button(
+                        onClick = {
+                            runCatching {
+                                AgentSecrets.put(agentContext, AgentSecrets.KEY_GITHUB_PAT, githubPat)
+                                AgentSecrets.put(agentContext, AgentSecrets.KEY_SUPABASE_PAT, supabasePat)
+                                AgentSecrets.put(agentContext, AgentSecrets.KEY_SUPABASE_PROJECT_REF, supabaseRef)
+                                AgentSecrets.put(agentContext, AgentSecrets.KEY_VERCEL_TOKEN, vercelToken)
+                                githubSaved = githubPat.isNotBlank()
+                                supabaseSaved = supabasePat.isNotBlank()
+                                supabaseRefSaved = supabaseRef.isNotBlank()
+                                vercelSaved = vercelToken.isNotBlank()
+                                agentSaveBanner = "Agent Mode accounts saved ✅"
+                            }.onFailure { e ->
+                                agentSaveBanner = "Save fail hua: ${(e.message ?: "").take(120)}"
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85C38))
+                    ) {
+                        Text("SAVE AGENT MODE ACCOUNTS", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (agentSaveBanner.isNotBlank()) {
+                        Text(agentSaveBanner, color = Color(0xFF2E7D5B), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        text = "Note: ye fields edit karne ke baad SAVE dabana zaroori hai — bina Save ke plan purane saved tokens par chalega.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF8A7A70)
+                    )
                 }
             }
         }

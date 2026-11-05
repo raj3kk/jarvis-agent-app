@@ -874,4 +874,208 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             isCompleted = obj.optBoolean("isCompleted", action == "NONE")
         )
     }
+
+    // ---- 1.4.21 Agent Mode: planner (SEPARATE from decideNextStep) ----
+    // planNext / buildPlanPrompt / parsePlanJson are NEW functions
+    // only; decideNextStep, buildSystemPrompt, answerWithLiveSearch
+    // and callGeminiApi are untouched. The planner runs on the
+    // GEMINI chain only (same key, same fallback chain) — NEVER
+    // LOCAL Gemma (the on-device model has no structured-plan path,
+    // same reason as the builder guard above). Other providers get
+    // a plain failure asking for Gemini; the planner does not
+    // branch on provider in 1.4.21. Strict parsing mirrors
+    // parseDecisionJson (A-M2): string-aware brace scan, trailing
+    // content = error, unknown step kind = error, missing
+    // kind/title = error, needsGate defaults false, max 8 steps.
+
+    data class PlanStepDraft(
+        val kind: String,
+        val title: String,
+        val detail: String,
+        val needsGate: Boolean
+    )
+
+    sealed interface PlanResult {
+        data class Planned(val planTitle: String, val steps: List<PlanStepDraft>) : PlanResult
+        data class Failed(val reason: String) : PlanResult
+    }
+
+    class PlanParseException(message: String) : IllegalArgumentException(message)
+
+    suspend fun planNext(
+        goal: String,
+        answeredClarifications: List<String>,
+        recentChat: List<String>
+    ): PlanResult = withContext(Dispatchers.IO) {
+        if (prefs.provider != AiProvider.GEMINI) {
+            return@withContext PlanResult.Failed(
+                "Planner sirf Gemini provider par chalta hai — AI Brain me Gemini chuno, key save karo, phir dobara bolo."
+            )
+        }
+        val apiKey = prefs.apiKey
+        if (apiKey.isBlank()) {
+            JarvisStateRepository.addDiagnostic("llm", "NO_KEY", "API key missing in preferences (planner)")
+            return@withContext PlanResult.Failed(
+                "API key nahi hai — AI Brain me Gemini key daal kar Save karo, phir dobara bolo."
+            )
+        }
+        val prompt = buildPlanPrompt(goal, answeredClarifications, recentChat)
+        val systemPrompt = "You are JARVIS, an Android agent planner. " +
+            "Respond ONLY with the plan JSON object described in the user message — " +
+            "no prose, no markdown fences, no explanation."
+        val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
+            .map { it.trim().removePrefix("models/") }
+            .filter { it.isNotBlank() }.distinct()
+        // PLAN retry budget (§3d): 1 re-plan on a parse error, then ask.
+        var attempt = 0
+        while (attempt < 2) {
+            attempt++
+            try {
+                var rawJson: String? = null
+                var lastError: Exception? = null
+                for (candidate in candidates) {
+                    try {
+                        rawJson = callGeminiApi(
+                            apiKey = apiKey,
+                            model = candidate,
+                            systemPrompt = systemPrompt,
+                            userPrompt = prompt
+                        )
+                        break
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (e: Exception) {
+                        lastError = e
+                        if (candidate == candidates.last()) throw e
+                        if (isNonRetryableLlmError(e)) throw e
+                    }
+                }
+                return@withContext parsePlanJson(
+                    rawJson ?: throw (lastError ?: IllegalStateException("No model responded"))
+                )
+            } catch (e: PlanParseException) {
+                if (attempt >= 2) {
+                    JarvisStateRepository.addDiagnostic("llm", "PLAN_PARSE", (e.message ?: "").take(200))
+                    return@withContext PlanResult.Failed(
+                        "Plan JSON dobara bhi gadbad aaya (${(e.message ?: "").take(150)}). Goal dobara simple shabdon me bolo."
+                    )
+                }
+                // else: one re-plan retry.
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                val detail = (e.message ?: "Unknown error").take(200)
+                JarvisStateRepository.addDiagnostic("llm", "PLAN_ERROR", detail)
+                return@withContext PlanResult.Failed("Planner error: $detail")
+            }
+        }
+        PlanResult.Failed("Planner se plan nahi bana — dobara koshish karo.")
+    }
+
+    private fun buildPlanPrompt(
+        goal: String,
+        answeredClarifications: List<String>,
+        recentChat: List<String>
+    ): String {
+        return buildString {
+            appendLine("USER GOAL (Agent Mode — multi-step plan banao):")
+            appendLine(goal)
+            appendLine()
+            if (answeredClarifications.isNotEmpty()) {
+                appendLine("ALREADY ANSWERED (never re-ask — inhe plan me use karo):")
+                answeredClarifications.takeLast(12).forEach { appendLine("- $it") }
+                appendLine()
+            }
+            if (recentChat.isNotEmpty()) {
+                appendLine("RECENT CONVERSATION (project/repo naam yahin se mil sakta hai):")
+                recentChat.takeLast(6).forEach { appendLine("- $it") }
+                appendLine()
+            }
+            appendLine("WEBSITE BUILD CHECKLIST (BUILD step ke liye — har website build par ye checklist lagti hai, user dobara details nahi dega):")
+            appendLine(WebsiteBuildSpec.CHECKLIST_TEXT)
+            appendLine()
+            appendLine("PLAN RULES (strict — inhe todna plan reject kar dega):")
+            appendLine("1. Output SIRF ek JSON object ho, is schema me (no prose, no fences):")
+            appendLine("{ \"planTitle\": \"short title\", \"steps\": [ { \"kind\": \"BUILD|GITHUB_PUSH|SUPABASE_TABLES|VERCEL_DEPLOY|HTTP_CHECK\", \"title\": \"short\", \"detail\": \"...\", \"needsGate\": false } ] }")
+            appendLine("2. Steps 1 se 8 ke beech — zyada steps ho to plan ko chhota rakho, silently truncate mat karo.")
+            appendLine("3. Step kinds sirf ye 5 allowed hain: BUILD (website banao — existing builder checklist ke saath), GITHUB_PUSH (code GitHub repo me push karo), SUPABASE_TABLES (built backend/schema.sql se tables banao), VERCEL_DEPLOY (GitHub repo se Vercel deploy karo), HTTP_CHECK (ek URL check karo). Koi aur kind mat likho.")
+            appendLine("4. Order dependency ka dhyaan rakho: BUILD pehle, phir GITHUB_PUSH, phir SUPABASE_TABLES, phir VERCEL_DEPLOY. Vercel deploy ke liye GitHub push DONE hona zaroori hai — uske bina Vercel step mat rakho.")
+            appendLine("5. detail me har step ke liye zaroori naam likho, is format me: BUILD -> \"project=<project-name>; <site kaisa ho, ek line>\"; GITHUB_PUSH -> \"repo=<repo-name>\" (user ne naam diya ho to wahi, nahi diya to \"repo=?\"); SUPABASE_TABLES -> \"project=<project-name>\"; VERCEL_DEPLOY -> \"project=<project-name>; repo=<owner>/<repo>\" (repo pata ho to); HTTP_CHECK -> \"url=<full-url> marker=<expected text>\".")
+            appendLine("6. Naam KABHI invent mat karo: repo naam, project naam, table naam user ne diya ho ya conversation me ho to wahi use karo — nahi ho to \"repo=?\" / project poochne ke liye detail me likho, khud ka naam mat gadh lo.")
+            appendLine("7. needsGate=true set karo jab step paise kharch kare, kuch delete kare, login/2FA maange, ya kisi existing non-empty project ko overwrite kare — us step se pehle user se poocha jayega.")
+            appendLine("8. Phone par koi backend server nahi chalta — backend files (backend/server.js, backend/schema.sql) deploy ke liye generate hoti hain, phone par run hone ka daava mat karo.")
+            appendLine("9. Goal me sirf website banani ho (koi GitHub/Supabase/Vercel/deploy shabd na ho) to BUILD step hi rakho — deploy steps mat jodo.")
+        }
+    }
+
+    private fun parsePlanJson(raw: String): PlanResult {
+        val cleaned = raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        val start = cleaned.indexOf('{')
+        if (start < 0) throw PlanParseException("Model reply me JSON object nahi mila")
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var end = -1
+        for (i in start until cleaned.length) {
+            val c = cleaned[i]
+            if (inString) {
+                if (escaped) escaped = false
+                else if (c == '\\') escaped = true
+                else if (c == '"') inString = false
+                continue
+            }
+            when (c) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        end = i
+                        break
+                    }
+                }
+            }
+        }
+        if (end < 0) throw PlanParseException("Model plan JSON adhoora/truncated hai")
+        val trailing = cleaned.substring(end + 1).trim().removePrefix("```").trim()
+        if (trailing.isNotEmpty()) {
+            throw PlanParseException("Model reply me ek se zyada JSON object mile (merge) — partial plan nahi liya")
+        }
+        val obj = try {
+            JSONObject(cleaned.substring(start, end + 1))
+        } catch (e: Exception) {
+            throw PlanParseException("Model plan JSON parse nahi hua: ${e.message}")
+        }
+        val planTitle = obj.optString("planTitle", "").trim()
+        val stepsArr = obj.optJSONArray("steps")
+            ?: throw PlanParseException("Plan me 'steps' array nahi mila")
+        if (stepsArr.length() == 0) throw PlanParseException("Plan me koi step nahi hai")
+        if (stepsArr.length() > 8) throw PlanParseException("Plan me 8 se zyada steps hain (${stepsArr.length()}) — chhota plan banao")
+        val allowedKinds = setOf(
+            "PLAN", "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK"
+        )
+        val steps = mutableListOf<PlanStepDraft>()
+        for (i in 0 until stepsArr.length()) {
+            val stepObj = stepsArr.optJSONObject(i)
+                ?: throw PlanParseException("Step ${i + 1} JSON object nahi hai")
+            val kind = stepObj.optString("kind", "").trim().uppercase()
+            if (kind.isBlank()) throw PlanParseException("Step ${i + 1} me 'kind' missing hai")
+            if (kind !in allowedKinds) throw PlanParseException("Step ${i + 1} ka kind unknown hai: $kind")
+            val title = stepObj.optString("title", "").trim()
+            if (title.isBlank()) throw PlanParseException("Step ${i + 1} me 'title' missing hai")
+            steps.add(
+                PlanStepDraft(
+                    kind = kind,
+                    title = title,
+                    detail = stepObj.optString("detail", "").trim(),
+                    needsGate = stepObj.optBoolean("needsGate", false)
+                )
+            )
+        }
+        return PlanResult.Planned(planTitle = planTitle, steps = steps)
+    }
 }
