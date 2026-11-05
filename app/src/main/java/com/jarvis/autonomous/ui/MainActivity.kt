@@ -221,8 +221,9 @@ class MainActivity : ComponentActivity() {
         }.start()
         startJarvisBackgroundService()
         // 1.4.18: startup greeting REMOVED — no greeting speak
-        // and no greeting chat line; the service starts VAD
-        // immediately when the loop restores.
+        // and no greeting chat line; the service starts the
+        // system-mic loop immediately when the loop restores
+        // (VAD removed in 1.4.23-PRO).
         // 1.4.3 home-redirect gate: lifecycle markers are
         // PERSISTED (addDiagnostic appends to diagnostics.jsonl),
         // so a post-death report still shows whether the activity

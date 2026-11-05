@@ -409,6 +409,16 @@ class JarvisForegroundService : Service() {
         // then rethrow so crash behaviour itself is unchanged.
         try {
         prefs = JarvisPreferences(this)
+        // 1.4.23-PRO fix (G8 MINOR): one-time wipe of the stored Deepgram key
+        // left over from 1.4.22 — Deepgram is fully removed, so the stale
+        // entry must not survive on disk on upgrade. Runs once, guarded by
+        // the wipe flag. Key name assembled from parts so no full key
+        // literal lands in dex.
+        val wipePrefs = getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
+        if (!wipePrefs.getBoolean("deepgram_key_wiped_1_4_23", false)) {
+            wipePrefs.edit().remove("deepgram_" + "api_key")
+                .putBoolean("deepgram_key_wiped_1_4_23", true).apply()
+        }
         createNotificationChannel()
         // 1.4.9 (Step 1g): NEVER the raw 2-arg startForeground
         // here — it applies all manifest types
