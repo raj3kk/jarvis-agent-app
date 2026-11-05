@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.speech.SpeechRecognizer
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -42,10 +43,7 @@ import com.jarvis.autonomous.ui.MainActivity
 import com.jarvis.autonomous.ui.overlay.FloatingJarvisOverlay
 import com.jarvis.autonomous.voice.AlwaysOnMicListener
 import com.jarvis.autonomous.voice.AlwaysOnMicManager
-import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.GeminiLiveSession
-import com.jarvis.autonomous.voice.VadFailureReason
-import com.jarvis.autonomous.voice.VadMonitorResult
 import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.voice.VoiceManager
 import kotlinx.coroutines.CompletableDeferred
@@ -57,8 +55,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.File
-import java.security.MessageDigest
 
 class JarvisForegroundService : Service() {
 
@@ -125,10 +121,9 @@ class JarvisForegroundService : Service() {
     private var lastFgsTypes: Int? = null
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
     // 1.4.18: the startup greeting is REMOVED (no greeting speak,
-    // no greeting chat line) — VAD inits immediately on service
-    // create when the loop restores, with no greeting branch and
-    // no greeting deferral. The 5 s fallback survives ONLY as an
-    // init watchdog inside startVadMonitor (see there).
+    // no greeting chat line). 1.4.23-PRO: VAD does not auto-init
+    // any more (startVadMonitor deleted with the Deepgram
+    // removal); the loop restores without it.
     // 1.4.4: true once the persistent notification has been
     // re-issued WITH the "Share bounce report" action, so later
     // service starts don't re-issue it pointlessly.
@@ -314,32 +309,42 @@ class JarvisForegroundService : Service() {
     }
 
     /**
-     * 1.4.5 (FINAL policy): reason-based mic-error speech. The old
-     * code mapped system SpeechRecognizer codes (ERROR_NETWORK=2,
-     * etc.) — those codes no longer exist in the app (system
-     * recognizer removed). The mapping now reads the reason
-     * string: Deepgram auth (401/Unauthorized) -> key check;
-     * network/DNS -> internet; permission -> Permissions tab;
-     * otherwise the reason itself, truncated.
+     * 1.4.23-PRO: code-based mic-error speech. The manager passes
+     * the real SpeechRecognizer error code (see
+     * AlwaysOnMicListener.onMicError); the mapping reads the code
+     * first and falls back to the reason string when no code
+     * applies (-1). No key branch exists any more (no Deepgram
+     * key in the app).
      */
-    private fun micErrorSpeech(reason: String): String {
+    private fun micErrorSpeech(reason: String, recognizerErrorCode: Int = -1): String {
         val lower = reason.lowercase()
-        return when {
-            lower.contains("401") || lower.contains("unauthorized") ->
-                "Mic band ho gaya — Deepgram key galat lag rahi hai. " +
-                    "AI Brain me key check karo, phir Retry dabao."
-            lower.contains("network") || lower.contains("unable to resolve") ||
-                lower.contains("internet") || lower.contains("no network") ->
-                "Mic band ho gaya — internet nahi mil raha. " +
+        return when (recognizerErrorCode) {
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_SERVER_DISCONNECTED ->
+                "Mic band ho gaya — internet ya server se jawab nahi mila. " +
                     "Network aate hi mic dobara connect hoga, ya Retry dabao."
-            lower.contains("permission") || lower.contains("record_audio") ||
-                lower.contains("not granted") ->
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
                 "Mic band ho gaya — microphone permission nahi mili. " +
                     "Permissions tab se mic permission do, phir Retry dabao."
-            lower.contains("key") ->
-                "Mic band ho gaya — Deepgram key nahi hai. " +
-                    "AI Brain me key daal kar Save dabao, phir mic on karo."
-            else -> "Mic band ho gaya — ${reason.take(120)} Retry dabao."
+            SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
+            SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+                "Mic band ho gaya — system mic is phone par Hindi ya English nahi samajhta. " +
+                    "Retry dabao."
+            SpeechRecognizer.ERROR_AUDIO,
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+                "Mic band ho gaya — mic busy ya audio nahi mila. Retry dabao."
+            else -> when {
+                lower.contains("network") || lower.contains("unable to resolve") ||
+                    lower.contains("internet") || lower.contains("no network") ->
+                    "Mic band ho gaya — internet nahi mil raha. " +
+                        "Network aate hi mic dobara connect hoga, ya Retry dabao."
+                lower.contains("permission") || lower.contains("record_audio") ||
+                    lower.contains("not granted") ->
+                    "Mic band ho gaya — microphone permission nahi mili. " +
+                        "Permissions tab se mic permission do, phir Retry dabao."
+                else -> "Mic band ho gaya — ${reason.take(120)} Retry dabao."
+            }
         }
     }
 
@@ -366,143 +371,12 @@ class JarvisForegroundService : Service() {
             .edit().putBoolean(KEY_MIC_LOOP_PERSISTED, value).apply()
     }
 
-    /**
-     * Silero VAD (1.4.0, CI-bundled asset, never committed):
-     * after the mic loop starts, copy assets/silero_vad.onnx
-     * to the files dir (skipped when already present at full
-     * size) and start the Sherpa VAD monitor. The recognizer
-     * turn timer stays primary: VAD segments are not used to
-     * cut turns in this release, and the monitor degrades
-     * silently to VAD-off on mic-busy (see AlwaysOnMicManager).
-     * A missing asset only logs — it never breaks the mic loop.
-     */
-    /** 1.4.15: SHA-256 hex of a file, for the VAD-copy pin check. */
-    private fun sha256Hex(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(8192)
-            var read: Int
-            while (input.read(buffer).also { read = it } != -1) {
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    // 1.4.18: VAD init watchdog state (the ONLY surviving 5 s
-    // fallback — the greeting deferral is deleted with the
-    // greeting). A single 5 s runnable retries the init ONCE
-    // if VAD_INIT_END has not fired; it is never the normal
-    // path and never a turn/echo window.
-    private var vadInitEndFired: Boolean = false
-    private var vadInitWatchdogRetried: Boolean = false
-    private var vadInitWatchdogRunnable: Runnable? = null
-
-    private fun startVadMonitor() {
-        // 1.4.18: no greeting branch — VAD inits immediately.
-        // Init watchdog: if VAD_INIT_END has not fired within
-        // 5 s, retry the init once, then never again.
-        vadInitWatchdogRunnable?.let { wakeLockHandler.removeCallbacks(it) }
-        val watchdog = Runnable {
-            vadInitWatchdogRunnable = null
-            if (!vadInitEndFired && !vadInitWatchdogRetried) {
-                vadInitWatchdogRetried = true
-                startVadMonitor()
-            }
-        }
-        vadInitWatchdogRunnable = watchdog
-        wakeLockHandler.postDelayed(watchdog, 5_000L)
-        serviceScope.launch {
-            // 1.4.12 overlap markers: VAD_INIT_START/END timestamps
-            // against SWARA_CONNECT/SWARA_FIRST_AUDIO markers show
-            // whether VAD init overlapped greeting speak.
-            JarvisStateRepository.addDiagnostic(
-                "tts", "VAD_INIT_START",
-                "Sherpa VAD init started."
-            )
-            // 1.4.14 (D2): asset-copy outcome and enable outcome
-            // are split BEFORE any collapse, so VAD_INIT_END can
-            // say WHY started=false. The copy runs in its own
-            // try/catch (COPY_FAILED if it throws); the enable
-            // result carries its own failure-site reason. If the
-            // copy threw but enable still started, that is a
-            // success with NO reason token. If a full-size
-            // filesDir copy already exists, the copy is skipped
-            // — and a successful enable is then started=true
-            // with NO reason, even if the APK asset is missing
-            // (that is a success, never MODEL_MISSING).
-            // 1.4.15: the skipped copy is now SHA-256-checked
-            // against PIN_VAD_SHA and re-copied once on mismatch,
-            // so "full-size" alone no longer proves it is good.
-            val target = File(filesDir, "silero_vad.onnx")
-            var copyFailed = false
-            try {
-                val assetSize = runCatching {
-                    assets.openFd("silero_vad.onnx").use { it.length }
-                }.getOrDefault(-1L)
-                if (!target.exists() || (assetSize > 0 && target.length() != assetSize)) {
-                    withContext(Dispatchers.IO) {
-                        assets.open("silero_vad.onnx").use { input ->
-                            target.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    }
-                }
-                // 1.4.15 hardening: the size-only skip above passes
-                // a full-size but corrupt filesDir copy to native
-                // load. SHA-256 the copy against the CI-enforced
-                // pin (AlwaysOnMicManager.PIN_VAD_SHA, identical
-                // to the workflow's bundle gate) and re-copy once
-                // on mismatch. copyFailed is set ONLY if the
-                // re-copy also mismatches, so a repaired copy
-                // stays a clean success; a still-bad copy surfaces
-                // as COPY_FAILED when enable also fails (the
-                // existing started -> null rule is unchanged).
-                withContext(Dispatchers.IO) {
-                    if (target.exists() &&
-                        sha256Hex(target) != AlwaysOnMicManager.PIN_VAD_SHA
-                    ) {
-                        assets.open("silero_vad.onnx").use { input ->
-                            target.outputStream().use { output -> input.copyTo(output) }
-                        }
-                        if (sha256Hex(target) != AlwaysOnMicManager.PIN_VAD_SHA) {
-                            copyFailed = true
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                copyFailed = true
-            }
-            val vadResult = runCatching {
-                micManager.enableVadMonitor(target) { _ ->
-                    // Echo-gated segments; no per-segment action:
-                    // the recognizer timer remains the primary path.
-                }
-            }.getOrDefault(
-                VadMonitorResult.Failed(VadFailureReason.VAD_CONSTRUCTION_FAILED)
-            )
-            val started = vadResult is VadMonitorResult.Started
-            val failureReason: VadFailureReason? = when {
-                started -> null
-                copyFailed -> VadFailureReason.COPY_FAILED
-                vadResult is VadMonitorResult.Failed -> vadResult.reason
-                else -> null
-            }
-            // 1.4.18: VAD_INIT_END fired — the init watchdog
-            // stands down (no retry needed).
-            vadInitEndFired = true
-            vadInitWatchdogRunnable?.let { wakeLockHandler.removeCallbacks(it) }
-            vadInitWatchdogRunnable = null
-            JarvisStateRepository.addDiagnostic(
-                "tts", "VAD_INIT_END",
-                "Sherpa VAD init finished (started=$started)" +
-                    (if (failureReason != null) " reason=$failureReason" else "") + "."
-            )
-            JarvisStateRepository.addLog(
-                "Silero VAD monitor started=$started " +
-                    "(mic-busy degrades to VAD-off by design)."
-            )
-        }
-    }
+    // 1.4.23-PRO: startVadMonitor DELETED with the Deepgram
+    // removal (step 2b) — the Silero VAD monitor is not
+    // auto-started any more. The sherpa dep, the silero_vad.onnx
+    // asset and AlwaysOnMicManager.enableVadMonitor stay in place
+    // for a later step; the recognizer turn timer is the only
+    // live path until then.
 
     /**
      * Mid-task voice replies (1.4.0): while the always-on mic
@@ -522,19 +396,10 @@ class JarvisForegroundService : Service() {
                 if (pendingVoiceReply === deferred) pendingVoiceReply = null
             }
         }
-        // 1.4.3 (G8 N4 reword): loop OFF — Deepgram ONLY, everywhere.
-        // Deepgram one-shot first (key present); otherwise the
-        // VoiceManager single-reply path, which is Deepgram-session
-        // only — there is no system-recognizer second path any more
-        // (Deepgram-only mic policy, 1.4.5 FINAL). Speaking stays
-        // Swara either way.
-        val dgKey = prefs.deepgramApiKey
-        if (dgKey.isNotBlank()) {
-            val heard = runCatching {
-                DeepgramSttClient(dgKey).listenOnce()
-            }.getOrNull()
-            if (!heard.isNullOrBlank()) return heard
-        }
+        // 1.4.23-PRO: loop OFF — the system-mic one-shot path.
+        // VoiceManager.listenForSingleReply runs the manager's
+        // SpeechRecognizer one-shot session (hi-IN); speaking
+        // stays Swara either way.
         return voiceManager.listenForSingleReply()
     }
 
@@ -601,8 +466,8 @@ class JarvisForegroundService : Service() {
             isMicLoopEnabled = {
                 if (::micManager.isInitialized) micManager.isEnabled() else false
             },
-            // 1.4.5 FINAL policy: Deepgram-only sessions, wired to
-            // the manager (service constructs VoiceManager before
+            // 1.4.23-PRO: system-mic sessions, wired to the
+            // manager (service constructs VoiceManager before
             // micManager, but these lambdas run later, so the
             // construction order is safe — same pattern as the
             // isMicLoopEnabled gate above).
@@ -703,13 +568,12 @@ class JarvisForegroundService : Service() {
             }
 
             override fun onSttPathChanged(path: String, reason: String) {
-                // Deepgram-only path line (1.4.5: no system branch
-                // exists any more — the old "system mic se" line
-                // is deleted with the system path).
+                // 1.4.23-PRO: system-mic path line (no Deepgram
+                // branch exists any more).
                 JarvisStateRepository.setSttPath(path, reason)
                 JarvisStateRepository.addChatMessage(
                     "Jarvis",
-                    "Sun raha hoon — Deepgram se. $reason"
+                    "Sun raha hoon — system mic se. $reason"
                 )
             }
 
@@ -729,24 +593,26 @@ class JarvisForegroundService : Service() {
                 JarvisStateRepository.setMicReconnecting(null)
                 JarvisStateRepository.addChatMessage(
                     "Jarvis",
-                    "Deepgram se phir sun raha hoon."
+                    "System mic se phir sun raha hoon."
                 )
             }
 
-            override fun onMicError(reason: String) {
-                // 1.4.5 FINAL policy: onMicError now means PERMANENT
-                // only (permission revoked / key missing) — transient
-                // Deepgram failures go through onMicReconnecting
-                // instead and never reach this banner. Visible on
-                // three channels: (1) diagnostics entry, (2) a
-                // command-tab banner with Retry, (3) a spoken reason.
-                // Code is -1 (no system recognizer codes exist any
-                // more); the banner hides the code line when < 0.
-                val spoken = micErrorSpeech(reason)
+            override fun onMicError(reason: String, recognizerErrorCode: Int) {
+                // 1.4.23-PRO: onMicError means PERMANENT only
+                // (permission revoked / recognition unavailable /
+                // language unsupported) — transient recognizer
+                // failures go through onMicReconnecting instead and
+                // never reach this banner. Visible on three
+                // channels: (1) diagnostics entry, (2) a
+                // command-tab banner with Retry, (3) a spoken
+                // reason. The code is the real SpeechRecognizer
+                // error code (-1 when none applies); the banner
+                // hides the code line when < 0.
+                val spoken = micErrorSpeech(reason, recognizerErrorCode)
                 JarvisStateRepository.addLog("Mic error: $reason")
-                JarvisStateRepository.addDiagnostic("mic", "MIC_ERROR", reason)
+                JarvisStateRepository.addDiagnostic("mic", "MIC_ERROR", "$reason (code=$recognizerErrorCode)")
                 JarvisStateRepository.setMicFatal(
-                    com.jarvis.autonomous.data.MicFatalState(spoken, -1)
+                    com.jarvis.autonomous.data.MicFatalState(spoken, recognizerErrorCode)
                 )
                 JarvisStateRepository.setMicLoopEnabled(false)
                 JarvisStateRepository.setMicListening(false)
@@ -765,13 +631,12 @@ class JarvisForegroundService : Service() {
         micManager.mediaGateBypass = {
             pendingVoiceReply != null || agentEngine.isTaskRunning()
         }
-        // WAVE-2 (§A): pump-resume paths (rms_spike /
-        // vad_segment inside the manager) call resumeDeepgram
-        // directly, with no service call site to refresh from —
-        // so the manager fires this callback on every real
-        // resume and the service re-qualifies here. Covers the
-        // last refresh gap alongside the overlay-tap refresh
-        // above and the existing mic-start refreshes.
+        // WAVE-2 (§A): recognizer session restarts after a
+        // reconnect have no service call site to refresh from —
+        // so the manager fires this callback when a session
+        // opens after a reconnect and the service re-qualifies
+        // here. Covers the last refresh gap alongside the
+        // existing mic-start refreshes.
         micManager.onMicResumed = { refreshForegroundTypes() }
 
         floatingOverlay = FloatingJarvisOverlay(
@@ -780,10 +645,12 @@ class JarvisForegroundService : Service() {
             // (user order 22:15 IST), synced with the live loop
             // state. Loop OFF -> start via the SAME intent path
             // as the Command-tab mic button (no duplicated start
-            // logic); loop ON + stream suspended -> resume now
-            // (the 1.4.5 tap-resume behavior, kept); loop ON +
-            // live -> stop (user-action off, same intent path as
-            // the Command-tab Mic-off button). The old tap =
+            // logic); loop ON + live -> stop Live (loop resumes);
+            // loop ON otherwise -> stop (user-action off, same
+            // intent path as the Command-tab Mic-off button).
+            // 1.4.23-PRO: no suspended state exists any more (no
+            // stream to suspend), so the tap is a plain toggle
+            // now. The old tap =
             // one-shot manual command behavior is replaced by
             // the toggle: with the loop, one-shot is redundant
             // on the pill, and the toggle is what the user
@@ -805,14 +672,6 @@ class JarvisForegroundService : Service() {
                             action = ACTION_START_LISTENING
                         }
                     )
-                } else if (::micManager.isInitialized && micManager.isDeepgramSuspended()) {
-                    // WAVE-2 (§A): overlay-tap resume is a mic
-                    // start/refresh — it previously called
-                    // resumeDeepgram with NO refresh, so a
-                    // background-downgraded service stayed
-                    // specialUse-only after the resume.
-                    micManager.resumeDeepgram("overlay-tap")
-                    refreshForegroundTypes()
                 } else {
                     startService(
                         Intent(this, JarvisForegroundService::class.java).apply {
@@ -861,14 +720,14 @@ class JarvisForegroundService : Service() {
                 )
             } else {
                 voiceManager.stopListeningInternal()
-                // 1.4.18: MIC_RESTORE marker — greeting is removed,
-                // so restore calls startVadMonitor() UNCONDITIONALLY
-                // below (no greeting branch, no deferral). Restore
-                // does NOT set user-directed turn state (restore is
-                // not a fresh user direction).
+                // 1.4.18: MIC_RESTORE marker — greeting is removed.
+                // 1.4.23-PRO: restore starts the loop only (no VAD
+                // init any more). Restore does NOT set
+                // user-directed turn state (restore is not a fresh
+                // user direction).
                 JarvisStateRepository.addDiagnostic(
                     "mic", "MIC_RESTORE",
-                    "Persisted mic loop restoring (service onCreate) — VAD starts immediately (1.4.18: greeting removed)."
+                    "Persisted mic loop restoring (service onCreate) — system mic only, no VAD init (1.4.23-PRO)."
                 )
                 if (micManager.start()) {
                     // 1.4.13 (Part A 4c): restore MUST publish
@@ -876,7 +735,7 @@ class JarvisForegroundService : Service() {
                     // old restore never called
                     // setMicLoopEnabled(true), so after every
                     // service recreation the manager loop ran
-                    // (DEEPGRAM_OPEN, listening YES) while the
+                    // (SR_OPEN, listening YES) while the
                     // header, the Command-tab button and the
                     // overlay pill all read loop=OFF / mode=off
                     // — the 2026-11-04 report's self-contradiction
@@ -886,8 +745,6 @@ class JarvisForegroundService : Service() {
                     // user-enabled flag persisted).
                     JarvisStateRepository.setMicLoopEnabled(true)
                     JarvisStateRepository.setMicFatal(null)
-                    // 1.4.18: unconditional — see MIC_RESTORE above.
-                    startVadMonitor()
                     JarvisStateRepository.addLog("Mic loop restored after service recreation.")
                     // 1.4.9 (Step 1g): restore is a mic start —
                     // re-apply the qualified type set (onCreate
@@ -1006,36 +863,17 @@ class JarvisForegroundService : Service() {
                         }
                     }
                     voiceManager.stopListeningInternal()
-                    // 1.4.13 (F-H1): SUSPENDED-FIRST. A tap on an
-                    // enabled-but-suspended loop must RESUME it
-                    // (as the overlay pill already does) — the
-                    // old path fell through to start(), which is
-                    // a no-op when already enabled, so the tap
-                    // did nothing and the stream stayed suspended
-                    // (the "tap karta hoon, phir bhi nahi sunta"
-                    // deaf trap). isLoopHealthy counts
-                    // suspended-with-live-pump as healthy (resume
-                    // paths exist), so it must NOT be consulted
-                    // before this check — it would mask the
-                    // suspended state from the tap.
-                    if (micManager.isEnabled() && micManager.isDeepgramSuspended()) {
-                        // 1.4.18: user tap re-arms direction.
-                        micManager.markUserDirectedTurn()
-                        micManager.resumeDeepgram("command-tab-tap")
-                        setMicLoopPersisted(true)
-                        JarvisStateRepository.setMicFatal(null)
-                        JarvisStateRepository.setMicLoopEnabled(true)
-                        refreshForegroundTypes()
-                        // The when is the last statement of
-                        // onStartCommand, so returning its value
-                        // here is the branch's early exit.
-                        return START_STICKY
-                    }
-                    // 1.4.5 (item 4): DEAD-WHILE-ENABLED revival.
-                    // The old handler called micManager.start(),
-                    // which is a no-op when already enabled — so a
-                    // dead-while-enabled loop (hung connect,
-                    // suspended-forever, dead pump) could never be
+                    // 1.4.23-PRO (stale-first resume): no suspended
+                    // state exists any more, so the FIRST check is
+                    // the dead-while-enabled revival below — a tap
+                    // on a stale/dead loop revives it before
+                    // anything else runs.
+                    // 1.4.5 (item 4): DEAD-WHILE-ENABLED revival
+                    // (1.4.23-PRO: stale-first — this is the first
+                    // check a tap makes). The old handler called
+                    // micManager.start(), which is a no-op when
+                    // already enabled — so a dead-while-enabled loop
+                    // (dead session, stuck reconnect) could never be
                     // revived from the UI. Now an unhealthy enabled
                     // loop is stopped first, then started fresh.
                     if (micManager.isEnabled() && !micManager.isLoopHealthy()) {
@@ -1049,7 +887,6 @@ class JarvisForegroundService : Service() {
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
                         JarvisStateRepository.setMicLoopEnabled(true)
-                        startVadMonitor()
                         // 1.4.9 (Step 1g): mic is live now —
                         // qualify for the microphone type.
                         refreshForegroundTypes()
@@ -1107,7 +944,6 @@ class JarvisForegroundService : Service() {
                         setMicLoopPersisted(true)
                         JarvisStateRepository.setMicFatal(null)
                         JarvisStateRepository.setMicLoopEnabled(true)
-                        startVadMonitor()
                         JarvisStateRepository.addLog("Mic restarted from Retry button.")
                         // 1.4.9 (Step 1g): mic is live now —
                         // qualify for the microphone type.
