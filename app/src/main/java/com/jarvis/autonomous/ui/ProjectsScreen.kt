@@ -685,5 +685,6 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         } // close editor scroll column
+        } // close else block (Editor mode)
     }
 }

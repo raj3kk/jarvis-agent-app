@@ -624,7 +624,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                             if (uri.isNotBlank()) {
                                 sources.add(
                                     LiveSource(
-                                        title = web.optString("title", uri),
+                                        title = web?.optString("title", uri) ?: uri,
                                         uri = uri
                                     )
                                 )
