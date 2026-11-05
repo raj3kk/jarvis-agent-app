@@ -41,13 +41,13 @@ import kotlin.coroutines.resume
  * gone: OFF means "system voice speaks", never silence).
  * Never for a first/second failure, never silently
  * (TTS_FALLBACK_USED + latch card name the voice that spoke).
- * 1.4.5 FINAL MIC POLICY (user order 2026-11-03 ~19:36 IST):
- * system SpeechRecognizer is REMOVED ENTIRELY — loop, one-shot,
- * wake-word, everywhere. Listening is Deepgram ONLY, via the
+ * 1.4.23-PRO MIC POLICY (Item 1 staged; SUPERSEDES the 1.4.5
+ * Deepgram-only policy): listening is the system SpeechRecognizer
+ * ONLY — loop, one-shot, wake-word, everywhere — via the
  * AlwaysOnMicManager session lambdas wired by the service
  * ([startWakeSession]/[stopWakeSession]/[listenOnceSession]/
- * [cancelListenOnceSession]). The old "System STT below is
- * UNTOUCHED" note is DEAD: there is no system STT left here.
+ * [cancelListenOnceSession]). No API key, no websocket, no
+ * per-minute cost.
  *
  * If Swara is unavailable, [speakAndWait] returns false and logs a
  * clear message — UNLESS the Swara latch is active (or this
@@ -92,10 +92,10 @@ class VoiceManager(
      */
     private val isMicLoopEnabled: () -> Boolean = { false },
     /**
-     * 1.4.5 FINAL policy wiring (service -> AlwaysOnMicManager):
-     * Deepgram-only wake/one-shot sessions. Defaults are no-ops
-     * so unit callers without a service keep compiling; the
-     * service MUST wire all four, or listening never starts.
+     * 1.4.23-PRO policy wiring (service -> AlwaysOnMicManager):
+     * system-recognizer wake/one-shot sessions. Defaults are
+     * no-ops so unit callers without a service keep compiling;
+     * the service MUST wire all four, or listening never starts.
      */
     private val startWakeSession: (((String) -> Unit) -> Unit) = { },
     private val stopWakeSession: (() -> Unit) = { },
@@ -427,7 +427,7 @@ class VoiceManager(
         // static stop handle — a barge-in cut during a fallback
         // utterance stops it here instead of letting it play
         // out (its old tts.stop() fired only on internal
-        // timeout). Deepgram listening is untouched by design.
+        // timeout). Mic listening is untouched by design.
         SystemTtsFallbackSpeaker.stop()
     }
 
@@ -515,7 +515,7 @@ class VoiceManager(
             // ran; this block only listens, without stopping.
             suspendCancellableCoroutine { cont ->
             mainHandler.post {
-                // Deepgram-only single shot (1.4.5): stop any wake
+                // System-recognizer single shot (1.4.23-PRO): stop any wake
                 // session first (one mic owner), then listen once.
                 stopWakeSession()
                 pendingSingleReplyCallback = { recognizedText ->
@@ -562,7 +562,7 @@ class VoiceManager(
                     AgentRunState.LISTENING,
                     "Listening... बोलो भाई क्या करना है?"
                 )
-                // Deepgram-only single shot (1.4.5): wake session
+                // System-recognizer single shot (1.4.23-PRO): wake session
                 // stops first — one mic owner at a time.
                 stopWakeSession()
                 pendingSingleReplyCallback = { text ->
@@ -587,9 +587,9 @@ class VoiceManager(
     }
 
     /**
-     * Deepgram-only wake-word listening (1.4.5 FINAL policy).
+     * System-recognizer wake-word listening (1.4.23-PRO policy).
      * Pref + RECORD_AUDIO + loop-off gate, then the manager's
-     * continuous Deepgram session. Finals arrive via the session
+     * continuous system recognizer session. Finals arrive via the session
      * callback; [matchWakeTrigger] decides (start/bare only);
      * non-matches are ignored and the session KEEPS running.
      * On a match the session stops first (one mic owner), then
@@ -641,7 +641,7 @@ class VoiceManager(
 
     fun stopListeningInternal() {
         mainHandler.post {
-            // Deepgram-only teardown (1.4.5): stop the wake session
+            // System-recognizer teardown (1.4.23-PRO): stop the wake session
             // and cancel any one-shot; complete any pending single
             // reply as cancelled so a stale reply never swallows
             // the next command.

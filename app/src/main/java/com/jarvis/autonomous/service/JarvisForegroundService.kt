@@ -121,8 +121,8 @@ class JarvisForegroundService : Service() {
     private var lastFgsTypes: Int? = null
     private var pendingVoiceReply: CompletableDeferred<String?>? = null
     // 1.4.18: the startup greeting is REMOVED (no greeting speak,
-    // no greeting chat line). 1.4.23-PRO: VAD does not auto-init
-    // any more (startVadMonitor deleted with the Deepgram
+    // no greeting chat line). 1.4.23-PRO: no VAD auto-init any
+    // more (the VAD monitor was deleted with the Deepgram
     // removal); the loop restores without it.
     // 1.4.4: true once the persistent notification has been
     // re-issued WITH the "Share bounce report" action, so later
@@ -180,7 +180,7 @@ class JarvisForegroundService : Service() {
 
     /**
      * 1.4.0 echo gate: EVERY speak goes through here so the
-     * mic manager's VAD ignores Jarvis's own voice (setSpeaking
+     * mic manager quarantines Jarvis's own voice (setSpeaking
      * true/false around playback), except the barge-in keywords
      * "ruk"/"bas" which still stop speech via the callback below.
      */
@@ -371,12 +371,10 @@ class JarvisForegroundService : Service() {
             .edit().putBoolean(KEY_MIC_LOOP_PERSISTED, value).apply()
     }
 
-    // 1.4.23-PRO: startVadMonitor DELETED with the Deepgram
-    // removal (step 2b) — the Silero VAD monitor is not
-    // auto-started any more. The sherpa dep, the silero_vad.onnx
-    // asset and AlwaysOnMicManager.enableVadMonitor stay in place
-    // for a later step; the recognizer turn timer is the only
-    // live path until then.
+    // 1.4.23-PRO step 2c: the VAD monitor is fully removed —
+    // the VAD engine dep, the model asset, the workflow VAD
+    // steps/gate and the manager's VAD enable function are all
+    // gone. The recognizer turn timer is the only live path.
 
     /**
      * Mid-task voice replies (1.4.0): while the always-on mic
@@ -411,20 +409,6 @@ class JarvisForegroundService : Service() {
         // then rethrow so crash behaviour itself is unchanged.
         try {
         prefs = JarvisPreferences(this)
-        // 1.4.23-PRO step 2a (Item 1 staged): one-time wipe of the
-        // stored Deepgram key. The Deepgram client is deleted and
-        // the key property is gone from JarvisPreferences, so any
-        // key saved on the phone is cleared once here and never
-        // read again. Same SharedPreferences file ("jarvis_agent_prefs")
-        // and key ("deepgram_api_key") the property used; guarded
-        // by a flag so it runs a single time.
-        val wipePrefs = getSharedPreferences("jarvis_agent_prefs", MODE_PRIVATE)
-        if (!wipePrefs.getBoolean("deepgram_key_wiped_1_4_23", false)) {
-            wipePrefs.edit()
-                .remove("deepgram_api_key")
-                .putBoolean("deepgram_key_wiped_1_4_23", true)
-                .apply()
-        }
         createNotificationChannel()
         // 1.4.9 (Step 1g): NEVER the raw 2-arg startForeground
         // here — it applies all manifest types

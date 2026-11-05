@@ -32,7 +32,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (29 = 1.4.21-PRO) — BUMP THIS FLOOR ON
+      # last delivered vc (30 = 1.4.22-PRO) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,10 +41,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=29, previous delivered 1.4.21-PRO)"
+          echo "versionCode in tree: $VC (floor PREV_VC=30, previous delivered 1.4.22-PRO)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=29
+          PREV_VC=30
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
@@ -98,35 +98,6 @@ jobs:
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
 
-      # Sherpa-ONNX AAR for Silero VAD (never committed):
-      # downloaded fresh each build, size-checked (37,631,864 bytes).
-      - name: Download Sherpa-ONNX AAR (Silero VAD engine)
-        run: |
-          mkdir -p app/libs
-          curl -sL -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-static-link-onnxruntime-1.13.4.aar
-          ls -lh app/libs/sherpa-onnx.aar
-          test $(stat -c%s app/libs/sherpa-onnx.aar) -eq 37631864
-
-
-      # Silero VAD model — BUNDLED IN CI, NEVER COMMITTED:
-      # same pattern as the old bundle steps. URL verified
-      # 2026-11-03 via HEAD before use: HTTP 200,
-      # application/octet-stream, 643,854 bytes, from the
-      # sherpa-onnx asr-models release (also referenced by
-      # sherpa-onnx's own flutter/wasm VAD examples). The exact
-      # byte check below fails loudly if GitHub ever serves a
-      # different build, instead of silently shipping it.
-      - name: Bundle Silero VAD model asset (CI-only, never committed)
-        run: |
-          set -e
-          mkdir -p app/src/main/assets
-          curl -sL -o app/src/main/assets/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-          VAD_BYTES=$(stat -c%s app/src/main/assets/silero_vad.onnx)
-          echo "Silero VAD bytes: $VAD_BYTES (expected 643854)"
-          test "$VAD_BYTES" -eq 643854
-          # 1.4.12: VAD hash pin (mirrored in code as AlwaysOnMicManager PIN_VAD_*).
-          test "$(sha256sum app/src/main/assets/silero_vad.onnx | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
-
       - name: Build Debug & Release APK
         # Owner's HF token (read-only Gemma-download token) goes into
         # BuildConfig.HF_TOKEN so the end user enters no token. The
@@ -170,21 +141,9 @@ jobs:
           # 1.4.12 NEGATIVE gate: the release APK must NOT
           # carry any bundled voice-model assets (Swara is
           # cloud-only — no assets/kokoro/ any more).
-          # 1.4.5 (item 7): IN-APK hash check — defense in depth
-          # (bundle source vs shipped bytes): extract the APK's
-          # assets and verify exact sizes + SHA-256 of what
-          # actually SHIPS, against the same pins (VAD only now).
           for APK in app/build/outputs/apk/release/*.apk; do
-            echo "Checking no bundled voice assets + VAD in $APK"
+            echo "Checking no bundled voice assets in $APK"
             if unzip -l "$APK" | grep -qE "assets/kokoro/"; then echo "FAIL: bundled voice assets present in $APK"; exit 1; fi
-            # 1.4.0 gate: the release APK MUST carry the bundled Silero VAD model.
-            unzip -l "$APK" | grep -F "assets/silero_vad.onnx" || (echo "MISSING bundled Silero VAD model in $APK"; exit 1)
-            APK_TMP=$(mktemp -d)
-            unzip -p "$APK" "assets/silero_vad.onnx" > "$APK_TMP/silero_vad.onnx"
-            test "$(stat -c%s "$APK_TMP/silero_vad.onnx")" -eq 643854
-            test "$(sha256sum "$APK_TMP/silero_vad.onnx" | cut -d' ' -f1)" = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
-            echo "In-APK asset sizes + hashes verified for $APK"
-            rm -rf "$APK_TMP"
           done
 
       - name: Rename release APK to Jarvis2026.apk

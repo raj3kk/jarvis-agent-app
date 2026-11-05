@@ -120,7 +120,6 @@ import com.jarvis.autonomous.data.AgentSecrets
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanView
-import com.jarvis.autonomous.voice.DeepgramSttClient
 import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
@@ -902,10 +901,10 @@ fun CommandCenterScreen(
                         fontSize = 12.sp,
                         color = Color(0xFF3B2F2A)
                     )
-                    // 1.4.5 (item 4/6): Deepgram-only errors carry
-                    // code -1 (no system recognizer codes exist any
-                    // more) — showing "-1" would be noise, so the
-                    // line is hidden when code < 0.
+                    // 1.4.23-PRO: mic errors carry the real system
+                    // recognizer code (see MicFatalState); -1 means
+                    // no code applies — showing "-1" would be noise,
+                    // so the line is hidden when code < 0.
                     if (micFatal!!.code >= 0) {
                         Text(
                             text = "Recognizer error code: ${micFatal!!.code}",
@@ -1560,13 +1559,6 @@ fun AiBrainSettingsScreen(
     var selectedProvider by remember { mutableStateOf(prefs.provider) }
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
-    // 1.4.3: Deepgram STT key (listening only — speaking stays
-    // Swara). Saved by the same SAVE button.
-    // 1.4.5 FINAL policy: empty = CANNOT LISTEN (system fallback
-    // REMOVED entirely — no fallback exists any more). Never
-    // displayed, never logged.
-    var deepgramKey by remember { mutableStateOf(prefs.deepgramApiKey) }
-    var showDeepgramKey by remember { mutableStateOf(false) }
     var modelName by remember { mutableStateOf(prefs.modelName) }
     var hfToken by remember { mutableStateOf(prefs.hfToken) }
     var languageMode by remember { mutableStateOf(prefs.languageMode) }
@@ -1909,30 +1901,6 @@ fun AiBrainSettingsScreen(
             singleLine = true
         )
 
-        // 1.4.3: Deepgram STT key — SUNNE ke liye (transcription),
-        // bolne ke liye NAHI (bolna hamesha Swara).
-        // 1.4.5 FINAL policy: key khaali ho to mic bilkul nahi
-        // chalega (system fallback REMOVED — koi fallback nahi).
-        OutlinedTextField(
-            value = deepgramKey,
-            onValueChange = { deepgramKey = it },
-            label = { Text("Deepgram API Key (sunne ke liye, STT only)") },
-            placeholder = { Text("Paste Deepgram key here — bina iske mic nahi chalega (koi fallback nahi)") },
-            visualTransformation = if (showDeepgramKey) VisualTransformation.None else PasswordVisualTransformation(),
-            trailingIcon = {
-                Text(
-                    text = if (showDeepgramKey) "HIDE" else "SHOW",
-                    fontSize = 11.sp,
-                    color = Color(0xFFB85C38),
-                    modifier = Modifier
-                        .padding(end = 10.dp)
-                        .clickable { showDeepgramKey = !showDeepgramKey }
-                )
-            },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
         // Model Input
         OutlinedTextField(
             value = modelName,
@@ -2081,17 +2049,9 @@ fun AiBrainSettingsScreen(
 
         Button(
             onClick = {
-                // 1.4.5 (item 4): capture the OLD Deepgram key
-                // BEFORE writing — a key change while the loop runs
-                // must restart the loop with the new key (the old
-                // code only sent ACTION_REFRESH_OVERLAY, which
-                // refreshes the overlay, NOT the loop — so the new
-                // key had no effect until a restart).
-                val oldDeepgramKey = prefs.deepgramApiKey
                 prefs.provider = selectedProvider
                 prefs.hfToken = hfToken
                 prefs.apiKey = apiKey
-                prefs.deepgramApiKey = deepgramKey
                 prefs.modelName = modelName
                 prefs.languageMode = languageMode
                 prefs.personaPrompt = personaPrompt
@@ -2134,31 +2094,6 @@ fun AiBrainSettingsScreen(
                         aiBrainContext.startForegroundService(liveIntent)
                     } else {
                         aiBrainContext.startService(liveIntent)
-                    }
-                }
-                // 1.4.5 (item 4): key-change restart — only when the
-                // key actually changed AND the loop is live (the
-                // repository flag is the live-loop signal). RETRY
-                // always stops first, then starts, so it restarts
-                // with the new key even when enabled. Loop not live
-                // -> nothing (next start uses the new key). Blank
-                // new key while live -> RETRY restarts into the
-                // no-key fatal banner path (visible, not silent).
-                if (deepgramKey.trim() != oldDeepgramKey.trim() &&
-                    JarvisStateRepository.micLoopEnabled.value
-                ) {
-                    JarvisStateRepository.addDiagnostic(
-                        "stt", "KEY_CHANGED_RESTART",
-                        "Deepgram key changed while loop live — restarting loop with the new key."
-                    )
-                    val retryIntent = Intent(
-                        aiBrainContext,
-                        JarvisForegroundService::class.java
-                    ).apply { action = JarvisForegroundService.ACTION_RETRY_MIC }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        aiBrainContext.startForegroundService(retryIntent)
-                    } else {
-                        aiBrainContext.startService(retryIntent)
                     }
                 }
                 saveBanner = "Settings Saved & Applied Successfully ✅"
@@ -2235,56 +2170,6 @@ fun AiBrainSettingsScreen(
                         fontSize = 11.sp,
                         color = Color(0xFF8A7A70)
                     )
-                }
-            }
-        }
-
-        // 1.4.3: Deepgram key test — Gemini Test-key pattern par:
-        // ek cheap WS handshake, result VERBATIM (HTTP code +
-        // message). Key kabhi dikhayi nahi jaati. Bina Save ke
-        // test purani saved key par chalega (upar wala note).
-        run {
-            val testContext = LocalContext.current
-            val testScope = rememberCoroutineScope()
-            var dgResult by remember { mutableStateOf("") }
-            var dgBusy by remember { mutableStateOf(false) }
-            val sttPath by JarvisStateRepository.sttPath.collectAsState()
-            val sttReason by JarvisStateRepository.sttPathReason.collectAsState()
-            val lastScript by JarvisStateRepository.lastTranscriptScript.collectAsState()
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Deepgram STT (sunna) — saved state", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    Text(
-                        text = "STT path: $sttPath · $sttReason · Last transcript script: $lastScript · " +
-                            "Key saved: ${if (prefs.deepgramApiKey.isNotBlank()) "yes" else "NO — mic nahi chalega, key daalo aur SAVE dabao"}",
-                        fontSize = 12.sp
-                    )
-                    Button(
-                        enabled = !dgBusy,
-                        onClick = {
-                            dgBusy = true
-                            dgResult = "Testing…"
-                            testScope.launch(Dispatchers.IO) {
-                                val key = prefs.deepgramApiKey
-                                dgResult = if (key.isBlank()) {
-                                    "Deepgram key saved nahi hai — pehle key daalo aur SAVE dabao."
-                                } else {
-                                    DeepgramSttClient(key).testAuth()
-                                }
-                                dgBusy = false
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
-                    ) {
-                        Text("Test Deepgram key", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-                    if (dgResult.isNotBlank()) {
-                        Text(dgResult, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    }
                 }
             }
         }

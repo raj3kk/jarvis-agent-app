@@ -4,10 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -21,19 +18,6 @@ import android.speech.SpeechRecognizer
 import androidx.core.content.ContextCompat
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.JarvisStateRepository
-import com.k2fsa.sherpa.onnx.SileroVadModelConfig
-import com.k2fsa.sherpa.onnx.SpeechSegment
-import com.k2fsa.sherpa.onnx.Vad
-import com.k2fsa.sherpa.onnx.getVadModelConfig
-import java.io.File
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * S1 — Always-on mic loop (JarvisAgentApp 1.4.0).
@@ -66,9 +50,7 @@ import kotlinx.coroutines.withContext
  * wake-word listening (service stops it before [start] and only
  * restarts it when the loop is not enabled), so two recognizers
  * never fight over the mic. The recognizer loop below is
- * session-gated by [start]/[stop]; the optional VAD monitor
- * likewise only segments while a session is active, because
- * the coordinator only starts it after [start].
+ * session-gated by [start]/[stop].
  *
  * PRIMARY PATH — recognizer-only turn timer. Turn end comes from
  * [TurnDetector] (silence + completeness), never from the
@@ -78,12 +60,6 @@ import kotlinx.coroutines.withContext
  * kill the session. Partial results accumulate into
  * [TurnDetector]'s rolling buffer across restarts (see its
  * onPartial new-session append rule).
- *
- * OPTIONAL PATH — Sherpa VAD (see [SherpaVadMonitor]). It is OFF
- * by default, needs a silero_vad.onnx model file the coordinator
- * supplies, and NEVER breaks the primary path: any VAD failure
- * (missing model, native error, mic-busy) silently disables the
- * monitor and the recognizer timer carries on.
  *
  * STT LANGUAGE — Hinglish code-switch: the recognizer starts in
  * hi-IN (primary). If a whole recognizer session ends with NO
@@ -95,10 +71,9 @@ import kotlinx.coroutines.withContext
  *
  * ECHO GATE (S1 echo amendment): while Jarvis speaks, [isSpeaking]
  * is true. Two gates apply, and they are different paths:
- * - VAD: [SherpaVadMonitor] DROPS audio frames while speaking and
- *   calls Vad.reset() the moment speaking stops, so Jarvis's own
- *   voice never becomes a "user segment". Segmenting resumes only
- *   on fresh post-TTS audio.
+ * - Echo gating lives in the recognizer transcript path below
+ *   (barge-in scan + quarantine + echo-fingerprint stack) — no
+ *   VAD segmenter exists any more (removed 1.4.23-PRO step 2c).
  * - Recognizer transcripts during TTS are still scanned, but ONLY
  *   for a barge-in ([BargeInDetector]): a leading "ruk"/"ruko"/
  *   "bas"/"chup"/"stop" (loud when RMS is known, echo-guarded
@@ -135,8 +110,7 @@ import kotlinx.coroutines.withContext
  *
  * THREADING: turn checks use [mainHandler]; SpeechRecognizer
  * callbacks arrive on the main thread (the recognizer is created
- * on it). Task work never runs here. The VAD loop runs on
- * [vadScope] (IO).
+ * on it). Task work never runs here.
  *
  * PERMISSIONS (audited, see INTEGRATION_NOTES_Mic.md): the
  * manifest already declares RECORD_AUDIO, FOREGROUND_SERVICE (+
@@ -147,33 +121,6 @@ import kotlinx.coroutines.withContext
  * foreground service is running, and must prompt the battery
  * exemption on first enable (see [buildBatteryExemptionIntent]).
  */
-/**
- * 1.4.14 (D2): WHY a VAD init failed — diagnostics tokens only,
- * never paths, exception text, or message content. The reason is
- * set atomically where the failure is detected (Sherpa init /
- * enable), never recomputed later by the coordinator, because
- * mic state can change between start() success and the enable
- * call. COPY_FAILED is a coordinator-side bucket (asset copy
- * threw) — the mic manager never returns it; the foreground
- * service records it from its own copy try/catch.
- */
-enum class VadFailureReason {
-    MODEL_MISSING,
-    VAD_CONSTRUCTION_FAILED,
-    LOOP_OFF,
-    COPY_FAILED
-}
-
-/**
- * 1.4.14 (D2): enableVadMonitor result. Started carries no
- * reason (success lines stay reason-free); Failed carries the
- * token from the failure site.
- */
-sealed class VadMonitorResult {
-    data object Started : VadMonitorResult()
-    data class Failed(val reason: VadFailureReason) : VadMonitorResult()
-}
-
 class AlwaysOnMicManager(
     context: Context,
     private val listener: AlwaysOnMicListener
@@ -184,11 +131,6 @@ class AlwaysOnMicManager(
     private val appContext: Context = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val turnDetector = TurnDetector()
-    private val vadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    private var vadMonitor: SherpaVadMonitor? = null
-    private var vadJob: Job? = null
-
     private var enabled: Boolean = false
     private var listeningActive: Boolean = false
 
@@ -748,10 +690,9 @@ class AlwaysOnMicManager(
     }
 
     /**
-     * Starts one recognizer session (main thread only): stops any
-     * VAD runLoop first (its AudioRecord would steal the mic),
-     * destroys the previous session's recognizer, creates a fresh
-     * one and calls startListening. The session id increments
+     * Starts one recognizer session (main thread only): destroys
+     * the previous session's recognizer, creates a fresh one and
+     * calls startListening. The session id increments
      * inside stopRecognizerSession BEFORE the destroy, so late
      * callbacks from the old recognizer are ignored. A failed
      * create is a PERMANENT stop (recognition unavailable); a
@@ -763,7 +704,6 @@ class AlwaysOnMicManager(
      */
     private fun startSession() {
         if (!enabled || livePaused) return
-        stopVadLoopOnly()
         stopRecognizerSession()
         sessionStarting = true
         sessionHadTranscript = false
@@ -904,7 +844,6 @@ class AlwaysOnMicManager(
         stopRecognizerSession()
         listeningActive = false
         listener.onListeningStateChanged(false)
-        stopVadMonitor()
         turnDetector.reset()
         resetTurnAssembly()
         listener.onMicError(reason, recognizerErrorCode)
@@ -947,12 +886,11 @@ class AlwaysOnMicManager(
      * not enabled. Order: snapshot first, then cancel the
      * reconnect runnable and set livePaused (so
      * scheduleReconnect()/enterReconnecting() no-op from here
-     * on), stop wake + one-shot, stop only the VAD runLoop
-     * (monitor object + callback kept, NOT released), destroy
-     * the recognizer session (the Live session owns the mic
-     * instead), reset the speaking state (depth=0, quarantine
-     * cleared). No pump to drain any more — the destroy is
-     * synchronous, so the pause cannot fail on a stuck thread.
+     * on), stop wake + one-shot, destroy the recognizer session
+     * (the Live session owns the mic instead), reset the
+     * speaking state (depth=0, quarantine cleared). No pump to
+     * drain any more — the destroy is synchronous, so the pause
+     * cannot fail on a stuck thread.
      * This does NOT change stop()/start() semantics — enabled
      * stays true and language is untouched. A stale partial turn
      * is dropped by turnDetector.reset() + resetTurnAssembly()
@@ -974,7 +912,6 @@ class AlwaysOnMicManager(
         livePaused = true
         stopWakeListening()
         cancelListenOnce()
-        stopVadLoopOnly()
         stopRecognizerSession()
         speakingDepth = 0
         isSpeaking = false
@@ -996,8 +933,8 @@ class AlwaysOnMicManager(
      * backoff reconnect (never a fresh session — the network may
      * still be down); otherwise a fresh startSession(). NEVER
      * calls start() (that would reset turn assembly/language)
-     * and NEVER resets reconnectAttempt. The VAD monitor object
-     * survived the pause, so nothing is re-created. Wake is NOT
+     * and NEVER resets reconnectAttempt. Nothing is re-created
+     * on resume. Wake is NOT
      * restarted here: if the loop is back on, the A-H3 gate
      * forbids wake beside it, and wake ownership sits with
      * VoiceManager. If the loop was stopped mid-Live (mic-off
@@ -1110,8 +1047,8 @@ class AlwaysOnMicManager(
     /**
      * Stops the loop. The ONLY programmatic off switch besides the
      * user's "mic band karo" transcript (handled in [handleTranscript]).
-     * Stops the recognizer and the VAD monitor; does NOT stop the
-     * foreground service itself (coordinator-owned).
+     * Stops the recognizer; does NOT stop the foreground service
+     * itself (coordinator-owned).
      */
     fun stop() {
         if (!enabled && !reconnecting) return
@@ -1137,7 +1074,6 @@ class AlwaysOnMicManager(
         sttPathReason = "stopped"
         listeningActive = false
         listener.onListeningStateChanged(false)
-        stopVadMonitor()
         turnDetector.reset()
         resetTurnAssembly()
     }
@@ -1147,7 +1083,6 @@ class AlwaysOnMicManager(
         stop()
         stopWakeListening()
         cancelListenOnce()
-        vadScope.cancel()
     }
 
     /**
@@ -1166,8 +1101,8 @@ class AlwaysOnMicManager(
     /**
      * Coordinator MUST call this around every speak: true before
      * VoiceManager.speakAndWait, false right after it returns.
-     * False also resets the VAD so stale own-voice audio is dropped
-     * and segmenting resumes on fresh user audio only.
+     * False flushes quarantined transcripts (echo-filtered) so
+     * post-TTS speech forms a turn on fresh user audio only.
      */
     fun setSpeaking(speaking: Boolean, spokenText: String = "") {
         // B-M13: depth-counted — setSpeaking(false) from one
@@ -1195,7 +1130,6 @@ class AlwaysOnMicManager(
             // 1.4.13 (F-E1/F-E5): a new speak supersedes any
             // stopping state left by the previous speak's barge-in.
             speakStopping = false
-            vadMonitor?.pauseForSpeech()
         } else {
             if (speakingDepth > 0) speakingDepth--
             if (speakingDepth > 0) return
@@ -1205,7 +1139,6 @@ class AlwaysOnMicManager(
             // speak coroutine's finally) — the stopping window
             // ends here, and only here, does the gate open.
             speakStopping = false
-            vadMonitor?.resumeAfterSpeech()
             // B-C3: flush quarantined transcripts now, stamped
             // with post-TTS time, so they form a turn only after
             // post-TTS silence — never mid-speech.
@@ -1273,35 +1206,6 @@ class AlwaysOnMicManager(
      */
     fun continueAfterIncompletePrompt() {
         turnDetector.markIncompletePromptSent(System.currentTimeMillis())
-    }
-
-    /**
-     * Opt-in Sherpa VAD monitor. [modelFile] must be a silero_vad.onnx
-     * file (see [SherpaVadMonitor]); if it is missing or VAD setup
-     * fails, this is a no-op and the recognizer timer stays primary.
-     * Call only after [start]; the monitor stops with [stop].
-     * Returns [VadMonitorResult.Started] only if the monitor
-     * actually started; on failure the reason comes from the
-     * failure site (loop-off here, model/construction from
-     * the monitor's own init).
-     */
-    fun enableVadMonitor(modelFile: File, onSegment: (SpeechSegment) -> Unit): VadMonitorResult {
-        if (!enabled) return VadMonitorResult.Failed(VadFailureReason.LOOP_OFF)
-        val monitor = SherpaVadMonitor(appContext, modelFile, onSegment) { isSpeaking }
-        if (!monitor.isAvailable()) {
-            return VadMonitorResult.Failed(
-                monitor.failureReason ?: VadFailureReason.VAD_CONSTRUCTION_FAILED
-            )
-        }
-        stopVadMonitor()
-        vadMonitor = monitor
-        // 1.4.23-PRO: no pump feeds this monitor any more — the
-        // monitor runs its own AudioRecord loop. While the system
-        // recognizer holds the mic that loop degrades to VAD-off
-        // on mic-busy by design (see SherpaVadMonitor); the
-        // recognizer timer stays primary either way.
-        vadJob = vadScope.launch { monitor.runLoop() }
-        return VadMonitorResult.Started
     }
 
     /**
@@ -1869,34 +1773,10 @@ class AlwaysOnMicManager(
         emptySessionFallbackUsed = false
     }
 
-    // Cancels the standalone VAD loop job only, keeping the
-    // vadMonitor itself alive: the monitor object survives a
-    // Live pause / session restart, so a full stopVadMonitor()
-    // here would kill segment detection while listening
-    // continues.
-    private fun stopVadLoopOnly() {
-        vadJob?.cancel()
-        vadJob = null
-    }
-
-    private fun stopVadMonitor() {
-        vadJob?.cancel()
-        vadJob = null
-        runCatching { vadMonitor?.release() }
-        vadMonitor = null
-    }
-
     companion object {
         const val LANGUAGE_PRIMARY_HI_IN: String = "hi-IN"
         const val LANGUAGE_FALLBACK_EN_IN: String = "en-IN"
 
-        /** 1.4.12: Silero VAD model pin — CI mirror of the
-         *  workflow's VAD bundle gate (643,854 bytes). Moved
-         *  here so the pin has a code home now that the old
-         *  voice client's pins are deleted with it. The workflow
-         *  still enforces the same pin independently. */
-        const val PIN_VAD_SIZE: Long = 643_854L
-        const val PIN_VAD_SHA: String = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
         /** 1.4.5: reconnect backoff base + cap (5s, doubling to
          *  30s) — auto-revive runs forever until the user turns
          *  the mic off; only permission / recognition /
@@ -1973,343 +1853,4 @@ interface AlwaysOnMicListener {
 /** Stops whatever TTS engine is currently speaking. Wired by the coordinator to VoiceManager. */
 fun interface StopSpeakingCallback {
     fun stopSpeaking()
-}
-
-/**
- * OPTIONAL Sherpa-ONNX Silero VAD monitor (S1 VAD path).
- *
- * Verified API (sherpa-onnx 1.13.4 AAR, classes.jar inspected with
- * javap): com.k2fsa.sherpa.onnx.Vad(AssetManager?, VadModelConfig)
- * — null AssetManager routes to native newFromFile, non-null
- * routes to newFromAsset (bytecode-verified, 1.4.15).
- * acceptWaveform(FloatArray), isSpeechDetected(), empty(),
- * front(): SpeechSegment(start: Int, samples: FloatArray), pop(),
- * flush(), reset(), release(); VadModelConfig(SileroVadModelConfig,
- * TenVadModelConfig, sampleRate, numThreads, provider, debug);
- * SileroVadModelConfig(model, threshold, minSilenceDuration,
- * minSpeechDuration, windowSize, maxSpeechDuration);
- * getVadModelConfig(type) (top-level function in Vad.kt;
- * 1.4.15 correction: the Int is a MODEL-TYPE SELECTOR, not a
- * sample rate — 0 = Silero. The sample rate stays 16000 from
- * the returned base config. The old "sampleRate" reading was a
- * javap misread: javap shows only the Int type, never the name.
- *
- * HONEST LIMITS — read before enabling:
- * 1. MODEL BUNDLED (1.4.2 correction of a stale comment): CI bundles
- *    assets/silero_vad.onnx into the APK; when [modelFile] exists,
- *    [isAvailable] is true and the VAD monitor runs. The old text
- *    claiming no such file ships was false from 1.4.1 on.
- * 2. MIC SHARING: Android gives the mic to one client at a time in
- *    practice. Running AudioRecord WHILE SpeechRecognizer is
- *    listening can fail (mic busy) or disturb the recognizer.
- *    [runLoop] catches that, marks itself unavailable, and the
- *    recognizer-only timer (the PRIMARY path) is unaffected. Do
- *    not treat VAD as required; treat it as an enhancement that
- *    may be unavailable on a given device.
- * 3. NEVER FAILS THE BUILD OR THE MIC: all native/model work is
- *    inside runCatching; every failure degrades to "VAD off".
- *    (Compile-time: the sherpa AAR is already a declared
- *    dependency for VAD, so these imports add no new dep.)
- * 4. ECHO GATE: while [isSpeaking] is true, frames are DROPPED
- *    (never fed to Vad) and [resumeAfterSpeech] resets Vad, so
- *    Jarvis's own TTS can never be emitted as a user segment.
- *    Segmenting resumes on fresh post-TTS audio only. The loud
- *    "ruk"/"bas" barge-in during TTS is handled by the recognizer
- *    transcript path ([BargeInDetector]), NOT by VAD — VAD alone
- *    cannot recognise keywords.
- * 5. LOW-CPU IDLE BEHAVIOUR: frames below the energy gate
- *    (RMS < 0.005) are never sent to the ONNX model — near-silence
- *    costs an RMS computation, not an inference. Speech frames are
- *    fed in 512-sample (32ms @ 16kHz) slices. This reduces VAD CPU
- *    when idle; it does NOT make always-on listening free (see the
- *    battery note in INTEGRATION_NOTES_Mic.md).
- *
- * VAD segments go to STT only while a session is active: the
- * coordinator starts this monitor only after AlwaysOnMicManager
- * [start], and [stop]/[release] ends it. Wake-word listening is
- * a separate VoiceManager path (word: "Jarvis") that runs only
- * while this loop is off; there is no always-segmenting mode
- * outside an active session.
- */
-class SherpaVadMonitor(
-    context: Context,
-    private val modelFile: File,
-    private val onSegment: (SpeechSegment) -> Unit,
-    private val isSpeaking: () -> Boolean
-) {
-
-    private val appContext: Context = context.applicationContext
-    // A-H10: EVERY Vad touch (feed, front/pop, reset, release)
-    // goes through this lock, so release() can never race the
-    // inference loop's acceptWaveform/front/pop.
-    private val vadLock = Any()
-    private var vad: Vad? = null
-    // AudioRecord lifecycle is owned ONLY by runLoop's IO thread
-    // (create/start/stop/release there, incl. the finally block);
-    // release() below never touches it from the main thread.
-    private var audioRecord: AudioRecord? = null
-    @Volatile
-    private var running: Boolean = false
-    private var pausedForSpeech: Boolean = false
-
-    @Volatile
-    private var available: Boolean = false
-
-    // 1.4.14 (D2): reason for init failure, set atomically in
-    // init — null on success. Model-file-missing is kept
-    // distinct from null-config / Vad(...) throw, which the
-    // old single available flag collapsed together.
-    var failureReason: VadFailureReason? = null
-        private set
-
-    init {
-        failureReason = if (!modelFile.exists()) {
-            VadFailureReason.MODEL_MISSING
-        } else {
-            try {
-                // 1.4.15: getVadModelConfig's Int is a model-type
-                // selector (0 = Silero), NOT a sample rate — the
-                // old SAMPLE_RATE_HZ (16000) argument matched no
-                // branch, returned null on every device, and VAD
-                // never constructed. The sample rate stays 16000
-                // from the returned base config. A null result
-                // means the type selector was unknown — a
-                // construction failure, NOT a missing model
-                // (the file exists; the config could not be built).
-                val baseConfig = getVadModelConfig(0)
-                if (baseConfig == null) {
-                    VadFailureReason.VAD_CONSTRUCTION_FAILED
-                } else {
-                    val config = baseConfig.copy(
-                        sileroVadModelConfig = SileroVadModelConfig(
-                            modelFile.absolutePath,
-                            VAD_THRESHOLD,
-                            VAD_MIN_SILENCE_SEC,
-                            VAD_MIN_SPEECH_SEC,
-                            VAD_WINDOW_SIZE,
-                            VAD_MAX_SPEECH_SEC
-                        )
-                    )
-                    // 1.4.15: null AssetManager = file path. The
-                    // model path here is a filesDir ABSOLUTE path,
-                    // and the Vad constructor routes on it: null
-                    // AssetManager -> native newFromFile (which
-                    // runs config.Validate()); non-null -> native
-                    // newFromAsset, which expects an asset-relative
-                    // name. (Bytecode-verified on the CI AAR: there
-                    // is no single-arg Vad(config) constructor —
-                    // the first CI run failed on exactly that.)
-                    vad = Vad(null, config)
-                    null
-                }
-            } catch (e: Exception) {
-                VadFailureReason.VAD_CONSTRUCTION_FAILED
-            }
-        }
-        available = failureReason == null && vad != null
-        if (!available) {
-            synchronized(vadLock) {
-                runCatching { vad?.release() }
-                vad = null
-            }
-        }
-    }
-
-    fun isAvailable(): Boolean = available && vad != null
-
-    fun isRunning(): Boolean = running
-
-    /** Called by the manager when TTS starts: drop frames until speech ends. */
-    fun pauseForSpeech() {
-        pausedForSpeech = true
-    }
-
-    /** Called by the manager when TTS stops: fresh state, fresh audio only. */
-    fun resumeAfterSpeech() {
-        pausedForSpeech = false
-        synchronized(vadLock) {
-            runCatching { vad?.reset() }
-        }
-    }
-
-    /**
-     * AudioRecord + VAD loop. Runs on the manager's IO scope.
-     * Returns normally on stop/failure; never throws to the caller.
-     * Must be called from a coroutine (it suspends via withContext
-     * only for cleanup ordering; the read loop itself blocks on
-     * AudioRecord.read, which is why it lives on Dispatchers.IO).
-     */
-    suspend fun runLoop() {
-        if (!isAvailable()) return
-        val started = runCatching {
-            val minBuffer = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE_HZ,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minBuffer <= 0) return@runCatching false
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                SAMPLE_RATE_HZ,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBuffer * 2
-            )
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                runCatching { record.release() }
-                return@runCatching false
-            }
-            record.startRecording()
-            if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                // Mic busy (recognizer holds it) or otherwise denied.
-                runCatching { record.stop() }
-                runCatching { record.release() }
-                return@runCatching false
-            }
-            audioRecord = record
-            true
-        }.getOrDefault(false)
-        if (!started) {
-            // Mic-sharing failure: degrade silently to VAD-off.
-            available = false
-            return
-        }
-        running = true
-        try {
-            val shortBuffer = ShortArray(VAD_WINDOW_SIZE * 2)
-            val floatBuffer = FloatArray(VAD_WINDOW_SIZE)
-            while (running) {
-                val record = audioRecord ?: break
-                val read = runCatching {
-                    record.read(shortBuffer, 0, shortBuffer.size)
-                }.getOrDefault(-1)
-                if (read <= 0) {
-                    if (read < 0) break
-                    continue
-                }
-                // Echo gate + pause: drop everything while speaking.
-                if (pausedForSpeech || isSpeaking()) continue
-                // Feed in 512-sample slices, with the energy gate:
-                // near-silent slices skip ONNX inference entirely.
-                var offset = 0
-                while (offset + VAD_WINDOW_SIZE <= read) {
-                    var sumSquares = 0.0
-                    for (i in 0 until VAD_WINDOW_SIZE) {
-                        val sample = shortBuffer[offset + i]
-                        sumSquares += (sample * sample).toDouble()
-                    }
-                    val rms = kotlin.math.sqrt(sumSquares / VAD_WINDOW_SIZE) / 32768.0
-                    if (rms >= ENERGY_GATE_RMS) {
-                        for (i in 0 until VAD_WINDOW_SIZE) {
-                            floatBuffer[i] = shortBuffer[offset + i] / 32768.0f
-                        }
-                        // A-H10: feed + drain under the lock; the
-                        // main-thread dispatch happens OUTSIDE it
-                        // (never hold the lock across a suspend).
-                        val segments = mutableListOf<SpeechSegment>()
-                        synchronized(vadLock) {
-                            val currentVad = vad ?: return@synchronized
-                            runCatching { currentVad.acceptWaveform(floatBuffer) }
-                            runCatching {
-                                while (!currentVad.empty()) {
-                                    segments.add(currentVad.front())
-                                    currentVad.pop()
-                                }
-                            }
-                        }
-                        for (segment in segments) {
-                            withContext(Dispatchers.Main) {
-                                onSegment(segment)
-                            }
-                        }
-                    }
-                    offset += VAD_WINDOW_SIZE
-                }
-            }
-        } finally {
-            running = false
-            // NonCancellable: a cancelled job would otherwise skip
-            // this cleanup (withContext on a cancelled job throws
-            // before running its block).
-            withContext(NonCancellable) {
-                runCatching { audioRecord?.stop() }
-                runCatching { audioRecord?.release() }
-                audioRecord = null
-            }
-        }
-    }
-
-    /**
-     * 1.4.3 TAP MODE: feeds caller-owned PCM into the SAME Vad
-     * instance, energy gate and 512-sample slicing as runLoop —
-     * but WITHOUT opening a second AudioRecord (Android gives the
-     * mic to one client). Returns completed segments; the caller
-     * dispatches them on the main thread, exactly as runLoop does.
-     * Echo gate identical to runLoop: nothing while speaking.
-     * 1.4.23-PRO: currently unused (no pump feeds it any more —
-     * the system recognizer owns the mic); kept for a future
-     * tap-mode caller. runLoop is the live VAD path.
-     */
-    fun feedSamples(samples: ShortArray, count: Int): List<SpeechSegment> {
-        if (!isAvailable()) return emptyList()
-        if (pausedForSpeech || isSpeaking()) return emptyList()
-        val segments = mutableListOf<SpeechSegment>()
-        val floatBuffer = FloatArray(VAD_WINDOW_SIZE)
-        var offset = 0
-        while (offset + VAD_WINDOW_SIZE <= count) {
-            var sumSquares = 0.0
-            for (i in 0 until VAD_WINDOW_SIZE) {
-                val sample = samples[offset + i]
-                sumSquares += (sample * sample).toDouble()
-            }
-            val rms = kotlin.math.sqrt(sumSquares / VAD_WINDOW_SIZE) / 32768.0
-            if (rms >= ENERGY_GATE_RMS) {
-                for (i in 0 until VAD_WINDOW_SIZE) {
-                    floatBuffer[i] = samples[offset + i] / 32768.0f
-                }
-                synchronized(vadLock) {
-                    val currentVad = vad ?: return@synchronized
-                    runCatching { currentVad.acceptWaveform(floatBuffer) }
-                    runCatching {
-                        while (!currentVad.empty()) {
-                            segments.add(currentVad.front())
-                            currentVad.pop()
-                        }
-                    }
-                }
-            }
-            offset += VAD_WINDOW_SIZE
-        }
-        return segments
-    }
-
-    /**
-     * Stops the loop (idempotent) and releases native state.
-     * A-H10: Vad release happens under [vadLock]; AudioRecord is
-     * deliberately NOT touched here — the runLoop thread owns it
-     * and releases it in its finally block (or the loop never
-     * started, so there is nothing to release). Releasing an
-     * AudioRecord from the main thread while the IO loop still
-     * reads it was the race this removes.
-     */
-    fun release() {
-        running = false
-        synchronized(vadLock) {
-            runCatching { vad?.release() }
-            vad = null
-        }
-        available = false
-    }
-
-    companion object {
-        const val SAMPLE_RATE_HZ: Int = 16_000
-        const val VAD_WINDOW_SIZE: Int = 512
-        const val VAD_THRESHOLD: Float = 0.5f
-        const val VAD_MIN_SILENCE_SEC: Float = 0.5f
-        const val VAD_MIN_SPEECH_SEC: Float = 0.25f
-        const val VAD_MAX_SPEECH_SEC: Float = 15.0f
-
-        /** Frames quieter than this skip ONNX inference (idle CPU saving). */
-        const val ENERGY_GATE_RMS: Double = 0.005
-    }
 }

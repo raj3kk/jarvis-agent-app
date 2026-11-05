@@ -14,11 +14,3 @@ app/release.keystore
 # IDE
 .idea/
 *.log
-
-# Sherpa-ONNX AAR (downloaded in CI, never committed)
-app/libs/
-
-
-# Silero VAD model (bundled in CI from the sherpa-onnx asr-models
-# release, never committed — 643,854 bytes)
-app/src/main/assets/silero_vad.onnx

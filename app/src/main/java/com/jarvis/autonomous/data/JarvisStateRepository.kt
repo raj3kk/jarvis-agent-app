@@ -58,9 +58,10 @@ data class DiagnosticEntry(
 )
 
 /** 1.4.2: a mic failure the user must SEE (banner + spoken
- *  reason + Retry), not a log line. `code` is -1 under the
- *  Deepgram-only policy (no system recognizer codes any more);
- *  the banner hides the code line when code < 0. */
+ *  reason + Retry), not a log line. `code` carries the real
+ *  system SpeechRecognizer error code (1.4.23-PRO step 2b);
+ *  -1 means no code applies, and the banner hides the code
+ *  line when code < 0. */
 data class MicFatalState(
     val reason: String,
     val code: Int,
@@ -126,12 +127,12 @@ object JarvisStateRepository {
     private val _micListening = MutableStateFlow(false)
     val micListening: StateFlow<Boolean> = _micListening.asStateFlow()
 
-    // 1.4.3: live STT path + switch reason + last Deepgram
-    // transcript script, written by the mic manager (and
-    // mirrored by the service's onSttPathChanged), read by the
-    // Diagnostics report. Values only — never a key.
-    // 1.4.5 part 3 (FINAL mic policy 2026-11-03): Deepgram ONLY
-    // — the path is always "deepgram" once started; "not
+    // 1.4.3: live STT path + switch reason + last transcript
+    // script, written by the mic manager (and mirrored by the
+    // service's onSttPathChanged), read by the Diagnostics
+    // report. Values only — never a key.
+    // 1.4.23-PRO (Item 1 staged): system SpeechRecognizer ONLY
+    // — the path is always "system" once started; "not
     // started" before the first user-enabled start.
     private val _sttPath = MutableStateFlow("not started")
     val sttPath: StateFlow<String> = _sttPath.asStateFlow()
@@ -139,8 +140,8 @@ object JarvisStateRepository {
     private val _sttPathReason = MutableStateFlow("not started")
     val sttPathReason: StateFlow<String> = _sttPathReason.asStateFlow()
 
-    // 1.4.5 part 3: mic auto-reconnect state (FINAL policy:
-    // transient Deepgram failures NEVER silently kill the loop).
+    // 1.4.5 part 3: mic auto-reconnect state (1.4.23-PRO policy:
+    // transient recognizer failures NEVER silently kill the loop).
     // Non-null reason = the loop is user-enabled but currently
     // reconnecting (amber banner, Retry + Mic off offered);
     // null = connected, or loop off. Set by the service's
@@ -256,7 +257,7 @@ object JarvisStateRepository {
      *  params and full URLs with query strings are reduced to the
      *  path, so a request URL can never leak a key into a report.
      *  1.4.3: also strips "Authorization: Token ..." header values
-     *  (Deepgram) and any token-like value after the word Token.
+     *  (legacy cloud STT) and any token-like value after the word Token.
      *  1.4.10 (Step 6): SINGLE implementation — JarvisDiagnosticsFile
      *  delegates here (its old second copy drifted and missed these).
      *  Added coverage: Bearer values, licence-shaped JARVIS-XXXX-…

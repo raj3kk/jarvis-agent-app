@@ -66,12 +66,12 @@ android {
         }
 
         // 1.4.12: ship native libs for arm64-v8a only.
-        // Both native stacks ship arm64-v8a (Sherpa-ONNX static AAR
-        // for Silero VAD, and LiteRT-LM Android), and the user's
-        // phone is arm64, so this does not break either lib on
-        // the target device. It drops the x86_64 slice
-        // (emulator-only) and saves a few MB. CI GATE: if the
-        // build fails with a missing-native-lib error, revert
+        // Only LiteRT-LM Android ships native code now (the
+        // VAD engine AAR was removed in 1.4.23-PRO step 2c),
+        // and the user's phone is arm64, so this does not
+        // break it on the target device. It drops the x86_64
+        // slice (emulator-only) and saves a few MB. CI GATE: if
+        // the build fails with a missing-native-lib error, revert
         // this block first (keep both ABIs) before touching
         // anything else.
         ndk {
@@ -128,11 +128,6 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        // Deliberately NO aapt noCompress for onnx: Sherpa never
-        // reads APK assets directly. The VAD copy step reads the
-        // asset via AssetManager streams (which decompress on the
-        // fly) to the files dir, and Sherpa loads that copy.
-        // noCompress would only inflate the APK for zero benefit.
     }
 }
 
@@ -158,12 +153,6 @@ dependencies {
     // the build FAILS loudly; there is deliberately NO fallback
     // to plain SharedPreferences for these tokens.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
-
-    // Sherpa-ONNX (Silero VAD only in 1.4.12) — AAR is downloaded in CI,
-    // never committed (37 MB, would bloat the repo). The workflow
-    // downloads the same file to app/libs/sherpa-onnx.aar before
-    // building; local builds need that file present too.
-    implementation(files("libs/sherpa-onnx.aar"))
 
     // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
     // Localhost preview uses plain java.net ServerSocket (no dependency):
