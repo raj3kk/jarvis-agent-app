@@ -5,6 +5,7 @@ import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.ProjectStore
+import com.jarvis.autonomous.data.WebsiteBuildSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -323,12 +324,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
-            5. CODE BUILDER — WEBSITE BUILD (multi-step, never one-and-done): If the user asks you to make a website/app/page — Hinglish or English, e.g. "ek website banao", "website bana do", "meri portfolio/dukaan/restaurant ki site banao", "ek calculator/todo page banao", "is ki website banao" — do NOT open a browser. Build it in EXACTLY these steps, one action per step, with the SAME projectName (short, no spaces, same spelling and case) on every step:
-               Step 1: action="CREATE_PROJECT", projectName=<name>, fileContent=the COMPLETE index.html (full, working, mobile-friendly, creamy theme). index.html MUST contain exactly `<link rel="stylesheet" href="style.css">` and `<script src="script.js"></script>` and NO other local file reference unless you also write that file. Set isCompleted=false on this step — the build is NOT done yet.
-               Step 2: action="WRITE_PROJECT_FILE", same projectName, fileName="style.css", fileContent=the COMPLETE custom CSS for this site (all classes the HTML uses). Set isCompleted=false.
-               Step 3: action="WRITE_PROJECT_FILE", same projectName, fileName="script.js", fileContent=the COMPLETE custom JS for this site (every id the HTML references must exist in the JS, every JS getElementById target must exist in the HTML). Set isCompleted=true, and your reply MUST be the build summary: files created (index.html, style.css, script.js), the project name, and "Projects tab me Preview dabao, ya Browser me kholo".
-               EXCEPTION — single-file build ONLY when the user explicitly asks for one file ("sirf ek file", "single file page"): then do ONE step, action="CREATE_PROJECT" with a fully self-contained index.html (inline <style> and <script> inside the HTML, NO href="style.css" and NO src="script.js"), isCompleted=true, and say it is a single-file build. Never mix the two modes: a 3-file HTML must never reference files you did not write, and a single-file HTML must never reference external files.
-            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps with isCompleted=false then true. Set isCompleted=true on the last edit step and reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho".
+            5. ${WebsiteBuildSpec.BUILDER_PROMPT_FRAGMENT}
+            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps with isCompleted=false then true. The new page MUST carry the SAME shared nav snippet as the other pages, and index.html's nav MUST link to it (validation fails on a page missing nav or linking a missing page). Set isCompleted=true on the last edit step and reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho".
             7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS STEPS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):
@@ -507,6 +504,157 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 .getString("text")
         }
     }
+
+    // ---- 1.4.20 (item 5): FREE live-browsing AI, separate path ----
+    // answerWithLiveSearch is deliberately NOT part of decideNextStep
+    // and NOT part of callGeminiApi: the decision parser needs strict
+    // JSON and would reject grounded prose, and the decision call's
+    // extractor drops groundingMetadata. This call is its own shape:
+    // model HARDCODED to gemini-3.1-flash-lite (never prefs.modelName,
+    // never the fallback chain — the primary 3.5-flash-lite budget is
+    // not burned by search turns), same saved key, same
+    // x-goog-api-key header, same OkHttpClient, same
+    // .../v1beta/models/<model>:generateContent URL shape.
+    // Grounding tool field (confirmed 2026-11-05 against Google's
+    // Grounding with Google Search reference): the REST request body
+    // carries "tools": [{"googleSearch": {}}] — the current field
+    // spelling (the older googleSearchRetrieval form is superseded).
+    // Google's supported-models list for Search grounding includes
+    // gemini-3.1-flash-lite. NO responseMimeType application/json on
+    // this call: grounded prose is the answer, not a decision object.
+    // Response parsing is new code, not the decision parser: all
+    // parts[].text joined as the answer, plus
+    // groundingMetadata.groundingChunks[].web{uri, title} as sources
+    // (+ webSearchQueries when present). A call with NO grounding
+    // metadata is a FAILURE, never a training-data answer presented
+    // as current. No new key, no new SDK, no paid service, no card.
+    // Gemini-provider only: the engine guards this, and this
+    // function double-guards (other providers get Failed, and the
+    // engine falls through to today's WebView-browse behaviour).
+
+    data class LiveSource(val title: String, val uri: String)
+
+    sealed interface LiveSearchResult {
+        data class Grounded(
+            val answer: String,
+            val sources: List<LiveSource>,
+            val queries: List<String>
+        ) : LiveSearchResult
+
+        data class Failed(val reason: String) : LiveSearchResult
+    }
+
+    suspend fun answerWithLiveSearch(question: String): LiveSearchResult =
+        withContext(Dispatchers.IO) {
+            if (prefs.provider != AiProvider.GEMINI) {
+                return@withContext LiveSearchResult.Failed(
+                    "Live search sirf Gemini provider par hai."
+                )
+            }
+            val apiKey = prefs.apiKey
+            if (apiKey.isBlank()) {
+                return@withContext LiveSearchResult.Failed("API key nahi hai.")
+            }
+            try {
+                val bodyJson = JSONObject().apply {
+                    put("contents", JSONArray().put(JSONObject().apply {
+                        put("role", "user")
+                        put("parts", JSONArray().put(JSONObject().apply {
+                            put(
+                                "text",
+                                "Answer concisely in 2-3 short sentences, based on the live search results: $question"
+                            )
+                        }))
+                    }))
+                    put("tools", JSONArray().put(JSONObject().apply {
+                        put("googleSearch", JSONObject())
+                    }))
+                }
+                val req = Request.Builder()
+                    .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent")
+                    .addHeader("x-goog-api-key", apiKey)
+                    .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val respBody = resp.body?.string() ?: ""
+                    if (!resp.isSuccessful) {
+                        return@withContext LiveSearchResult.Failed(
+                            "HTTP ${resp.code}: ${respBody.take(200)}"
+                        )
+                    }
+                    val root = JSONObject(respBody)
+                    val candidates = root.optJSONArray("candidates")
+                    if (candidates == null || candidates.length() == 0) {
+                        return@withContext LiveSearchResult.Failed(
+                            "Live search se koi jawab nahi mila."
+                        )
+                    }
+                    val candidate = candidates.getJSONObject(0)
+                    val parts = candidate.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                    val answer = buildString {
+                        if (parts != null) {
+                            for (i in 0 until parts.length()) {
+                                val text = parts.optJSONObject(i)?.optString("text", "")
+                                if (!text.isNullOrBlank()) {
+                                    if (isNotEmpty()) append("\n")
+                                    append(text)
+                                }
+                            }
+                        }
+                    }.trim()
+                    if (answer.isBlank()) {
+                        return@withContext LiveSearchResult.Failed(
+                            "Live search se khaali jawab mila."
+                        )
+                    }
+                    // No grounding metadata = NOT a grounded answer:
+                    // fail honestly instead of dressing up a
+                    // training-data reply as current information.
+                    val grounding = candidate.optJSONObject("groundingMetadata")
+                        ?: return@withContext LiveSearchResult.Failed(
+                            "Live search se grounded sources nahi mile."
+                        )
+                    val sources = mutableListOf<LiveSource>()
+                    val chunks = grounding.optJSONArray("groundingChunks")
+                    if (chunks != null) {
+                        for (i in 0 until chunks.length()) {
+                            val web = chunks.optJSONObject(i)?.optJSONObject("web")
+                            val uri = web?.optString("uri", "") ?: ""
+                            if (uri.isNotBlank()) {
+                                sources.add(
+                                    LiveSource(
+                                        title = web.optString("title", uri),
+                                        uri = uri
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    if (sources.isEmpty()) {
+                        return@withContext LiveSearchResult.Failed(
+                            "Live search se grounded sources nahi mile."
+                        )
+                    }
+                    val queries = mutableListOf<String>()
+                    val searchQueries = grounding.optJSONArray("webSearchQueries")
+                    if (searchQueries != null) {
+                        for (i in 0 until searchQueries.length()) {
+                            val q = searchQueries.optString(i, "")
+                            if (q.isNotBlank()) queries.add(q)
+                        }
+                    }
+                    LiveSearchResult.Grounded(answer, sources, queries)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Key and URL are never included in the reason.
+                LiveSearchResult.Failed(
+                    (e.message ?: "Network error").take(200)
+                )
+            }
+        }
 
     private fun callOpenAiCompatibleApi(
         provider: AiProvider,

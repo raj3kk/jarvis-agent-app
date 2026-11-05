@@ -200,6 +200,33 @@ object ProjectStore {
         if (!File(dir, "script.js").exists()) {
             writeFile(context, name, "script.js", defaultJs(name))
         }
+        // 1.4.20 (item 4): a bare "Create Website Project" tap also
+        // starts from the checklist shape — the fetch-with-fallback
+        // template JS fetches data/items.json, so that file must
+        // exist or the new fetch-target rule would fail the bare
+        // template itself; the backend files ship as the
+        // full-stack contract (real files, previewable as text,
+        // NOT executed on the phone). Only-if-missing, like
+        // style.css/script.js above — a re-build never clobbers
+        // custom backend/data content.
+        if (!File(dir, "data/items.json").exists()) {
+            writeFile(context, name, "data/items.json", seedJson())
+        }
+        if (!File(dir, "backend/api.md").exists()) {
+            writeFile(context, name, "backend/api.md", backendApiMd(name))
+        }
+        if (!File(dir, "backend/server.js").exists()) {
+            writeFile(context, name, "backend/server.js", backendServerJs(name))
+        }
+        if (!File(dir, "backend/schema.sql").exists()) {
+            writeFile(context, name, "backend/schema.sql", backendSchemaSql())
+        }
+        if (!File(dir, "backend/seed.json").exists()) {
+            writeFile(context, name, "backend/seed.json", seedJson())
+        }
+        if (!File(dir, "backend/README.md").exists()) {
+            writeFile(context, name, "backend/README.md", backendReadme(name))
+        }
         recordLastTouched(context, name)
         return dir
     }
@@ -418,6 +445,143 @@ object ProjectStore {
                 }
             }
         }
+        // 1.4.20 (item 4) rules 4, 5, 6, 8. Single-file projects
+        // (exactly one HTML file and no style.css/script.js files —
+        // the self-contained build) skip ONLY rule 4 (nav): the
+        // reduced checklist for them is items 5+6+7, and a lone
+        // page has no other top-level page to link. Rules 5, 6
+        // and 8 still apply to every project.
+        val allProjectFiles = listProjects(context)
+            .firstOrNull { it.name == name }?.files
+            ?: emptyList()
+        val isSingleFile = htmlFiles.size == 1 &&
+            allProjectFiles.none { it == "style.css" || it == "script.js" }
+        // Rule 5: viewport meta tag on EVERY page.
+        val viewportRegex = Regex("""<meta\s+[^>]*name\s*=\s*["']viewport["']""", RegexOption.IGNORE_CASE)
+        for (htmlFile in htmlFiles) {
+            val content = when (val read = readFileStatus(context, name, htmlFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            if (!viewportRegex.containsMatchIn(content)) {
+                invalid.add("$htmlFile -> viewport meta tag nahi hai (har page me viewport chahiye)")
+            }
+        }
+        // Rule 4: shared nav on every page, linking every
+        // top-level page. Top-level pages are the root .html files;
+        // nested pages link them with relative paths (../index.html
+        // resolves through resolveReference, same as other refs).
+        if (!isSingleFile) {
+            val topLevelPages = htmlFiles.filter { !it.contains("/") }
+            val navRegex = Regex("""<nav[^>]*>(.*?)</nav>""", RegexOption.DOT_MATCHES_ALL)
+            for (htmlFile in htmlFiles) {
+                val content = when (val read = readFileStatus(context, name, htmlFile)) {
+                    is FileRead.Ok -> read.content
+                    else -> continue
+                }
+                val navMatch = navRegex.find(content)
+                if (navMatch == null) {
+                    invalid.add("$htmlFile -> nav nahi hai (har page me shared nav chahiye)")
+                    continue
+                }
+                val fileDir = htmlFile.substringBeforeLast("/", "")
+                    .takeIf { htmlFile.contains("/") } ?: ""
+                val navHrefs = htmlRegex.findAll(navMatch.groupValues[1])
+                    .map { it.groupValues[1].substringBefore("?").substringBefore("#").trim() }
+                    .filter {
+                        it.isNotBlank() && !it.startsWith("http://") && !it.startsWith("https://") &&
+                            !it.startsWith("//") && !it.startsWith("data:")
+                    }
+                val navResolved = mutableSetOf<String>()
+                for (raw in navHrefs) {
+                    val resolved = resolveReference(fileDir, raw)
+                    if (resolved == null) {
+                        invalid.add("$htmlFile -> nav link $raw (absolute ya project se bahar ka path)")
+                        continue
+                    }
+                    navResolved.add(resolved)
+                    when (readFileStatus(context, name, resolved)) {
+                        is FileRead.Missing -> missing.add("$htmlFile nav -> $resolved")
+                        is FileRead.Empty -> empty.add("$htmlFile nav -> $resolved")
+                        is FileRead.Ok -> Unit
+                    }
+                }
+                for (page in topLevelPages) {
+                    if (page !in navResolved) {
+                        invalid.add("$htmlFile -> nav me $page ka link nahi hai")
+                    }
+                }
+            }
+        }
+        // Rule 6: every fetch() has a fallback — .catch, or a
+        // try/catch pair (word-boundary match, so "country" never
+        // counts as "try"). Checked for every .js file AND for
+        // inline <script> blocks in HTML files (the single-file
+        // shape has no .js file at all).
+        fun fetchFallbackOk(js: String): Boolean {
+            if (!js.contains("fetch(")) return true
+            if (js.contains(".catch(")) return true
+            val hasTry = Regex("""\btry\b""").containsMatchIn(js)
+            val hasCatch = Regex("""\bcatch\b""").containsMatchIn(js)
+            return hasTry && hasCatch
+        }
+        val jsFiles = allProjectFiles.filter { it.lowercase().endsWith(".js") }
+        for (jsFile in jsFiles) {
+            val content = when (val read = readFileStatus(context, name, jsFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            if (!fetchFallbackOk(content)) {
+                invalid.add("$jsFile -> fetch() ka fallback (catch) nahi hai")
+            }
+        }
+        val inlineScriptRegex = Regex(
+            """<script(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script>""",
+            RegexOption.DOT_MATCHES_ALL
+        )
+        for (htmlFile in htmlFiles) {
+            val content = when (val read = readFileStatus(context, name, htmlFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            for (block in inlineScriptRegex.findAll(content)) {
+                if (!fetchFallbackOk(block.groupValues[1])) {
+                    invalid.add("$htmlFile -> inline script me fetch() ka fallback (catch) nahi hai")
+                }
+            }
+        }
+        // Rule 8: every JS fetch("...") target resolves to an
+        // existing non-empty project file (same directory rule as
+        // href/src and CSS url()). Only quoted-literal targets are
+        // scannable; variable targets are skipped, never guessed.
+        val fetchRegex = Regex("""fetch\(\s*["']([^"']+)["']""")
+        for (jsFile in jsFiles) {
+            val content = when (val read = readFileStatus(context, name, jsFile)) {
+                is FileRead.Ok -> read.content
+                else -> continue
+            }
+            val fileDir = jsFile.substringBeforeLast("/", "")
+                .takeIf { jsFile.contains("/") } ?: ""
+            for (match in fetchRegex.findAll(content)) {
+                val raw = match.groupValues[1].substringBefore("?").substringBefore("#").trim()
+                if (raw.isBlank() || raw.startsWith("http://") || raw.startsWith("https://") ||
+                    raw.startsWith("//") || raw.startsWith("data:")
+                ) {
+                    continue
+                }
+                val resolved = resolveReference(fileDir, raw)
+                if (resolved == null) {
+                    invalid.add("$jsFile -> fetch $raw (absolute ya project se bahar ka path)")
+                    continue
+                }
+                referenced.add(resolved)
+                when (readFileStatus(context, name, resolved)) {
+                    is FileRead.Missing -> missing.add("$jsFile fetch -> $resolved")
+                    is FileRead.Empty -> empty.add("$jsFile fetch -> $resolved")
+                    is FileRead.Ok -> Unit
+                }
+            }
+        }
         // Every CSS file's url(...) references, same directory rule.
         val cssFiles = listProjects(context)
             .firstOrNull { it.name == name }?.files
@@ -553,6 +717,7 @@ object ProjectStore {
           <link rel="stylesheet" href="style.css">
         </head>
         <body>
+          <nav><a href="index.html">Home</a></nav>
           <header class="hero">
             <h1>$title</h1>
             <p>Jarvis ne banaya — phone par, bina server ke.</p>
@@ -582,17 +747,142 @@ object ProjectStore {
     private fun defaultCss(): String = """
         * { box-sizing: border-box; }
         body { margin: 0; font-family: system-ui, sans-serif; background: #FFF8ED; color: #3B2F2A; }
+        nav { text-align: center; padding: 12px; background: #FFF1DC; }
+        nav a { color: #B85C38; margin: 0 8px; }
         .hero { padding: 48px 20px; text-align: center; background: #FFF1DC; }
         .hero h1 { margin: 0 0 8px; font-size: 32px; }
         .hero button { padding: 12px 22px; border: 0; border-radius: 24px; background: #B85C38; color: #fff; font-size: 16px; }
         main { max-width: 720px; margin: 0 auto; padding: 20px; }
         .card { background: #fff; border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
         footer { text-align: center; padding: 20px; color: #8A7A70; }
+        @media (max-width: 480px) {
+          .hero { padding: 24px 12px; }
+          .hero h1 { font-size: 24px; }
+          main { padding: 12px; }
+        }
     """.trimIndent()
 
     private fun defaultJs(title: String): String = """
         document.getElementById('helloBtn').addEventListener('click', function () {
           document.getElementById('helloMsg').textContent = 'Hello! Ye "$title" Jarvis ke phone se chal rahi hai.';
         });
+        // 1.4.20 (item 4): fetch-with-fallback pattern — the preview
+        // server serves data/items.json as application/json, so this
+        // fetch always resolves on a template project; the .catch
+        // keeps a visible message instead of a silent blank section.
+        fetch('data/items.json')
+          .then(function (response) { return response.json(); })
+          .then(function (items) {
+            var msg = document.getElementById('helloMsg');
+            if (msg && items && items.length) {
+              msg.textContent = 'Items loaded: ' + items.length;
+            }
+          })
+          .catch(function () {
+            var msg = document.getElementById('helloMsg');
+            if (msg) { msg.textContent = 'Data load nahi hua'; }
+          });
+    """.trimIndent()
+
+    // ---- 1.4.20 (item 4): full-stack template files ----
+    // The backend files are REAL, previewable files for deployment
+    // elsewhere — the phone preview server is static-only and never
+    // executes them. server.js deliberately contains no fetch()
+    // call, so the validator's fetch-target scan never misreads
+    // server-side code as a frontend fetch. No dollar signs appear
+    // in any template, so Kotlin interpolation cannot mangle them.
+
+    /** Seed data — written verbatim to BOTH backend/seed.json and
+     *  data/items.json, so the preview-time data source IS the seed. */
+    private fun seedJson(): String = """
+        [
+          { "id": 1, "name": "Sample item", "detail": "Jarvis se bana sample data" },
+          { "id": 2, "name": "Doosra item", "detail": "Is data ko builder se badalwa sakte ho" }
+        ]
+    """.trimIndent()
+
+    private fun backendApiMd(title: String): String = """
+        # $title — Backend API
+
+        Ye API contract hai: endpoints, request aur response shape, plain language me.
+        Ye code phone par NAHI chalta — deployment ke liye hai (backend/README.md dekho).
+
+        ## GET /api/items
+        Sab items ki list deta hai.
+        Response: JSON array — har item me id (number), name (string), detail (string).
+
+        ## GET /api/items/:id
+        Ek item deta hai (id ke hisaab se).
+        Response: ek item object, ya nahi mila to 404 with {"error": "not found"}.
+
+        ## POST /api/items
+        Naya item banata hai.
+        Request: JSON body {"name": string, "detail": string}.
+        Response: bana hua item object (nayi id ke saath).
+    """.trimIndent()
+
+    private fun backendServerJs(title: String): String = """
+        // $title — framework-free Node-style handler (generated file).
+        // NOT executed on the phone: the preview server is static-only.
+        // Deploy this file on a Node server elsewhere; it implements
+        // exactly the endpoints in backend/api.md against backend/schema.sql.
+        var http = require('http');
+        var items = require('./seed.json');
+        function sendJson(res, status, obj) {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(obj));
+        }
+        function handleRequest(req, res) {
+          if (req.method === 'GET' && req.url === '/api/items') {
+            sendJson(res, 200, items);
+            return;
+          }
+          if (req.method === 'GET' && req.url.indexOf('/api/items/') === 0) {
+            var id = parseInt(req.url.split('/').pop(), 10);
+            var found = null;
+            for (var i = 0; i < items.length; i++) {
+              if (items[i].id === id) { found = items[i]; }
+            }
+            if (found) { sendJson(res, 200, found); } else { sendJson(res, 404, { error: 'not found' }); }
+            return;
+          }
+          if (req.method === 'POST' && req.url === '/api/items') {
+            var body = '';
+            req.on('data', function (chunk) { body += chunk; });
+            req.on('end', function () {
+              var parsed = JSON.parse(body || '{}');
+              var created = { id: items.length + 1, name: parsed.name || '', detail: parsed.detail || '' };
+              items.push(created);
+              sendJson(res, 201, created);
+            });
+            return;
+          }
+          sendJson(res, 404, { error: 'not found' });
+        }
+        http.createServer(handleRequest).listen(3000);
+    """.trimIndent()
+
+    private fun backendSchemaSql(): String = """
+        CREATE TABLE items (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          detail TEXT
+        );
+    """.trimIndent()
+
+    private fun backendReadme(title: String): String = """
+        # $title — Backend
+
+        Backend code is for deployment elsewhere, not run on the phone.
+
+        Files (previewable as text from the editor):
+        - api.md — endpoint list (method, path, request/response shape).
+        - server.js — framework-free Node-style handlers for those endpoints.
+        - schema.sql — database tables and columns.
+        - seed.json — real sample rows; data/items.json is its verbatim copy,
+          served by the localhost preview as the preview-time data source.
+
+        Phone preview me frontend sirf data/items.json fetch karta hai — koi
+        remote backend nahi chalta.
     """.trimIndent()
 }

@@ -23,6 +23,7 @@ import com.jarvis.autonomous.ui.JarvisBackgroundBrowser
 import com.jarvis.autonomous.voice.TurnDetector
 import com.jarvis.autonomous.ui.LICENCE_SERVER_URL
 import com.jarvis.autonomous.ui.LicencePrefs
+import com.jarvis.autonomous.ui.browserTargetForInput
 import com.jarvis.autonomous.ui.normalizeBrowserUrl
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -406,6 +407,43 @@ class JarvisAgentEngine(
      * unsent), then send. Anything that does not match a routine
      * falls through to the normal LLM multi-step loop below.
      */
+    /**
+     * 1.4.20 (item 5): current-information question matcher, kept
+     * deliberately narrow so it never hijacks commands. A turn
+     * matches only when it has BOTH a current-info topic token
+     * (aaj/latest/abhi/current/live/news/score/price/mausam/weather
+     * and kin) AND a question shape ("?" or kya/kaun/kitna/kaisa/
+     * batao / English wh-words). Show-page commands ("weather
+     * dikhao", "news kholo"), build requests ("website banao")
+     * and plain statements do NOT match — they keep today's path.
+     * Time/date turns never reach here (the time/date block above
+     * returns first). Tokens are whole words, so "aaj" inside a
+     * longer word cannot false-match.
+     */
+    private fun isCurrentInfoQuestion(lower: String): Boolean {
+        if (lower.contains("website") || lower.contains("banao") ||
+            lower.contains("banado") || lower.contains("kholo") ||
+            lower.contains("chalao") || lower.contains("dikhao")
+        ) {
+            return false
+        }
+        val tokens = lower.replace(Regex("[^a-z0-9 ]"), " ")
+            .split(" ").filter { it.isNotBlank() }.toSet()
+        val topics = setOf(
+            "aaj", "latest", "abhi", "current", "live", "news",
+            "score", "price", "mausam", "weather", "bhav", "rate",
+            "samachar", "khabar", "taaza", "taza", "aajkal"
+        )
+        if (tokens.intersect(topics).isEmpty()) return false
+        if (lower.contains("?")) return true
+        val questionWords = setOf(
+            "kya", "kaun", "kitna", "kitne", "kaisa", "kahan",
+            "kab", "batao", "bata", "what", "when", "where",
+            "who", "why", "how", "which"
+        )
+        return tokens.intersect(questionWords).isNotEmpty()
+    }
+
     private fun tryNoAiRoutine(lower: String, trimmed: String): Boolean {
         val acc = JarvisAccessibilityService.instance
         // Patterns suggestions (1.4.1 audit gap): "patterns dikhao" /
@@ -507,6 +545,79 @@ class JarvisAgentEngine(
                 "Abhi time hai ${"%02d".format(now.hour)} baj kar ${"%02d".format(now.minute)} minute."
             }
             scope.launch { speak(answer) }
+            return true
+        }
+        // 1.4.20 (item 5): FREE live-browsing AI, engine-side
+        // pre-check in the no-AI routine pattern (same shape as the
+        // time/date block above). Matching turns route to
+        // answerWithLiveSearch BEFORE decideNextStep runs;
+        // non-matching turns are byte-for-byte unchanged.
+        // Gemini-provider only: other providers fall through to
+        // today's behaviour (LLM loop / OPEN_BROWSER browse).
+        if (prefs.provider == AiProvider.GEMINI && isCurrentInfoQuestion(lower)) {
+            scope.launch {
+                try {
+                    when (val result = llmClient.answerWithLiveSearch(trimmed)) {
+                        is LlmClient.LiveSearchResult.Grounded -> {
+                            // Spoken: at most 2 short sentences +
+                            // one source name — never full grounded
+                            // text, never raw URLs spoken.
+                            val sentences = result.answer
+                                .split(Regex("""(?<=[.!?])\s+"""))
+                                .map { it.trim() }
+                                .filter { it.isNotBlank() }
+                            val spokenBase = if (sentences.isEmpty()) {
+                                result.answer.take(280)
+                            } else {
+                                sentences.take(2).joinToString(" ")
+                            }
+                            val sourceName = result.sources.firstOrNull()
+                                ?.title?.ifBlank { null }
+                                ?: result.sources.firstOrNull()?.uri
+                                    ?.substringAfter("://", "")
+                                    ?.substringBefore("/")
+                            val spoken = if (sourceName.isNullOrBlank()) {
+                                spokenBase
+                            } else {
+                                "$spokenBase (source: $sourceName)"
+                            }
+                            speak(spoken)
+                            // Chat: full grounded answer + Sources
+                            // list of titles with URLs (tappable
+                            // text, not spoken).
+                            val chat = buildString {
+                                append(result.answer)
+                                append("\n\nSources:")
+                                result.sources.forEach { src ->
+                                    append("\n- ${src.title}: ${src.uri}")
+                                }
+                            }
+                            JarvisStateRepository.addChatMessage("Jarvis", chat)
+                        }
+                        is LlmClient.LiveSearchResult.Failed -> {
+                            // FAILURE HONESTY: never fall back
+                            // silently to a training-data answer
+                            // presented as current. The fallback is
+                            // the existing OPEN_BROWSER background
+                            // browse over a Google search URL (the
+                            // item-3 search rule), LABELED as
+                            // scraped snippets, not a grounded
+                            // answer — weaker, and said so.
+                            val label = "Live search nahi mila (${result.reason.take(120)}). " +
+                                "Google search page se dekh raha hoon — ye grounded answer nahi hai, scraped snippets hain."
+                            JarvisStateRepository.addChatMessage("Jarvis", label)
+                            speak(label)
+                            val searchUrl = browserTargetForInput(trimmed)
+                            if (searchUrl.isNotBlank()) {
+                                executeBrowserLoad(searchUrl, speakSummary = true)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    JarvisStateRepository.addLog("Live search error: ${e.message}")
+                    speak("Live search nahi mila — dobara koshish karo ya Browser me kholo.")
+                }
+            }
             return true
         }
         if (acc != null) {
@@ -1372,8 +1483,13 @@ class JarvisAgentEngine(
                 if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE")) {
                     val v = lastBuildValidation
                     if (v != null && !v.ok) {
+                        // 1.4.20 (item 4): the repair note names
+                        // invalid refs too (nav/viewport/fetch
+                        // failures), not just missing/empty — the
+                        // loop machinery itself is unchanged.
                         val detail = (v.missingFiles.map { "$it missing" } +
-                            v.emptyFiles.map { "$it khaali" }).joinToString(", ")
+                            v.emptyFiles.map { "$it khaali" } +
+                            v.invalidRefs).joinToString(", ")
                         val repairNote = "Build validation fail ho gaya — $detail. In files ko dobara likh raha hoon, success tabhi bolunga jab validation OK ho."
                         JarvisStateRepository.addChatMessage("Jarvis", repairNote)
                         speak(repairNote, alreadyPostedToChat = true)
@@ -1723,8 +1839,14 @@ class JarvisAgentEngine(
                 // app). Background by default; foreground show only
                 // on explicit user request, and only for
                 // user-asked / user-approved URLs (§7 gate).
+                // 1.4.20 (item 3): ONE search rule — spoken query
+                // text maps to a Google search via
+                // browserTargetForInput, not the invalid
+                // "https://" prefix normalizeBrowserUrl produced.
+                // Real URLs pass through unchanged; the approval
+                // gate below is unchanged.
                 val raw = d.browserUrl
-                val url = normalizeBrowserUrl(raw)
+                val url = browserTargetForInput(raw)
                 if (url.isEmpty()) {
                     "OPEN_BROWSER blocked: empty/blocked URL"
                 } else {

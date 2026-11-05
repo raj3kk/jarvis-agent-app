@@ -47,6 +47,7 @@
         android:roundIcon="@drawable/ic_jarvis_core"
         android:supportsRtl="true"
         android:theme="@style/Theme.JarvisAutonomous"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:usesCleartextTraffic="false">
 
         <!-- LiteRT-LM GPU backend libraries: marked not required, so the

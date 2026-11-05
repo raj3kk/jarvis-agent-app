@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 1.4.20 (item 1): localhost preview cleartext, scoped tight.
+     The global cleartext ban stays (base-config false + the
+     manifest's usesCleartextTraffic="false"): real http:// pages
+     are still blocked at the network layer. ONLY the on-device
+     preview loopback is permitted in cleartext — exactly
+     127.0.0.1 and localhost, subdomains NOT included — because
+     the Projects preview server is plain HTTP on 127.0.0.1:8080
+     by design (no TLS on loopback). There is no WebView setting
+     for cleartext; this manifest/config pair is the only fix. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

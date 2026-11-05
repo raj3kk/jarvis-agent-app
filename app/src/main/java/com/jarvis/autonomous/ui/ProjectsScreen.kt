@@ -83,6 +83,11 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
     var previewProject by remember { mutableStateOf<String?>(null) }
     var previewStarting by remember { mutableStateOf(false) }
     var previewError by remember { mutableStateOf<String?>(null) }
+    // 1.4.20 (item 2): Editor / Preview are mutually exclusive UI
+    // modes — UI state only, no mic/wake involvement. Editor mode
+    // (default) is the scrollable column; Preview mode is a
+    // non-scrolling container with the WebView at weight(1f).
+    var previewMode by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     // B-L6: true once the editor text differs from the loaded file.
     // A file/project switch with unsaved edits asks first (banner
@@ -154,6 +159,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         previewBaseUrl = null
         previewProject = null
         previewError = null
+        previewMode = false
         loadFile(clean, "index.html")
     }
 
@@ -185,6 +191,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         previewBaseUrl = null
         previewProject = null
         previewError = null
+        previewMode = false
         status = "Preview band ho gaya."
     }
 
@@ -213,6 +220,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
             previewBaseUrl = ProjectStore.localhostUrl(clean)
             previewProject = clean
             previewNonce += 1
+            previewMode = true
             status = "Preview chal raha hai: ${ProjectStore.localhostUrl(clean)}"
         }
     }
@@ -249,6 +257,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 previewBaseUrl = url
                 previewProject = clean
                 previewNonce += 1
+                previewMode = true
                 status = "Browser tab wiring abhi coordinator se pending hai — preview yahin (same engine) khul gaya: $url"
             } else {
                 host.loadUrl(url)
@@ -257,10 +266,17 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         }
     }
 
+    // 1.4.20 (item 2): the root container does NOT scroll. Editor
+    // mode (default) is the scrollable column below; Preview mode
+    // is a non-scrolling container with the WebView at weight(1f),
+    // structurally identical to the Browser tab. The WebView is
+    // NEVER composed inside a verticalScroll column any more: pages
+    // taller than the old 420.dp box were truncated and gestures
+    // were contested between the outer Compose scroll and the
+    // WebView's own scroll, with no nested-scroll wiring anywhere.
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -275,6 +291,64 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
             fontSize = 12.sp,
             color = Color(0xFF8A7A70)
         )
+
+        if (previewMode) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = previewProject ?: selected ?: "Preview",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { previewNonce += 1 }) { Text("Reload", fontSize = 12.sp) }
+                OutlinedButton(onClick = { stopPreview() }) { Text("Stop", fontSize = 12.sp) }
+                OutlinedButton(onClick = { previewMode = false }) { Text("Editor wapas", fontSize = 12.sp) }
+                OutlinedButton(
+                    onClick = {
+                        val p = previewProject ?: selected
+                        if (p != null) openInBrowser(p)
+                    }
+                ) { Text("Browser me kholo", fontSize = 12.sp) }
+            }
+            if (previewStarting) {
+                Text("Preview server start ho raha hai…", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            val modeErr = previewError
+            val modeUrl = previewUrl
+            if (modeErr != null) {
+                Text(modeErr, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB3261E))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val retryProject = selected
+                    if (retryProject != null) {
+                        OutlinedButton(onClick = { startPreview(retryProject) }) { Text("Retry Preview") }
+                    }
+                    OutlinedButton(onClick = { previewMode = false }) { Text("Editor wapas", fontSize = 12.sp) }
+                }
+            } else if (modeUrl != null) {
+                Text("Live Preview (localhost, isi phone par — Browser tab wala engine):", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text(previewBaseUrl ?: modeUrl, fontSize = 12.sp, color = Color(0xFFB85C38))
+                JarvisWebView(
+                    targetUrl = modeUrl,
+                    onError = { previewError = it },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+                Text(
+                    "Note: preview aur Browser tab ek hi page share karte hain — ek jagah navigate karoge to doosri jagah bhi wahi page dikhega.",
+                    fontSize = 11.sp,
+                    color = Color(0xFF8A7A70)
+                )
+            } else {
+                Text("Preview band hai — Editor se kisi project ka Preview dabao.", fontSize = 13.sp)
+            }
+        } else {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
 
         // New project
         Card(
@@ -380,6 +454,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                                         previewBaseUrl = null
                                         previewProject = null
                                         previewError = null
+                                        previewMode = false
                                     }
                                     refresh()
                                     status = "Project delete ho gaya: ${project.name}"
@@ -419,6 +494,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                                 previewBaseUrl = null
                                 previewProject = null
                                 previewError = null
+                                previewMode = false
                             }
                             loadFile(parked.first, parked.second)
                         }
@@ -590,7 +666,12 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
             Text(status, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2E7D5B))
         }
 
-        // Preview — shared Browser-tab engine, never a silent blank.
+        // 1.4.20 (item 2): NO inline preview WebView in this scroll
+        // column any more — preview lives in Preview mode above
+        // (non-scrolling, weight(1f)). Validation / server errors
+        // still surface here in Editor mode, so a failed Preview
+        // tap is never silent; the error's Retry re-enters Preview
+        // mode on success via startPreview.
         if (previewStarting) {
             Text("Preview server start ho raha hai…", fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
@@ -602,44 +683,7 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                 OutlinedButton(onClick = { startPreview(retryProject) }) { Text("Retry Preview") }
             }
         }
-        val url = previewUrl
-        if (url != null && previewErr == null) {
-            Text("Live Preview (localhost, isi phone par — Browser tab wala engine):", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            Text(previewBaseUrl ?: url, fontSize = 12.sp, color = Color(0xFFB85C38))
-            // B-L4: the preview renders through the shared JarvisWebView
-            // composable (same engine as the Browser tab) WITH its error
-            // callbacks wired — the old raw AndroidView had no error
-            // path, so a dead server left a blank box with no reason.
-            // A load failure now lands in previewError above instead.
-            // The update block loads ONLY when the target URL string
-            // changes, so the Browser tab can later borrow it back
-            // without a reload, and typing in the editor never resets
-            // the preview. onRelease deliberately does NOT destroy it.
-            JarvisWebView(
-                targetUrl = url,
-                onError = { previewError = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(420.dp)
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        previewNonce += 1
-                        status = "Preview reload ho raha hai."
-                    }
-                ) { Text("Reload Preview") }
-                val previewProject = selected
-                if (previewProject != null) {
-                    OutlinedButton(onClick = { openInBrowser(previewProject) }) { Text("Browser me kholo (full-screen)") }
-                }
-            }
-            Text(
-                "Note: preview aur Browser tab ek hi page share karte hain — ek jagah navigate karoge to doosri jagah bhi wahi page dikhega.",
-                fontSize = 11.sp,
-                color = Color(0xFF8A7A70)
-            )
-        }
         Spacer(modifier = Modifier.height(8.dp))
+        } // close editor scroll column
     }
 }

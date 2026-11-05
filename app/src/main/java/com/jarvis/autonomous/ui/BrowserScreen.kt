@@ -357,15 +357,25 @@ class BrowserHostState {
     @Volatile
     var isBrowserTabVisible: Boolean = false
 
+    // 1.4.20 (item 3): ONE search rule everywhere. loadUrl /
+    // showLoadedPage (and openInBrowser via showLoadedPage) route
+    // through browserTargetForInput, not normalizeBrowserUrl: spoken
+    // or typed query text ("weather today") now maps to a Google
+    // search instead of the invalid "https://weather today" the old
+    // prefix produced. Real http(s) URLs pass through unchanged, so
+    // localhost preview URLs are unaffected. normalizeBrowserUrl
+    // stays for background-browse internals (browse()) where the
+    // input is already a URL, and for the host's displayed-URL
+    // record (reportDisplayedUrl), which only ever sees real URLs.
     fun loadUrl(url: String) {
-        val normalized = normalizeBrowserUrl(url)
+        val normalized = browserTargetForInput(url)
         if (normalized.isEmpty()) return
         foregroundUrl = normalized
         onShowBrowserTab()
     }
 
     fun showLoadedPage(url: String) {
-        val normalized = normalizeBrowserUrl(url)
+        val normalized = browserTargetForInput(url)
         if (normalized.isEmpty()) return
         foregroundUrl = normalized
         onShowBrowserTab()
