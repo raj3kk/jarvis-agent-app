@@ -62,12 +62,9 @@ fun AlwaysOnMicManager.isEnabled(): Boolean
 fun AlwaysOnMicManager.isListeningActive(): Boolean
 fun AlwaysOnMicManager.isRecordAudioGranted(): Boolean
 fun AlwaysOnMicManager.currentLanguage(): String            // "hi-IN" | "en-IN"
-fun AlwaysOnMicManager.isVadActive(): Boolean
 fun AlwaysOnMicManager.setStopSpeakingCallback(callback: StopSpeakingCallback?)
 fun AlwaysOnMicManager.setSpeaking(speaking: Boolean, spokenText: String = "")
 fun AlwaysOnMicManager.continueAfterIncompletePrompt()
-fun AlwaysOnMicManager.enableVadMonitor(modelFile: File, onSegment: (SpeechSegment) -> Unit): Boolean
-fun AlwaysOnMicManager.disableVadMonitor()
 fun AlwaysOnMicManager.buildBatteryExemptionIntent(): Intent?
 @Volatile var AlwaysOnMicManager.isSpeaking: Boolean        // read-only outside (private set)
 @Volatile var AlwaysOnMicManager.currentSpokenText: String  // read-only outside (private set)
