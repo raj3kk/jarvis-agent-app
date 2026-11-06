@@ -297,6 +297,19 @@ class AlwaysOnMicManager(
     private var reconnecting: Boolean = false
     private var reconnectAttempt: Int = 0
     private var reconnectRunnable: Runnable? = null
+    // 1.4.24-PRO step 1 (RC-B): bounded fast retry for consecutive
+    // BUSY (8) / CLIENT (5) errors — max 2 fast retries, 500ms
+    // apart, then the normal capped backoff. The count resets on
+    // onReadyForSpeech / onResults (a live session proves the
+    // churn is over) and on start().
+    private var busyRetryCount: Int = 0
+    /** Pending 500ms BUSY/CLIENT fast-retry runnable, if any. */
+    private var busyRetryRunnable: Runnable? = null
+    // 1.4.24-PRO step 1 (RC-E): true when the last successful
+    // (re)start recreated the recognizer. Gates the
+    // SR_REUSED_SESSION diagnostic so the routine-reuse path logs
+    // it once per recreate, not on every routine restart.
+    private var lastRestartWasRecreate: Boolean = false
     // 1.4.17: true while the loop is paused for Live mode. The
     // loop stays enabled (so stop()/start() semantics are
     // untouched) but scheduleReconnect()/enterReconnecting()
@@ -327,13 +340,16 @@ class AlwaysOnMicManager(
 
     /**
      * 1.4.23-PRO: the always-on loop is one SpeechRecognizer
-     * session after another. A fresh recognizer is created per
-     * session and destroyed at its terminal callback — a stale
-     * instance is never reused across sessions. Every callback
-     * carries the session id it was created with; callbacks from
-     * a destroyed session are ignored (destroy can still deliver
-     * a late ERROR_CLIENT). All callbacks arrive on the main
-     * thread (the recognizer is created on it).
+     * session after another. 1.4.24-PRO step 1 (RC-E): ROUTINE
+     * restarts reuse the live loop recognizer (same instance,
+     * fresh listener + startListening from inside the terminal
+     * callback — the AOSP-sanctioned pattern); only the backoff
+     * path recreates it, so the async binder teardown can settle
+     * during the backoff instead of racing the next start. Every
+     * callback carries the session id it was created with;
+     * callbacks from a destroyed session are ignored (destroy can
+     * still deliver a late ERROR_CLIENT). All callbacks arrive on
+     * the main thread (the recognizer is created on it).
      *
      * HONEST LIMIT: a restart gap (hundreds of ms – ~2s) can miss
      * speech that starts exactly in the gap, and there is no
@@ -360,6 +376,7 @@ class AlwaysOnMicManager(
                 sessionActive = true
                 reconnecting = false
                 reconnectAttempt = 0
+                busyRetryCount = 0
                 lastSpeechMs = System.currentTimeMillis()
                 if (wasReconnecting) {
                     JarvisStateRepository.addDiagnostic(
@@ -433,6 +450,7 @@ class AlwaysOnMicManager(
                 if (!enabled || livePaused) return
                 sessionActive = false
                 sessionStarting = false
+                busyRetryCount = 0
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val text = matches?.firstOrNull().orEmpty()
                 if (text.isBlank()) {
@@ -532,11 +550,45 @@ class AlwaysOnMicManager(
             else -> {
                 listeningActive = false
                 listener.onListeningStateChanged(false)
-                JarvisStateRepository.addDiagnostic(
-                    "stt", "SR_ERROR",
-                    "Recognizer error $error — entering reconnect."
-                )
-                mainHandler.post {
+                // 1.4.24-PRO step 1 (RC-B): BUSY (8) / CLIENT (5)
+                // usually mean the new startListening raced the
+                // previous session's async binder teardown — a
+                // bounded fast retry (max 2, 500ms apart, via the
+                // RECREATE path so the destroy settles) before
+                // falling through to the capped backoff. All other
+                // codes go straight to enterReconnecting.
+                // Recognition callbacks already run on the main
+                // thread, so enterReconnecting is called directly
+                // (no mainHandler.post).
+                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                    error == SpeechRecognizer.ERROR_CLIENT
+                ) {
+                    if (busyRetryCount < 2) {
+                        busyRetryCount++
+                        JarvisStateRepository.addDiagnostic(
+                            "stt", "SR_BUSY_RETRY",
+                            "Recognizer busy/client error $error — fast retry $busyRetryCount/2 in 500ms."
+                        )
+                        val retryRunnable = Runnable {
+                            busyRetryRunnable = null
+                            if (!enabled || livePaused) return@Runnable
+                            startSession()
+                        }
+                        busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+                        busyRetryRunnable = retryRunnable
+                        mainHandler.postDelayed(retryRunnable, 500L)
+                    } else {
+                        JarvisStateRepository.addDiagnostic(
+                            "stt", "SR_ERROR",
+                            "Recognizer error $error — entering reconnect."
+                        )
+                        enterReconnecting("System mic error $error — reconnecting.")
+                    }
+                } else {
+                    JarvisStateRepository.addDiagnostic(
+                        "stt", "SR_ERROR",
+                        "Recognizer error $error — entering reconnect."
+                    )
                     enterReconnecting("System mic error $error — reconnecting.")
                 }
             }
@@ -662,6 +714,7 @@ class AlwaysOnMicManager(
         enabled = true
         reconnecting = false
         reconnectAttempt = 0
+        busyRetryCount = 0
         quarantinedWhileSpeaking.clear()
         turnDetector.reset()
         // 1.4.19: clear any stale user direction on start —
@@ -690,12 +743,18 @@ class AlwaysOnMicManager(
     }
 
     /**
-     * Starts one recognizer session (main thread only): destroys
-     * the previous session's recognizer, creates a fresh one and
-     * calls startListening. The session id increments
-     * inside stopRecognizerSession BEFORE the destroy, so late
-     * callbacks from the old recognizer are ignored. A failed
-     * create is a PERMANENT stop (recognition unavailable); a
+     * Starts one recognizer session, RECREATE path (main thread
+     * only): destroys the previous session's recognizer, creates
+     * a fresh one and calls startListening. Callers: start(),
+     * the backoff expiry in scheduleReconnect(), the BUSY/CLIENT
+     * fast retry, and resumeFromLive() — every path where the
+     * old instance is already destroyed or the teardown needs
+     * time to settle (the backoff / 500ms retry IS the settle).
+     * Routine session ends use [startSessionReuse] instead and
+     * never come here. The session id increments inside
+     * stopRecognizerSession BEFORE the destroy, so late callbacks
+     * from the old recognizer are ignored. A failed create is a
+     * PERMANENT stop (recognition unavailable); a
      * SecurityException (permission revoked between check and
      * call) stops permanently with the real code; any other start
      * failure enters reconnecting. The turn-check chain is
@@ -744,6 +803,69 @@ class AlwaysOnMicManager(
             }
             return
         }
+        lastRestartWasRecreate = true
+        mainHandler.removeCallbacks(turnCheckRunnable)
+        mainHandler.postDelayed(turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS)
+    }
+
+    /**
+     * 1.4.24-PRO step 1 (RC-E): ROUTINE restart — reuses the live
+     * loop recognizer instead of destroying + recreating it.
+     * Called from inside a terminal callback (onResults /
+     * NO_MATCH / SPEECH_TIMEOUT / language retry) via
+     * [restartSessionNow], i.e. the session has already ended, so
+     * the same instance can startListening again immediately
+     * (AOSP-sanctioned pattern) with no async-teardown race and
+     * no ERROR_RECOGNIZER_BUSY. Increments the session id first
+     * (late callbacks from the ended session are ignored) and
+     * swaps in a fresh listener for the new id. If no live
+     * instance exists (destroyed by a racing pause/stop), falls
+     * back to the [startSession] recreate path. A startListening
+     * throw on the reused instance destroys it and enters
+     * reconnecting, exactly like the recreate path.
+     */
+    private fun startSessionReuse() {
+        if (!enabled || livePaused) return
+        val recognizer = loopRecognizer
+        if (recognizer == null) {
+            startSession()
+            return
+        }
+        sessionStarting = true
+        sessionHadTranscript = false
+        currentSessionId++
+        val sessionId = currentSessionId
+        lastSpeechMs = System.currentTimeMillis()
+        if (lastRestartWasRecreate) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "SR_REUSED_SESSION",
+                "Routine restart reusing the live loop recognizer (no destroy/create)."
+            )
+        }
+        lastRestartWasRecreate = false
+        recognizer.setRecognitionListener(makeLoopListener(sessionId))
+        val started = runCatching {
+            recognizer.startListening(buildRecognizerIntent(currentLanguage, true))
+        }
+        if (started.isFailure) {
+            val e = started.exceptionOrNull()
+            loopRecognizer = null
+            runCatching { recognizer.destroy() }
+            sessionStarting = false
+            if (e is SecurityException) {
+                stopPermanently(
+                    "RECORD_AUDIO not granted — mic loop stopped.",
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
+                )
+            } else {
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "SR_START_FAILED",
+                    "Recognizer startListening threw (${e?.javaClass?.simpleName}) on reused instance — entering reconnect."
+                )
+                enterReconnecting("System mic start failed — reconnecting.")
+            }
+            return
+        }
         mainHandler.removeCallbacks(turnCheckRunnable)
         mainHandler.postDelayed(turnCheckRunnable, TurnThresholds.TURN_CHECK_INTERVAL_MS)
     }
@@ -763,10 +885,10 @@ class AlwaysOnMicManager(
         runCatching { recognizer?.destroy() }
     }
 
-    /** Immediate session restart (routine session end, no banner). No-op when the loop is off or Live owns the mic. */
+    /** Immediate session restart (routine session end, no banner). No-op when the loop is off or Live owns the mic. Reuses the live recognizer — see [startSessionReuse]. */
     private fun restartSessionNow() {
         if (!enabled || livePaused) return
-        startSession()
+        startSessionReuse()
     }
 
     /**
@@ -779,8 +901,14 @@ class AlwaysOnMicManager(
      * backoff, or from the UI Retry (service stops then starts).
      */
     private fun enterReconnecting(reason: String) {
-        if (!enabled || reconnecting) return
-        if (livePaused) return
+        if (!enabled || livePaused) return
+        // 1.4.24-PRO step 1 (RC-A): guard on the PENDING runnable,
+        // not on the flag. A stale reconnecting=true with no
+        // runnable pending (runnable already consumed, session
+        // never opened) must schedule a fresh backoff instead of
+        // no-op-ing into a dead loop.
+        if (reconnecting && reconnectRunnable != null) return
+        val wasAlreadyReconnecting = reconnecting
         reconnecting = true
         listeningActive = false
         listener.onListeningStateChanged(false)
@@ -789,6 +917,12 @@ class AlwaysOnMicManager(
             "stt", "RECONNECT_SCHEDULED",
             "Mic reconnecting (attempt ${reconnectAttempt + 1}): $reason"
         )
+        if (wasAlreadyReconnecting) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "SR_RECONNECT_RESCHEDULED",
+                "Reconnect re-entered while already reconnecting (stale flag, no runnable pending) — fresh backoff scheduled."
+            )
+        }
         scheduleReconnect()
     }
 
@@ -821,6 +955,12 @@ class AlwaysOnMicManager(
                 scheduleReconnect()
                 return@Runnable
             }
+            // 1.4.24-PRO step 1 (RC-A): clear the flag BEFORE the
+            // fresh start — if that start fails and re-enters
+            // reconnecting, the guard must see a clean flag and
+            // schedule a new backoff (onReadyForSpeech clears it
+            // too, on success).
+            reconnecting = false
             startSession()
         }
         reconnectRunnable = runnable
@@ -840,6 +980,9 @@ class AlwaysOnMicManager(
         reconnecting = false
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
+        busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        busyRetryRunnable = null
+        busyRetryCount = 0
         mainHandler.removeCallbacks(turnCheckRunnable)
         stopRecognizerSession()
         listeningActive = false
@@ -857,7 +1000,9 @@ class AlwaysOnMicManager(
      */
     fun isLoopHealthy(): Boolean {
         if (!enabled) return false
-        return sessionActive || sessionStarting || reconnecting
+        // 1.4.24-PRO step 1 (RC-A): reconnecting with NO pending
+        // runnable is UNHEALTHY (dead loop) so tap revival works.
+        return sessionActive || sessionStarting || (reconnecting && reconnectRunnable != null)
     }
 
     /** True while the loop is paused for a Live session. */
@@ -908,6 +1053,8 @@ class AlwaysOnMicManager(
         )
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
+        busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        busyRetryRunnable = null
         mainHandler.removeCallbacks(turnCheckRunnable)
         livePaused = true
         stopWakeListening()
@@ -1057,6 +1204,9 @@ class AlwaysOnMicManager(
         // A cancelled reconnect must never revive a stopped loop.
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
+        busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        busyRetryRunnable = null
+        busyRetryCount = 0
         quarantinedWhileSpeaking.clear()
         speakingDepth = 0
         isSpeaking = false
