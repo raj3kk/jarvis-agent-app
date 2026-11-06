@@ -196,6 +196,13 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             appendLine(trimmedTree)
         }
 
+        // 1.4.25 (Item 3): latency markers — diagnostics-only.
+        // llmStartMs is declared OUTSIDE the try so the catch can
+        // also report totalMs. Markers never branch on anything and
+        // never touch the fallback control flow; each marker call is
+        // wrapped in its own runCatching as belt-and-braces.
+        val llmStartMs = System.currentTimeMillis()
+
         return@withContext try {
             // A-M1 fallback chain: ANY attempt failure (429 / 401 /
             // network / JSON-shape / empty body) is fallback-eligible
@@ -204,10 +211,26 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
                 .map { it.trim().removePrefix("models/") }
                 .filter { it.isNotBlank() }.distinct()
+            runCatching {
+                JarvisStateRepository.addDiagnostic(
+                    "llm", "LLM_START",
+                    "step=$stepNumber provider=${prefs.provider.name} candidates=${candidates.size}"
+                )
+            }
             var lastError: Exception? = null
             var rawJson: String? = null
-            for (candidate in candidates) {
+            for ((attemptIndex, candidate) in candidates.withIndex()) {
+                // attemptStartMs is declared OUTSIDE the try: the
+                // catch below must also see it for the END marker.
+                var attemptStartMs = 0L
                 try {
+                    attemptStartMs = System.currentTimeMillis()
+                    runCatching {
+                        JarvisStateRepository.addDiagnostic(
+                            "llm", "LLM_ATTEMPT_START",
+                            "attempt=${attemptIndex + 1}/${candidates.size} model=$candidate"
+                        )
+                    }
                     rawJson = when (prefs.provider) {
                         AiProvider.GEMINI -> callGeminiApi(
                             apiKey = apiKey,
@@ -225,10 +248,22 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                             userPrompt = userPayload
                         )
                     }
+                    runCatching {
+                        JarvisStateRepository.addDiagnostic(
+                            "llm", "LLM_ATTEMPT_END",
+                            "attempt=${attemptIndex + 1}/${candidates.size} model=$candidate ms=${System.currentTimeMillis() - attemptStartMs} outcome=ok"
+                        )
+                    }
                     break
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (e: Exception) {
+                    runCatching {
+                        JarvisStateRepository.addDiagnostic(
+                            "llm", "LLM_ATTEMPT_END",
+                            "attempt=${attemptIndex + 1}/${candidates.size} model=$candidate ms=${System.currentTimeMillis() - attemptStartMs} outcome=${llmAttemptOutcome(e)}"
+                        )
+                    }
                     lastError = e
                     if (candidate == candidates.last()) throw e
                     // 1.4.13 (F-L2): fail FAST on non-retryable
@@ -245,7 +280,14 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     // else: fall through to the next candidate model
                 }
             }
-            parseDecisionJson(rawJson ?: throw (lastError ?: IllegalStateException("No model responded")))
+            val decision = parseDecisionJson(rawJson ?: throw (lastError ?: IllegalStateException("No model responded")))
+            runCatching {
+                JarvisStateRepository.addDiagnostic(
+                    "llm", "LLM_END",
+                    "step=$stepNumber totalMs=${System.currentTimeMillis() - llmStartMs} kind=OK"
+                )
+            }
+            decision
         } catch (e: Exception) {
             // Do NOT truncate the error to 60 chars any more: that hid the
             // "404 model not found" detail that would have named the fix.
@@ -272,6 +314,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             // 1.4.2: record the failure for the bug report (HTTP
             // code + body message only — never the key or URL).
             JarvisStateRepository.addDiagnostic("llm", kind, detail)
+            runCatching {
+                JarvisStateRepository.addDiagnostic(
+                    "llm", "LLM_END",
+                    "step=$stepNumber totalMs=${System.currentTimeMillis() - llmStartMs} kind=$kind"
+                )
+            }
             AgentDecision(
                 reply = reply,
                 thought = "Exception: ${e.message}",
@@ -316,6 +364,25 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
     private fun isNonRetryableLlmError(e: Exception): Boolean {
         val msg = (e.message ?: "").trim()
         return msg.startsWith("HTTP 401") || msg.startsWith("HTTP 404")
+    }
+
+    /**
+     * 1.4.25 (Item 3): latency-marker outcome for a failed attempt.
+     * HTTP code ONLY, from the "HTTP <code>: ..." prefix both API
+     * callers throw — the body after the colon is NEVER logged.
+     * Timeout = the socket timed out (OkHttp read/connect). Anything
+     * else (unknown host, TLS, …) is "network". Key=value pairs only:
+     * no user text, no reply text, no URL, no key.
+     */
+    private fun llmAttemptOutcome(e: Exception): String {
+        val msg = (e.message ?: "").trim()
+        val code = Regex("^HTTP (\\d{3})").find(msg)?.groupValues?.getOrNull(1)
+        if (code != null) return "error:$code"
+        if (e is java.net.SocketTimeoutException ||
+            msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("timed out", ignoreCase = true)
+        ) return "timeout"
+        return "error:network"
     }
 
     private fun buildSystemPrompt(): String {
@@ -936,6 +1003,18 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
             .map { it.trim().removePrefix("models/") }
             .filter { it.isNotBlank() }.distinct()
+        // 1.4.25 (Item 3): latency markers — diagnostics-only, same
+        // shape as decideNextStep. planStartMs is declared OUTSIDE
+        // the loop so every catch can report totalMs. Markers never
+        // branch on anything and never touch the retry budget; each
+        // marker call is wrapped in its own runCatching.
+        val planStartMs = System.currentTimeMillis()
+        runCatching {
+            JarvisStateRepository.addDiagnostic(
+                "llm", "PLAN_LLM_START",
+                "provider=${prefs.provider.name} candidates=${candidates.size}"
+            )
+        }
         // PLAN retry budget (§3d): 1 re-plan on a parse error, then ask.
         var attempt = 0
         while (attempt < 2) {
@@ -944,28 +1023,63 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 var rawJson: String? = null
                 var lastError: Exception? = null
                 for (candidate in candidates) {
+                    // attemptStartMs is declared OUTSIDE the try: the
+                    // catch below must also see it for the END marker.
+                    var attemptStartMs = 0L
                     try {
+                        attemptStartMs = System.currentTimeMillis()
+                        runCatching {
+                            JarvisStateRepository.addDiagnostic(
+                                "llm", "PLAN_LLM_ATTEMPT_START",
+                                "attempt=$attempt/2 model=$candidate"
+                            )
+                        }
                         rawJson = callGeminiApi(
                             apiKey = apiKey,
                             model = candidate,
                             systemPrompt = systemPrompt,
                             userPrompt = prompt
                         )
+                        runCatching {
+                            JarvisStateRepository.addDiagnostic(
+                                "llm", "PLAN_LLM_ATTEMPT_END",
+                                "attempt=$attempt/2 model=$candidate ms=${System.currentTimeMillis() - attemptStartMs} outcome=ok"
+                            )
+                        }
                         break
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (e: Exception) {
+                        runCatching {
+                            JarvisStateRepository.addDiagnostic(
+                                "llm", "PLAN_LLM_ATTEMPT_END",
+                                "attempt=$attempt/2 model=$candidate ms=${System.currentTimeMillis() - attemptStartMs} outcome=${llmAttemptOutcome(e)}"
+                            )
+                        }
                         lastError = e
                         if (candidate == candidates.last()) throw e
                         if (isNonRetryableLlmError(e)) throw e
                     }
                 }
-                return@withContext parsePlanJson(
+                val planned = parsePlanJson(
                     rawJson ?: throw (lastError ?: IllegalStateException("No model responded"))
                 )
+                runCatching {
+                    JarvisStateRepository.addDiagnostic(
+                        "llm", "PLAN_LLM_END",
+                        "totalMs=${System.currentTimeMillis() - planStartMs} kind=OK"
+                    )
+                }
+                return@withContext planned
             } catch (e: PlanParseException) {
                 if (attempt >= 2) {
                     JarvisStateRepository.addDiagnostic("llm", "PLAN_PARSE", (e.message ?: "").take(200))
+                    runCatching {
+                        JarvisStateRepository.addDiagnostic(
+                            "llm", "PLAN_LLM_END",
+                            "totalMs=${System.currentTimeMillis() - planStartMs} kind=PARSE_ERROR"
+                        )
+                    }
                     return@withContext PlanResult.Failed(
                         "Plan JSON dobara bhi gadbad aaya (${(e.message ?: "").take(150)}). Goal dobara simple shabdon me bolo."
                     )
@@ -976,8 +1090,20 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             } catch (e: Exception) {
                 val detail = (e.message ?: "Unknown error").take(200)
                 JarvisStateRepository.addDiagnostic("llm", "PLAN_ERROR", detail)
+                runCatching {
+                    JarvisStateRepository.addDiagnostic(
+                        "llm", "PLAN_LLM_END",
+                        "totalMs=${System.currentTimeMillis() - planStartMs} kind=ERROR"
+                    )
+                }
                 return@withContext PlanResult.Failed("Planner error: $detail")
             }
+        }
+        runCatching {
+            JarvisStateRepository.addDiagnostic(
+                "llm", "PLAN_LLM_END",
+                "totalMs=${System.currentTimeMillis() - planStartMs} kind=ERROR"
+            )
         }
         PlanResult.Failed("Planner se plan nahi bana — dobara koshish karo.")
     }
