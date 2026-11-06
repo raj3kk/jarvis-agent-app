@@ -874,6 +874,21 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 1.4.25-PRO Step 1B (1f): live music-active state, same
+     * AudioManager access path as controlMediaPlayback — no new
+     * permission. Observation only: it never starts, stops, or
+     * changes playback. False on any error (unknown state reads
+     * as "not playing", which callers treat as unverified, never
+     * as a success).
+     */
+    fun isMusicActive(): Boolean {
+        return runCatching {
+            val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audio.isMusicActive
+        }.getOrDefault(false)
+    }
+
+    /**
      * Copies text to the Android system clipboard.
      */
     fun copyToClipboard(text: String): Boolean {

@@ -774,30 +774,92 @@ class JarvisAgentEngine(
             // Boolean IS the result — a false return is a failed
             // action, never a success claim. Speak the failure,
             // not "kar diya", when the call reports false.
+            // 1.4.25-PRO Step 1B (1f): the Boolean is dispatch-only
+            // — a key swallowed with no player session still
+            // returns true. Before speaking "kar diya", check
+            // AudioManager.isMusicActive() before vs after (same
+            // access path as controlMediaPlayback, no new
+            // permission). No state change in the commanded
+            // direction = an honest line, never "kar diya". The
+            // post-check waits briefly so the player can react to
+            // the key before its state is read. NEXT / PREVIOUS
+            // have no track-change signal observable via
+            // AudioManager — the checkable proxy there is that
+            // music is still playing afterwards.
             if (lower.contains("music pause") || lower.contains("gaana roko") ||
                 lower.contains("song pause")
             ) {
+                val preActive = acc.isMusicActive()
                 val ok = acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { speak(if (ok) "Music pause kar diya." else "Music pause nahi ho paya.") }
+                scope.launch {
+                    if (!ok) {
+                        speak("Music pause nahi ho paya.")
+                    } else {
+                        delay(700)
+                        val postActive = acc.isMusicActive()
+                        speak(
+                            when {
+                                preActive && !postActive -> "Music pause kar diya."
+                                !preActive -> "Music pehle se nahi baj raha tha, isliye pause karne ko kuch nahi tha."
+                                else -> "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
+                            }
+                        )
+                    }
+                }
                 return true
             }
             if (lower.contains("music play") || lower.contains("gaana chalao") ||
                 lower.contains("song play")
             ) {
+                val preActive = acc.isMusicActive()
                 val ok = acc.controlMediaPlayback("PLAY_PAUSE")
-                scope.launch { speak(if (ok) "Music play kar diya." else "Music play nahi ho paya.") }
+                scope.launch {
+                    if (!ok) {
+                        speak("Music play nahi ho paya.")
+                    } else {
+                        delay(700)
+                        val postActive = acc.isMusicActive()
+                        speak(
+                            when {
+                                !preActive && postActive -> "Music play kar diya."
+                                preActive && postActive -> "Music pehle se baj raha tha."
+                                else -> "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
+                            }
+                        )
+                    }
+                }
                 return true
             }
             if (lower.contains("next song") || lower.contains("agla gaana") ||
                 lower.contains("next gaana")
             ) {
                 val ok = acc.controlMediaPlayback("NEXT")
-                scope.launch { speak(if (ok) "Agla gaana chala diya." else "Agla gaana nahi chal paya.") }
+                scope.launch {
+                    if (!ok) {
+                        speak("Agla gaana nahi chal paya.")
+                    } else {
+                        delay(700)
+                        speak(
+                            if (acc.isMusicActive()) "Agla gaana chala diya."
+                            else "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
+                        )
+                    }
+                }
                 return true
             }
             if (lower.contains("previous song") || lower.contains("pichla gaana")) {
                 val ok = acc.controlMediaPlayback("PREVIOUS")
-                scope.launch { speak(if (ok) "Pichla gaana chala diya." else "Pichla gaana nahi chal paya.") }
+                scope.launch {
+                    if (!ok) {
+                        speak("Pichla gaana nahi chal paya.")
+                    } else {
+                        delay(700)
+                        speak(
+                            if (acc.isMusicActive()) "Pichla gaana chala diya."
+                            else "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
+                        )
+                    }
+                }
                 return true
             }
             // Direct call: "<name> ko call karo/lagao"
@@ -1401,6 +1463,14 @@ class JarvisAgentEngine(
                     formattedTree = "Accessibility Service is NOT enabled yet. Only conversational chat, OPEN_APP, or hardware actions are available."
                 )
 
+                // 1.4.25-PRO Step 1B (1f): pre-action music state for
+                // the MEDIA_CONTROL evidence check — captured next to
+                // the pre-action screen snapshot, before the LLM
+                // decides and the action runs. Null when the service
+                // is absent (unknown state, never treated as a
+                // success by the evidence check).
+                val preMusicActive = accService?.isMusicActive()
+
                 // Stuck-loop detection (A-M11): stuck needs 2+
                 // CONSECUTIVE unchanged screens, and screen-invariant
                 // actions (volume / flashlight / media / WAIT) never
@@ -1720,7 +1790,7 @@ class JarvisAgentEngine(
                         clearTaskScopedState()
                         return
                     }
-                    when (verifyStepEvidence(decision, stepResult, accService)) {
+                    when (verifyStepEvidence(decision, stepResult, accService, preSnapshot = snapshot, preMusicActive = preMusicActive)) {
                         StepEvidence.VERIFIED -> {
                             // The held completion reply (C2) may be
                             // spoken now — the evidence backs it.
@@ -1854,22 +1924,39 @@ class JarvisAgentEngine(
      * Evidence table for the verified exit (C1/C4/C7). Decides
      * whether a step the model marked isCompleted may end the
      * task. Per-action evidence:
-     * - NONE: no action taken, the reply IS the outcome — vacuous.
+     * - NONE: no action taken — never evidence (1A, AMBIGUOUS).
      * - CREATE_PROJECT / WRITE_PROJECT_FILE: validation OK +
      *   written + preview GET 200 (verifyBuildEvidence).
-     * - UI actions: action ok=true PLUS one verification snapshot
-     *   taken AFTER the action ran (non-empty tree). ok=false is a
-     *   definite failure; a missing/empty snapshot is ambiguous.
-     * - FLASHLIGHT / VOLUME / MEDIA_CONTROL / WAIT / SAVE_MEMORY:
-     *   screen-invariant (same set the stuck detector uses) — the
-     *   action's own Boolean is the whole evidence, no snapshot.
-     * Ambiguous evidence continues the loop (adopted default),
-     * never fails outright, never reports success.
+     * - MEDIA_CONTROL: AudioManager.isMusicActive() before vs
+     *   after (1B/1f) — PLAY / PLAY_PAUSE-towards-play needs
+     *   inactive→active, PAUSE / PLAY_PAUSE-towards-pause needs
+     *   active→inactive; NEXT / PREVIOUS have no track-change
+     *   signal observable here, so they are never VERIFIED on
+     *   dispatch alone (AMBIGUOUS).
+     * - UI actions: action ok=true PLUS a post-action snapshot
+     *   that is non-empty AND changed vs the pre-action snapshot
+     *   (1B/1c, H5) — a non-empty screen alone proves a screen
+     *   exists, not that the action achieved its outcome.
+     * - FLASHLIGHT / VOLUME / WAIT / SAVE_MEMORY: screen-invariant
+     *   — the action's own Boolean is the whole evidence, no
+     *   snapshot (real system calls / trivially true by
+     *   construction). MEDIA_CONTROL was removed from this set
+     *   in 1B: its Boolean is dispatch-only.
+     * ok=false is a definite failure; a missing/empty snapshot, an
+     * unchanged screen, or an unobserved music-state transition is
+     * ambiguous. Ambiguous evidence continues the loop (adopted
+     * default), never fails outright, never reports success.
+     * Per-kind expected-text checks (TYPE_TEXT / OPEN_APP /
+     * WHATSAPP_SEND / YOUTUBE_PLAY / OPEN_BROWSER-foreground)
+     * come in a later step — this step is the interface + default
+     * screen-change rule only.
      */
     private suspend fun verifyStepEvidence(
         decision: AgentDecision,
         result: ActionResult?,
-        accService: JarvisAccessibilityService?
+        accService: JarvisAccessibilityService?,
+        preSnapshot: ScreenSnapshot? = null,
+        preMusicActive: Boolean? = null
     ): StepEvidence {
         // 1.4.25-PRO Step 1A (H1, defence-in-depth): NONE is never
         // evidence. The chat-end branch in the loop ends a
@@ -1886,14 +1973,64 @@ class JarvisAgentEngine(
         // model claimed (C1). The media Boolean arrives here as
         // ok (C7 loop side).
         if (!result.ok) return StepEvidence.FAILED
-        if (decision.action in setOf("FLASHLIGHT", "VOLUME", "MEDIA_CONTROL", "WAIT", "SAVE_MEMORY")) {
+        // 1.4.25-PRO Step 1B (1f): MEDIA_CONTROL is no longer
+        // Boolean-only — a dispatched media key proves nothing when
+        // no player session exists. Require the music-active state
+        // to move in the commanded direction.
+        if (decision.action == "MEDIA_CONTROL") {
+            return verifyMediaControlEvidence(decision, preMusicActive, accService)
+        }
+        if (decision.action in setOf("FLASHLIGHT", "VOLUME", "WAIT", "SAVE_MEMORY")) {
             return StepEvidence.VERIFIED
         }
         val verifySnapshot = accService?.captureScreenSnapshot()
-        return if (verifySnapshot != null && verifySnapshot.elements.isNotEmpty()) {
-            StepEvidence.VERIFIED
-        } else {
-            StepEvidence.AMBIGUOUS
+        if (verifySnapshot == null || verifySnapshot.elements.isEmpty()) {
+            return StepEvidence.AMBIGUOUS
+        }
+        // 1.4.25-PRO Step 1B (1c, H5): the post-action screen must
+        // have CHANGED vs the pre-action snapshot — formatted-tree
+        // hash, owning package, or element set. An identical screen
+        // means the action had no observable effect (stale node,
+        // wrong field, wrong app), so it is ambiguous, never
+        // verified. A missing pre-snapshot cannot prove a change,
+        // so it is ambiguous too.
+        if (preSnapshot == null) return StepEvidence.AMBIGUOUS
+        val screenChanged = verifySnapshot.formattedTree.hashCode() != preSnapshot.formattedTree.hashCode() ||
+            verifySnapshot.packageName != preSnapshot.packageName ||
+            verifySnapshot.elements != preSnapshot.elements
+        return if (screenChanged) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+    }
+
+    /**
+     * 1.4.25-PRO Step 1B (1f): MEDIA_CONTROL evidence from
+     * AudioManager.isMusicActive() before vs after the dispatch.
+     * PLAY / PLAY_PAUSE-towards-play requires inactive→active;
+     * PAUSE / PLAY_PAUSE-towards-pause requires active→inactive;
+     * NEXT / PREVIOUS have no track-change signal observable here,
+     * so they are AMBIGUOUS, never VERIFIED on dispatch alone. An
+     * unknown pre/post state is AMBIGUOUS too — a missing signal
+     * never becomes a success. The short settle delay lets the
+     * player react to the key before the post-state is read; the
+     * AMBIGUOUS→continue default still covers a slow player.
+     */
+    private suspend fun verifyMediaControlEvidence(
+        decision: AgentDecision,
+        preMusicActive: Boolean?,
+        accService: JarvisAccessibilityService?
+    ): StepEvidence {
+        if (preMusicActive == null || accService == null) return StepEvidence.AMBIGUOUS
+        delay(500)
+        val postMusicActive = accService.isMusicActive()
+        return when (decision.text.uppercase()) {
+            "PLAY" -> if (!preMusicActive && postMusicActive) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            "PAUSE" -> if (preMusicActive && !postMusicActive) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            // PLAY_PAUSE toggles: whichever direction the pre-state
+            // implies, the state must flip.
+            "PLAY_PAUSE" -> if (preMusicActive != postMusicActive) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            // NEXT / PREVIOUS / anything else: no track-change
+            // signal is observable via AudioManager, so dispatch
+            // alone never verifies.
+            else -> StepEvidence.AMBIGUOUS
         }
     }
 
