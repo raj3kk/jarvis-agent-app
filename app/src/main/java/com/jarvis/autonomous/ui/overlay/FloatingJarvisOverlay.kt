@@ -278,12 +278,21 @@ class FloatingJarvisOverlay(
                 Quad("🔊", step.ifBlank { "Bol raha hoon" }, "#00B0FF", true)
             playback == com.jarvis.autonomous.data.PlaybackState.PREPARING ->
                 Quad("⏳", "Bolne ki tayyari…", "#78909C", true)
-            state == AgentRunState.LISTENING -> Quad("🟢", step.ifBlank { "Sun raha hoon" }, "#00E676", false)
+            // 1.4.24-PRO step 3 (RC-D): task state stays truthful
+            // during a task — THINKING / EXECUTING / SPEAKING
+            // outrank the reconnecting pill. But a stale LISTENING
+            // must NOT outrank it, so the reconnecting branch sits
+            // above LISTENING (and above the live-listening green
+            // branch): during a reconnect the pill shows yellow
+            // "Dobara jud raha hoon…" even if agent state is
+            // stale-LISTENING; when listening is truly live it
+            // still shows green via `loopOn && listening`.
             state == AgentRunState.THINKING -> Quad("🧠", step.ifBlank { "Soch raha hoon" }, "#D500F9", true)
             state == AgentRunState.EXECUTING_STEP -> Quad("⚡", step.ifBlank { "Kaam kar raha hoon" }, "#FFAB00", true)
-            state == AgentRunState.WAITING_USER_REPLY -> Quad("❓", step.ifBlank { "Jawab ka intezar" }, "#00E676", true)
             state == AgentRunState.SPEAKING -> Quad("🔊", step.ifBlank { "Bol raha hoon" }, "#00B0FF", true)
             loopOn && reconnecting != null -> Quad("🟡", "Dobara jud raha hoon…", "#FFAB00", false)
+            state == AgentRunState.LISTENING -> Quad("🟢", step.ifBlank { "Sun raha hoon" }, "#00E676", false)
+            state == AgentRunState.WAITING_USER_REPLY -> Quad("❓", step.ifBlank { "Jawab ka intezar" }, "#00E676", true)
             loopOn && listening -> Quad("🟢", "Sun raha hoon", "#00E676", false)
             loopOn -> Quad("🎙️", "Mic ON — jud raha hai…", "#00E5FF", false)
             else -> Quad("🎙️", "Mic OFF — tap karo", "#00E5FF", false)

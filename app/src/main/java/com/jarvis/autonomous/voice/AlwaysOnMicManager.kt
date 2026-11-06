@@ -270,6 +270,15 @@ class AlwaysOnMicManager(
     /** True between startSession() and onReadyForSpeech/onError. */
     @Volatile
     private var sessionStarting: Boolean = false
+    /** 1.4.24-PRO step 3 (RC-F): wall-clock ms of the last loop
+     * session start attempt (startSession() / startSessionReuse()
+     * — the routine reuse path is a session start too, and it is
+     * the path that sets sessionStarting on every routine
+     * restart, so the stamp must live in both or the watchdog
+     * below would misfire on a stale timestamp). The hung-session
+     * watchdog in turnCheckRunnable compares against this. */
+    @Volatile
+    private var lastSessionStartMs: Long = 0L
     /** True once the current session delivered any non-blank transcript. */
     private var sessionHadTranscript: Boolean = false
     // 1.4.7 (A1): SEGMENT assembly. A recognizer session ends at
@@ -613,11 +622,28 @@ class AlwaysOnMicManager(
             if (livePaused) {
                 return
             }
+            val nowMs = System.currentTimeMillis()
+            // 1.4.24-PRO step 3 (RC-F): hung-session watchdog —
+            // no new timer, uses this existing 250ms turn-check
+            // chain. A healthy startListening reaches
+            // onReadyForSpeech in well under 10s; if
+            // sessionStarting is still true after 10s the service
+            // never called back, so kill the hung session and
+            // route into the frozen backoff. 10s is a watchdog,
+            // not a grace window.
+            if (sessionStarting && nowMs - lastSessionStartMs > 10_000L) {
+                sessionStarting = false
+                stopRecognizerSession()
+                JarvisStateRepository.addDiagnostic(
+                    "stt", "SR_START_TIMEOUT",
+                    "System mic session start timed out after ${nowMs - lastSessionStartMs}ms — reconnecting."
+                )
+                enterReconnecting("System mic session start timed out — reconnecting.")
+            }
             if (isSpeaking) {
                 mainHandler.postDelayed(this, TurnThresholds.TURN_CHECK_INTERVAL_MS)
                 return
             }
-            val nowMs = System.currentTimeMillis()
             when (val outcome = turnDetector.check(nowMs)) {
                 is TurnOutcome.Complete -> {
                     val text = outcome.text
@@ -776,6 +802,7 @@ class AlwaysOnMicManager(
         sessionHadTranscript = false
         val sessionId = currentSessionId
         lastSpeechMs = System.currentTimeMillis()
+        lastSessionStartMs = System.currentTimeMillis()
         val recognizer = runCatching {
             SpeechRecognizer.createSpeechRecognizer(appContext)
         }.getOrNull()
@@ -844,6 +871,11 @@ class AlwaysOnMicManager(
         currentSessionId++
         val sessionId = currentSessionId
         lastSpeechMs = System.currentTimeMillis()
+        // 1.4.24-PRO step 3 (RC-F): same stamp as startSession() —
+        // this reuse path is a session start (it sets
+        // sessionStarting), so the hung-session watchdog needs the
+        // fresh timestamp here too, not the last recreate's.
+        lastSessionStartMs = System.currentTimeMillis()
         if (lastRestartWasRecreate) {
             JarvisStateRepository.addDiagnostic(
                 "stt", "SR_REUSED_SESSION",
