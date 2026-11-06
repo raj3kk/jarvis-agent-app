@@ -714,7 +714,11 @@ class JarvisForegroundService : Service() {
                     "Mic not restored: RECORD_AUDIO revoked since last run."
                 )
             } else {
-                voiceManager.stopListeningInternal()
+                // 1.4.24-PRO step 2 (RC-C): stop wake
+                // synchronously — the async post would only run
+                // after this call stack returns, i.e. after the
+                // loop below already started listening.
+                voiceManager.stopListeningNow()
                 // 1.4.18: MIC_RESTORE marker — greeting is removed.
                 // 1.4.23-PRO: restore starts the loop only (no VAD
                 // init any more). Restore does NOT set
@@ -857,7 +861,12 @@ class JarvisForegroundService : Service() {
                             }
                         }
                     }
-                    voiceManager.stopListeningInternal()
+                    // 1.4.24-PRO step 2 (RC-C): stop wake
+                    // synchronously BEFORE micManager.start() —
+                    // the async post ran only after this call
+                    // stack returned, i.e. while wake still held
+                    // the mic (BUSY on the loop's first start).
+                    voiceManager.stopListeningNow()
                     // 1.4.23-PRO (stale-first resume): no suspended
                     // state exists any more, so the FIRST check is
                     // the dead-while-enabled revival below — a tap
@@ -931,7 +940,10 @@ class JarvisForegroundService : Service() {
                 // (reconnecting loops stay enabled), so RETRY must
                 // force the stop itself.
                 if (::micManager.isInitialized) {
-                    voiceManager.stopListeningInternal()
+                    // 1.4.24-PRO step 2 (RC-C): same sync
+                    // handover as ACTION_START_LISTENING —
+                    // wake stops before micManager.stop()/start().
+                    voiceManager.stopListeningNow()
                     micManager.stop()
                     if (micManager.start()) {
                         // 1.4.18: Retry tap is fresh user direction.

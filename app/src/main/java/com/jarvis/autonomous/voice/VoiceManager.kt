@@ -639,6 +639,31 @@ class VoiceManager(
         return TurnDetector.matchWakeTrigger(text)
     }
 
+    /**
+     * 1.4.24-PRO step 2 (RC-C): synchronous twin of
+     * [stopListeningInternal] — the posted runnable's body
+     * executed synchronously, on the calling thread. Callers
+     * are the service's onStartCommand / onCreate (main
+     * thread), so the wake recognizer is destroyed BEFORE the
+     * caller starts the loop recognizer — the async post in
+     * [stopListeningInternal] could not run until the current
+     * call stack returned, so a tap/Retry started the loop
+     * while wake still held the mic (BUSY on first start).
+     * Speak paths keep the async [stopListeningInternal];
+     * no loop start follows them.
+     */
+    fun stopListeningNow() {
+        stopWakeSession()
+        cancelListenOnceSession()
+        val cb = pendingSingleReplyCallback
+        pendingSingleReplyCallback = null
+        cb?.invoke(null)
+        JarvisStateRepository.addDiagnostic(
+            "mic", "WAKE_STOPPED_SYNC",
+            "Wake/one-shot stopped synchronously before loop start (tap/Retry handover)."
+        )
+    }
+
     fun stopListeningInternal() {
         mainHandler.post {
             // System-recognizer teardown (1.4.23-PRO): stop the wake session

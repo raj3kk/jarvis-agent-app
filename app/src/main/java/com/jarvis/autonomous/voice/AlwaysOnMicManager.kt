@@ -737,6 +737,14 @@ class AlwaysOnMicManager(
         if (!hasNetwork()) {
             enterReconnecting("No network — mic reconnects when network returns.")
         } else {
+            // 1.4.24-PRO step 2 (RC-C, defence in depth):
+            // start() is self-safe regardless of caller ordering
+            // — the wake session is stopped synchronously before
+            // the loop session starts, so the loop's first
+            // startListening never lands while wake holds the
+            // mic. (Any residual binder-teardown race is covered
+            // by step 1's BUSY fast-retry.)
+            stopWakeListening()
             startSession()
         }
         return true
@@ -1659,24 +1667,16 @@ class AlwaysOnMicManager(
         return true
     }
 
-    private fun startWakeSession() {
-        if (!wakeActive) return
-        stopWakeRecognizer()
-        wakeSessionHadTranscript = false
-        val sessionId = wakeSessionId
-        val recognizer = runCatching {
-            SpeechRecognizer.createSpeechRecognizer(appContext)
-        }.getOrNull()
-        if (recognizer == null) {
-            JarvisStateRepository.addDiagnostic(
-                "stt", "WAKE_NO_RECOGNIZER",
-                "Wake session recognizer create failed — stopping wake listening."
-            )
-            stopWakeListening()
-            return
-        }
-        wakeRecognizer = recognizer
-        recognizer.setRecognitionListener(object : RecognitionListener {
+    /**
+     * 1.4.24-PRO step 2 (RC-B, wake): the wake session's
+     * listener, shared by the recreate path ([startWakeSession])
+     * and the routine-reuse path ([startWakeSessionReuse]).
+     * Extracted verbatim from [startWakeSession] — no behaviour
+     * change. The session-id guard ignores late callbacks from
+     * an ended session.
+     */
+    private fun makeWakeListener(sessionId: Int): RecognitionListener {
+        return object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 if (sessionId != wakeSessionId) return
                 JarvisStateRepository.setWakeListening(true)
@@ -1749,7 +1749,37 @@ class AlwaysOnMicManager(
             }
             override fun onPartialResults(partialResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
+        }
+    }
+
+    /**
+     * 1.4.24-PRO step 2 (RC-B, wake): RECREATE path — destroys
+     * the previous wake session's recognizer, creates a fresh
+     * one and calls startListening. Callers: startWakeListening()
+     * and the hard-error backoff in scheduleWakeRestart() —
+     * every path where the old instance is already destroyed or
+     * the teardown needs time to settle (the backoff IS the
+     * settle). Routine session ends use [startWakeSessionReuse]
+     * instead and never come here.
+     */
+    private fun startWakeSession() {
+        if (!wakeActive) return
+        stopWakeRecognizer()
+        wakeSessionHadTranscript = false
+        val sessionId = wakeSessionId
+        val recognizer = runCatching {
+            SpeechRecognizer.createSpeechRecognizer(appContext)
+        }.getOrNull()
+        if (recognizer == null) {
+            JarvisStateRepository.addDiagnostic(
+                "stt", "WAKE_NO_RECOGNIZER",
+                "Wake session recognizer create failed — stopping wake listening."
+            )
+            stopWakeListening()
+            return
+        }
+        wakeRecognizer = recognizer
+        recognizer.setRecognitionListener(makeWakeListener(sessionId))
         val started = runCatching {
             recognizer.startListening(buildRecognizerIntent(wakeLanguage, false))
         }
@@ -1766,9 +1796,52 @@ class AlwaysOnMicManager(
         // asserts the flag; errors and the backoff clear it.
     }
 
+    /**
+     * 1.4.24-PRO step 2 (RC-B/RC-E, wake): ROUTINE restart —
+     * reuses the live wake recognizer instead of destroying +
+     * recreating it. Called from inside a terminal callback
+     * (onResults / NO_MATCH / SPEECH_TIMEOUT / language retry)
+     * via [restartWakeSessionNow], i.e. the session has already
+     * ended, so the same instance can startListening again
+     * immediately (AOSP-sanctioned pattern) with no
+     * async-teardown race and no ERROR_RECOGNIZER_BUSY. Same
+     * shape as step 1's [startSessionReuse]: increments the
+     * session id first (late callbacks from the ended session
+     * are ignored) and swaps in a fresh listener for the new
+     * id. If no live instance exists, falls back to the
+     * [startWakeSession] recreate path. A startListening throw
+     * on the reused instance destroys it and schedules the
+     * backoff restart, exactly like the recreate path.
+     */
+    private fun startWakeSessionReuse() {
+        if (!wakeActive || enabled) return
+        val recognizer = wakeRecognizer
+        if (recognizer == null) {
+            startWakeSession()
+            return
+        }
+        wakeSessionHadTranscript = false
+        wakeSessionId++
+        val sessionId = wakeSessionId
+        recognizer.setRecognitionListener(makeWakeListener(sessionId))
+        val started = runCatching {
+            recognizer.startListening(buildRecognizerIntent(wakeLanguage, false))
+        }
+        if (started.isFailure) {
+            val e = started.exceptionOrNull()
+            wakeRecognizer = null
+            runCatching { recognizer.destroy() }
+            JarvisStateRepository.addDiagnostic(
+                "stt", "WAKE_START_FAILED",
+                "Wake session startListening threw (${e?.javaClass?.simpleName}) on reused instance — restarting in ${wakeBackoffMs / 1000}s."
+            )
+            scheduleWakeRestart()
+        }
+    }
+
     private fun restartWakeSessionNow() {
         if (!wakeActive || enabled) return
-        startWakeSession()
+        startWakeSessionReuse()
     }
 
     private fun scheduleWakeRestart() {
