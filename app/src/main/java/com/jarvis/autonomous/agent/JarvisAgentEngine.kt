@@ -1702,6 +1702,24 @@ class JarvisAgentEngine(
                         JarvisStateRepository.setCurrentGoal("")
                         return
                     }
+                    // 1.4.25-PRO Step 1A (H1/H2): a NONE turn that
+                    // claims completion is a CHAT end, never a task
+                    // DONE. The model's reply was already posted /
+                    // spoken above — do NOT post or speak it again,
+                    // and do NOT finish a routine, index a turn, or
+                    // say "Task Completed": no action ran, so there
+                    // is nothing to verify. The C6 guard above stays
+                    // first: a NONE+askUser turn still waits for
+                    // approval instead of ending here.
+                    if (decision.action == "NONE" && decision.isCompleted) {
+                        JarvisStateRepository.setAgentState(
+                            AgentRunState.IDLE,
+                            "Ready for next command"
+                        )
+                        JarvisStateRepository.setCurrentGoal("")
+                        clearTaskScopedState()
+                        return
+                    }
                     when (verifyStepEvidence(decision, stepResult, accService)) {
                         StepEvidence.VERIFIED -> {
                             // The held completion reply (C2) may be
@@ -1853,7 +1871,13 @@ class JarvisAgentEngine(
         result: ActionResult?,
         accService: JarvisAccessibilityService?
     ): StepEvidence {
-        if (decision.action == "NONE") return StepEvidence.VERIFIED
+        // 1.4.25-PRO Step 1A (H1, defence-in-depth): NONE is never
+        // evidence. The chat-end branch in the loop ends a
+        // NONE+isCompleted turn before this is reached, so this
+        // line is unreachable for a completed NONE; it stays
+        // AMBIGUOUS so a NONE can never again be verified as a
+        // task step.
+        if (decision.action == "NONE") return StepEvidence.AMBIGUOUS
         if (result == null) return StepEvidence.AMBIGUOUS
         if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE")) {
             return verifyBuildEvidence()

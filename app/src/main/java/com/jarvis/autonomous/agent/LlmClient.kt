@@ -123,7 +123,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     userText = userGoal,
                     recentChat = history
                 )
-                AgentDecision(reply = reply, thought = "Local Gemma chat", action = "NONE", isCompleted = true)
+                AgentDecision(reply = reply, thought = "Local Gemma chat", action = "NONE", isCompleted = false)
             } catch (e: Exception) {
                 AgentDecision(
                     reply = "Local model se jawab nahi aaya (${(e.message ?: "").take(120)}). AI Brain me dobara Gemini chuno ya model reload karo.",
@@ -327,8 +327,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
 
             You are JARVIS, an autonomous Android OS agent with full Accessibility Service control, Multimodal Vision Sight, AND a warm, friendly human-like companion.
             You operate in a multi-step ReAct loop:
-            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE".
-            2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved!
+            1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE". Set isCompleted=true ONLY for pure casual chat.
+            2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved! If you believe the task is already done, say so in reply with action="NONE" and isCompleted=true — Jarvis will re-check the screen before agreeing.
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
             5. ${WebsiteBuildSpec.BUILDER_PROMPT_FRAGMENT}
@@ -336,7 +336,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS STEPS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
 
             AVAILABLE ACTIONS (Pick strictly ONE per step):
-            - "NONE": No screen action needed (casual chat, asking user a question, or task already complete).
+            - "NONE": No screen action needed (casual chat only, or asking the user a question). NEVER use NONE for a task step, and NEVER claim in reply that an action happened when action is NONE.
             - "OPEN_APP": Launch an installed app by name. Fill `appName` (e.g. "WhatsApp", "YouTube", "Instagram", "Chrome", "Spotify", "Settings").
             - "YOUTUBE_SEARCH": Directly open YouTube search results for a song/video query! Fill `text` with search query.
             - "YOUTUBE_PLAY": Search YouTube AND play the first video result automatically. Fill `text` with search query. Use this when the user said play/chalao/bajao.
@@ -875,10 +875,13 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             browserSpeakSummary = obj.optBoolean("browserSpeakSummary", true),
             browserShowPage = obj.optBoolean("browserShowPage", false),
             askUser = obj.optBoolean("askUser", false),
-            // A-H1: isCompleted defaults FALSE for non-NONE actions —
-            // a step without an explicit completion flag must NOT
-            // end the task (engine exits on isCompleted only, A-H2).
-            isCompleted = obj.optBoolean("isCompleted", action == "NONE")
+            // A-H1 (1.4.25-PRO Step 1A): isCompleted defaults FALSE
+            // for EVERY action, NONE included. A step without an
+            // explicit completion flag must NOT end the task — the
+            // old NONE default let a model that answered instead
+            // of acting end the task as VERIFIED with zero action
+            // and zero evidence.
+            isCompleted = obj.optBoolean("isCompleted", false)
         )
     }
 
