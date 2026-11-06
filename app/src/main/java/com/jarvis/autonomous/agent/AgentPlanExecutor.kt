@@ -1508,11 +1508,6 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         return clean.ifBlank { "jarvis-site" }
     }
 
-    private fun parseCreateTables(schema: String): List<String> {
-        val regex = Regex("""(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([A-Za-z_][A-Za-z0-9_]*)""")
-        return regex.findAll(schema).map { it.groupValues[1] }.distinct().toList()
-    }
-
     /** 1.4.22 (item 5a): expected schema as table -> column set,
      *  parsed from the CREATE TABLE blocks. Per block, the
      *  parenthesised body is split on top-level commas; the first
@@ -1521,21 +1516,90 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
      *  CONSTRAINT), which are skipped. Quotes/backticks are
      *  stripped and both sides lowercased (Postgres folds
      *  unquoted identifiers; builder-generated schemas are
-     *  lowercase). NOTED LIMITATION (not fixed): a quoted
-     *  mixed-case column in hand-edited schema.sql would
-     *  false-mismatch. */
+     *  lowercase). 1.4.25 (step 2d): the head regex also accepts
+     *  an optional schema qualifier (`public.users` — the bare
+     *  name is still captured, matching the
+     *  `table_schema = 'public'` verify query); `--` comments
+     *  outside string literals are stripped before the depth
+     *  scan. NOTED LIMITATION (false-match, not false-mismatch):
+     *  a quoted mixed-case identifier folds to lowercase on both
+     *  sides, so verification passes while the real identifier
+     *  differs in case — a SUPABASE_VERIFY_CASEFOLD diagnostic
+     *  (table + column names only, no values) is logged whenever
+     *  a quoted identifier was folded. */
+
+    /** 1.4.25 (step 2d): strip `--` line comments that sit OUTSIDE
+     *  string literals, before the depth scan in
+     *  [parseSchemaColumns]. A `)`/`(` or an apostrophe inside a
+     *  comment must not move the paren depth or the quote state
+     *  (the old scan had no comment handling, so a comment
+     *  paren could truncate or skip a table). Length-preserving
+     *  (comment chars become spaces, newlines kept) so head-match
+     *  indices still line up with the input. `splitSqlStatements`
+     *  is NOT touched — it already strips whole `--` lines for
+     *  execution. */
+    private fun stripSqlLineComments(schema: String): String {
+        val out = StringBuilder(schema.length)
+        var i = 0
+        var inSingleQuote = false
+        while (i < schema.length) {
+            val ch = schema[i]
+            if (inSingleQuote) {
+                out.append(ch)
+                if (ch == '\'') inSingleQuote = false
+                i++
+            } else if (ch == '\'') {
+                inSingleQuote = true
+                out.append(ch)
+                i++
+            } else if (ch == '-' && i + 1 < schema.length && schema[i + 1] == '-') {
+                // Line comment to end of line; the newline itself is
+                // kept (appended by the next loop pass) so line
+                // structure — and every index — is preserved.
+                while (i < schema.length && schema[i] != '\n') {
+                    out.append(' ')
+                    i++
+                }
+            } else {
+                out.append(ch)
+                i++
+            }
+        }
+        return out.toString()
+    }
+
     private fun parseSchemaColumns(schema: String): Map<String, Set<String>> {
+        // 1.4.25 (step 2d): scan the comment-stripped copy — a `)`/`(`
+        // or an apostrophe inside a `--` comment must not move the
+        // paren depth or the quote state. Same length as the input,
+        // so every head-match index still lines up.
+        val code = stripSqlLineComments(schema)
         val result = mutableMapOf<String, Set<String>>()
-        val headRegex = Regex("""(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([A-Za-z_][A-Za-z0-9_]*)["`]?\s*\(""")
-        for (match in headRegex.findAll(schema)) {
-            val table = match.groupValues[1].lowercase()
+        val headRegex = Regex("""(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["`]?[A-Za-z_][A-Za-z0-9_]*["`]?\.)?["`]?([A-Za-z_][A-Za-z0-9_]*)["`]?\s*\(""")
+        for (match in headRegex.findAll(code)) {
+            val rawTable = match.groupValues[1]
+            val table = rawTable.lowercase()
+            // 1.4.25 (step 2d): a quoted mixed-case table name was
+            // folded to lowercase for the case-folded comparison
+            // (see the KDoc limitation) — log it, names only.
+            // Quoted-but-already-lowercase folds to itself, so it
+            // logs nothing.
+            val headText = match.value.trimEnd().removeSuffix("(").trimEnd()
+            if ((headText.endsWith("\"$rawTable\"") || headText.endsWith("`$rawTable`")) &&
+                rawTable != table
+            ) {
+                JarvisStateRepository.addDiagnostic(
+                    "supabase", "SUPABASE_VERIFY_CASEFOLD",
+                    "table=$rawTable folded to lowercase for verification"
+                )
+            }
             var depth = 1
             var i = match.range.last + 1
             val bodyStart = i
             var bodyEnd = -1
             var inSingleQuote = false
-            while (i < schema.length) {
-                val ch = schema[i]
+            while (i < code.length) {
+                val ch = code[i]
                 if (ch == '\'') inSingleQuote = !inSingleQuote
                 if (!inSingleQuote) {
                     if (ch == '(') depth++
@@ -1547,7 +1611,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 i++
             }
             if (bodyEnd < 0) continue
-            val body = schema.substring(bodyStart, bodyEnd)
+            val body = code.substring(bodyStart, bodyEnd)
             val columns = mutableSetOf<String>()
             var partStart = 0
             var d = 0
@@ -1560,6 +1624,16 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     if (first != null &&
                         first.uppercase() !in setOf("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT")
                     ) {
+                        // 1.4.25 (step 2d): same fold diagnostic for
+                        // a quoted mixed-case column (names only).
+                        if ((part.startsWith("\"") || part.startsWith("`")) &&
+                            first != first.lowercase()
+                        ) {
+                            JarvisStateRepository.addDiagnostic(
+                                "supabase", "SUPABASE_VERIFY_CASEFOLD",
+                                "table=$table column=$first folded to lowercase for verification"
+                            )
+                        }
                         columns.add(first.lowercase())
                     }
                 }

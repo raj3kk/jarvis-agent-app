@@ -114,7 +114,7 @@ class JarvisPreferences(context: Context) {
     // Persisted ONLY by the AI Brain Save button, like every
     // other setting here — flipping the toggle alone changes
     // nothing until Save. Default false: the normal pipeline
-    // (Deepgram listening + Gemini text + Swara speaking) stays
+    // (system SpeechRecognizer listening + Gemini text + Swara speaking) stays
     // default. The service gates Live start on provider==GEMINI
     // + a saved Gemini key + a live mic loop, so a stale true
     // here can never start Live on its own.

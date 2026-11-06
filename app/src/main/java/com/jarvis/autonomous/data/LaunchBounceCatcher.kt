@@ -83,8 +83,8 @@ import java.util.Locale
  *  - LAUNCH_START, no LAUNCH_UI after it, crash line present
  *      = Java crash during startup (class + frames in crash line).
  *  - LAUNCH_START, no LAUNCH_UI, NO crash line
- *      = died during startup: native crash (Sherpa/ONNX, first
- *      greeting speak loads the model) or system kill.
+ *      = died during startup: native crash on first greeting speak,
+ *      or system kill.
  *  - LAUNCH_UI, then NO LIFE_PAUSE/LIFE_DESTROY at all
  *      = process killed after UI (battery-kill style).
  *  - LAUNCH_UI + LIFE_PAUSE/LIFE_DESTROY (or a clean close)
@@ -325,7 +325,7 @@ fun detectPreviousBounce(): PreviousBounce? {
             "CRASH after UI — Java crash in previous session (class + frames below)"
         !hasUi ->
             "DIED DURING STARTUP — no first UI, no Java crash entry " +
-                "(native Sherpa/ONNX crash on first greeting speak, or system kill)"
+                "(native crash on first greeting speak, or system kill)"
         !hasPause && !hasDestroy ->
             "PROCESS KILLED after UI — no pause/destroy at all (battery-kill style)"
         else -> return null // Normal backgrounding / rotation / clean close.
