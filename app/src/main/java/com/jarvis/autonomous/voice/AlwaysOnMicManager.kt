@@ -390,7 +390,7 @@ class AlwaysOnMicManager(
                 if (wasReconnecting) {
                     JarvisStateRepository.addDiagnostic(
                         "stt", "SR_OPEN",
-                        "System mic session opened (recovered=true)."
+                        "System mic session opened (recovered=true, locale=$currentLanguage)."
                     )
                 }
                 // A stale listening=YES must never survive a stop
@@ -1711,6 +1711,11 @@ class AlwaysOnMicManager(
         return object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 if (sessionId != wakeSessionId) return
+                // 1.4.24-PRO step 4 (RC-C follow-through): a wake
+                // session that successfully opens must not carry
+                // a stale backoff into its next restart — reset
+                // here, not only in startWakeListening().
+                wakeBackoffMs = WAKE_RESTART_BASE_MS
                 JarvisStateRepository.setWakeListening(true)
             }
             override fun onBeginningOfSpeech() {}
