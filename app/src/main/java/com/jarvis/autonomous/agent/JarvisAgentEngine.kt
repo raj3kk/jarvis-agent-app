@@ -1235,15 +1235,24 @@ class JarvisAgentEngine(
 
     /**
      * Records ONLY the safe, repeatable subset of a loop step
-     * into the current routine buffer. Send / pay / delete /
+     * into the current routine buffer — and ONLY when the step
+     * actually succeeded (1.4.25-PRO Step 2A, H4 ok-filter:
+     * `ok == false` returns immediately, so a failed
+     * intermediate step can never ride along into a routine
+     * that a later VERIFIED exit persists). Send / pay / delete /
      * type / tap / call / project steps are never recorded:
      * their targets (contacts, message text, node ids, file
      * content) must never become a replayable template, and
      * recordStep() itself rejects sensitive-looking values as
      * a backstop. finishRoutine() persists the buffer only for
      * a verified, completed task; failures clear it.
+     * NOTE: an AMBIGUOUS-continue step whose action returned
+     * ok stays buffered (acceptable — the later VERIFIED exit
+     * re-checks evidence before anything persists); do NOT add
+     * a second filter here.
      */
-    private fun recordLoopStep(d: AgentDecision) {
+    private fun recordLoopStep(d: AgentDecision, ok: Boolean) {
+        if (!ok) return
         when (d.action) {
             "OPEN_APP" -> learnedRoutineStore.recordStep("OPEN_APP", d.appName)
             "SCROLL" -> learnedRoutineStore.recordStep("SCROLL", d.direction)
@@ -1805,7 +1814,10 @@ class JarvisAgentEngine(
                     val actionResult = executeDecisionAction(decision, accService)
                     stepResult = actionResult
                     previousActions.add("Step $step: ${actionResult.summary}")
-                    recordLoopStep(decision)
+                    // 1.4.25-PRO Step 2A (H4): record only ok steps.
+                    // stepResult is non-null here — action != NONE,
+                    // so executeDecisionAction just ran above.
+                    recordLoopStep(decision, stepResult.ok)
                     lastExecutedAction = decision.action
                 }
 
@@ -2055,10 +2067,33 @@ class JarvisAgentEngine(
      * unchanged screen, or an unobserved music-state transition is
      * ambiguous. Ambiguous evidence continues the loop (adopted
      * default), never fails outright, never reports success.
-     * Per-kind expected-text checks (TYPE_TEXT / OPEN_APP /
-     * WHATSAPP_SEND / YOUTUBE_PLAY / OPEN_BROWSER-foreground)
-     * come in a later step — this step is the interface + default
-     * screen-change rule only.
+     * Per-kind expected-text checks (1.4.25-PRO Step 2B, H5 rule
+     * (iii) — the change must be in the action's direction where
+     * checkable; a (iii) failure where checkable is FAILED):
+     * - TYPE_TEXT: the typed text (or its prefix) appears in some
+     *   element's text afterwards. Checkable only while an editable
+     *   field is still on screen — a submitted/navigated-away field
+     *   (or a password field, whose text is redacted) cannot be
+     *   checked, so it falls back to rules (i)+(ii).
+     * - OPEN_APP: post-snapshot packageName is the launched app's
+     *   package (resolveAppPackage) or the app's label appears.
+     * - WHATSAPP_SEND: the chat screen no longer shows an unsent
+     *   draft (message text still in an editable field = FAILED);
+     *   the message visible as a sent bubble = VERIFIED; no
+     *   observable signal either way = AMBIGUOUS, never
+     *   VERIFIED-on-empty-change.
+     * - YOUTUBE_PLAY: post-snapshot package is YouTube AND a
+     *   playing signal is present (pause/stop control or the video
+     *   title in the player area). Tap-dispatched alone stays
+     *   AMBIGUOUS.
+     * - OPEN_BROWSER foreground-show: VERIFIED only if the shown
+     *   page's snapshot is non-empty AND the URL's host appears in
+     *   the snapshot (no loaded-title signal is wired into the
+     *   engine — only the visibility supplier — so the host check
+     *   is the checkable half); otherwise AMBIGUOUS. The
+     *   background path already carries lastBrowserLoadOk and
+     *   keeps the default rules, unchanged.
+     * - All other UI actions keep the default rules (i)+(ii) only.
      */
     private suspend fun verifyStepEvidence(
         decision: AgentDecision,
@@ -2105,7 +2140,120 @@ class JarvisAgentEngine(
         // so it is ambiguous too.
         if (preSnapshot == null) return StepEvidence.AMBIGUOUS
         val screenChanged = snapshotsDiffer(preSnapshot, verifySnapshot)
-        return if (screenChanged) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+        if (!screenChanged) return StepEvidence.AMBIGUOUS
+        // 1.4.25-PRO Step 2B (H5 rule (iii)): the change must be
+        // in the action's direction where checkable. Default rules
+        // (i)+(ii) have passed; per-kind checks decide the rest.
+        return verifyPerKindEvidence(decision, verifySnapshot, accService)
+    }
+
+    /**
+     * 1.4.25-PRO Step 2B (H5 rule (iii)): per-kind expected-text
+     * checks on the post-action snapshot. The caller already
+     * established (i) non-empty and (ii) changed vs pre-action.
+     * A (iii) failure WHERE CHECKABLE is FAILED; where the app
+     * gives no observable signal for that kind, the result is
+     * AMBIGUOUS (never VERIFIED-on-empty-change, never a false
+     * failure). All other UI actions keep the default rules
+     * (i)+(ii) only and return VERIFIED here.
+     */
+    private fun verifyPerKindEvidence(
+        decision: AgentDecision,
+        postSnapshot: ScreenSnapshot,
+        accService: JarvisAccessibilityService?
+    ): StepEvidence {
+        return when (decision.action) {
+            "TYPE_TEXT" -> {
+                val typed = decision.text.trim()
+                if (typed.isBlank()) return StepEvidence.VERIFIED
+                // Probe: the full text, or its first 20 chars when
+                // the field truncates long input.
+                val probe = typed.take(20)
+                // Checkable only while a non-password editable field
+                // is still on screen. A submitted field (navigation
+                // / sent message cleared the input) or a password
+                // field (text redacted as [REDACTED_PASSWORD]) cannot
+                // be compared — fall back to (i)+(ii).
+                val editableFields = postSnapshot.elements.filter { it.isEditable && !it.isPassword }
+                if (editableFields.isEmpty()) return StepEvidence.VERIFIED
+                val typedVisible = editableFields.any { el ->
+                    el.text.contains(probe) || el.contentDesc.contains(probe)
+                }
+                if (typedVisible) StepEvidence.VERIFIED else StepEvidence.FAILED
+            }
+            "OPEN_APP" -> {
+                val expectedPkg = accService?.resolveAppPackage(decision.appName)
+                val pkgOk = expectedPkg != null && postSnapshot.packageName == expectedPkg
+                val labelOk = decision.appName.isNotBlank() && postSnapshot.elements.any { el ->
+                    val label = "${el.text} ${el.contentDesc}".lowercase()
+                    label.contains(decision.appName.lowercase())
+                }
+                when {
+                    pkgOk || labelOk -> StepEvidence.VERIFIED
+                    // Package known but neither it nor the label is
+                    // on screen: the wrong app (or no app) opened.
+                    expectedPkg != null -> StepEvidence.FAILED
+                    // Package unresolvable and label absent: nothing
+                    // checkable — do not fail, do not verify.
+                    else -> StepEvidence.AMBIGUOUS
+                }
+            }
+            "WHATSAPP_SEND" -> {
+                val sent = decision.text.trim()
+                if (sent.isBlank()) return StepEvidence.AMBIGUOUS
+                val probe = sent.take(40)
+                // An unsent draft is still sitting in an editable
+                // input field: the Send tap did not consume it.
+                val draftStillThere = postSnapshot.elements.any { el ->
+                    el.isEditable && (el.text.contains(probe) || el.contentDesc.contains(probe))
+                }
+                if (draftStillThere) return StepEvidence.FAILED
+                // The message now shows as a sent bubble / chat
+                // history (non-editable element): consumed + shown.
+                val sentVisible = postSnapshot.elements.any { el ->
+                    !el.isEditable && (el.text.contains(probe) || el.contentDesc.contains(probe))
+                }
+                if (sentVisible) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            }
+            "YOUTUBE_PLAY" -> {
+                // Same playing-signal rule as the 1C quick path:
+                // YouTube in the foreground AND a pause/stop control
+                // or the video title in the player area. Tap
+                // dispatch alone stays AMBIGUOUS — a still-loading
+                // player is re-observed on the next loop step, never
+                // failed outright and never verified on dispatch.
+                val youtubePkg = accService?.resolveAppPackage("YouTube")
+                    ?: "com.google.android.youtube"
+                if (postSnapshot.packageName != youtubePkg) return StepEvidence.AMBIGUOUS
+                val query = decision.text.ifBlank { decision.appName }.trim().take(40)
+                val playing = postSnapshot.elements.any { el ->
+                    val label = "${el.text} ${el.contentDesc}".lowercase()
+                    label.contains("pause") || label.contains("stop") ||
+                        (query.isNotBlank() &&
+                            (el.text.contains(query) || el.contentDesc.contains(query)))
+                }
+                if (playing) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            }
+            "OPEN_BROWSER" -> {
+                // Foreground-show only: the background path already
+                // carries lastBrowserLoadOk in result.ok and keeps
+                // the default rules. A foreground show happened only
+                // when the decision asked for it AND a host was
+                // wired to show the page.
+                if (!decision.browserShowPage || onShowBrowserPage == null) {
+                    return StepEvidence.VERIFIED
+                }
+                val url = browserTargetForInput(decision.browserUrl)
+                val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull()
+                    ?.removePrefix("www.")
+                if (url.isBlank() || host.isNullOrBlank()) return StepEvidence.AMBIGUOUS
+                val hostVisible = postSnapshot.elements.any { el ->
+                    "${el.text} ${el.contentDesc}".lowercase().contains(host)
+                }
+                if (hostVisible) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
+            }
+            else -> StepEvidence.VERIFIED
+        }
     }
 
     /**
