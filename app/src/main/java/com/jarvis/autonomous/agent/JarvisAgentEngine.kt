@@ -602,7 +602,29 @@ class JarvisAgentEngine(
                         val reply = askUserVoice("Pehli video $title mili hai. Chalau?")
                         if (reply != null && isYesReply(reply)) {
                             val ok = acc.tapNode(video.id)
-                            speak(if (ok) "Chala diya." else "Tap nahi ho paya.")
+                            if (!ok) {
+                                speak("Tap nahi ho paya.")
+                            } else {
+                                // 1.4.25-PRO Step 1C (1e): tap dispatch
+                                // alone proves nothing — verify the
+                                // post-tap screen is YouTube with a
+                                // player signal (audit §10(b)
+                                // YOUTUBE_PLAY rule): a pause/stop
+                                // control, or the tapped video's title
+                                // in the player area. No signal = an
+                                // honest line, never "Chala diya."
+                                delay(1000)
+                                val post = acc.captureScreenSnapshot()
+                                val titleProbe = title.take(40)
+                                val playing = post.packageName == "com.google.android.youtube" &&
+                                    post.elements.any { el ->
+                                        val label = "${el.text} ${el.contentDesc}".lowercase()
+                                        label.contains("pause") || label.contains("stop") ||
+                                            (titleProbe.isNotBlank() &&
+                                                (el.text.contains(titleProbe) || el.contentDesc.contains(titleProbe)))
+                                    }
+                                speak(if (playing) "Chala diya." else "Video tap ho gaya, par play hota dikh nahi raha — screen par check karo.")
+                            }
                         } else {
                             speak("Theek hai, nahi chalaya.")
                         }
@@ -632,6 +654,14 @@ class JarvisAgentEngine(
                         // NO — isYesReply vetoes on any negation token.
                         val reply = askUserVoice("$contact ko ye message bhejna hai: $message. Bhej dun?")
                         if (reply != null && isYesReply(reply)) {
+                            // 1.4.25-PRO Step 1C (1e): "Message bhej
+                            // diya." stays — sendWhatsAppMessage only
+                            // returns true when the Send button was
+                            // found AND tapped, the strongest
+                            // quick-path check. Residual: delivery /
+                            // read is still unconfirmed (the tap is
+                            // dispatch, not delivery) — no stronger
+                            // signal is observable here.
                             val ok = acc.sendWhatsAppMessage(contact, message)
                             speak(if (ok) "Message bhej diya." else "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
                         } else {
@@ -889,7 +919,11 @@ class JarvisAgentEngine(
                 if (lower.contains("pm") && hour < 12) hour += 12
                 if (hour in 0..23 && minute in 0..59) {
                     val ok = acc.setSystemAlarm(hour, minute, "Jarvis Alarm")
-                    scope.launch { speak(if (ok) "Alarm $hour baj kar $minute minute par laga diya." else "Alarm nahi lag paya.") }
+                    // 1.4.25-PRO Step 1C (1e): setSystemAlarm true
+                    // only means the ACTION_SET_ALARM intent fired —
+                    // never claim the alarm is stored. Intent-fired
+                    // wording; the user checks Clock.
+                    scope.launch { speak(if (ok) "Alarm $hour baj kar $minute minute par lagane ke liye bhej diya — Clock app me check kar lo ki alarm set hua." else "Alarm nahi lag paya.") }
                     return true
                 }
             }
@@ -899,7 +933,26 @@ class JarvisAgentEngine(
                 val app = openMatch.groupValues[1].trim()
                 if (app.isNotBlank() && app.length < 30) {
                     val ok = acc.launchApp(app)
-                    scope.launch { speak(if (ok) "$app khol diya." else "$app nahi khul paya.") }
+                    // 1.4.25-PRO Step 1C (1e): a fired launch intent
+                    // proves nothing — "khol diya" only when the
+                    // post-launch snapshot's package is the launched
+                    // app's package (resolveAppPackage mirrors the
+                    // launchApp match). Anything else = honest
+                    // "bhej diya" line, never a done claim.
+                    scope.launch {
+                        if (!ok) {
+                            speak("$app nahi khul paya.")
+                        } else {
+                            delay(1200)
+                            val post = acc.captureScreenSnapshot()
+                            val expectedPkg = acc.resolveAppPackage(app)
+                            if (expectedPkg != null && post.packageName == expectedPkg) {
+                                speak("$app khol diya.")
+                            } else {
+                                speak("$app kholne ke liye bhej diya — screen par check karo.")
+                            }
+                        }
+                    }
                     return true
                 }
             }
@@ -1080,7 +1133,7 @@ class JarvisAgentEngine(
             val acc = JarvisAccessibilityService.instance
             for (step in routine.steps) {
                 if (!isOnline() && learnedRoutineStore.isNetworkDependent(step.action)) {
-                    speak("Internet nahi hai — is step ke liye network chahiye, isliye replay yahin rok raha hoon. Local kaam ho gaya hai, baaki net aane par dobara bolo.")
+                    speak("Internet nahi hai — is step ke liye network chahiye, isliye replay yahin rok raha hoon. Net nahi hai, isliye yahin ruk raha hoon — jo steps ho gaye hain wo upar dikh rahe hain, baaki net aane par dobara bolo.")
                     clearTaskScopedState()
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Replay stopped offline")
                     return@launch
@@ -1100,11 +1153,36 @@ class JarvisAgentEngine(
                         return@launch
                     }
                 }
+                // 1.4.25-PRO Step 1C (1d): dispatch-only ok is not
+                // evidence. For screen-changing UI steps, the
+                // post-step screen must have CHANGED vs the pre-step
+                // snapshot (same formatted-tree hash / package /
+                // element-set comparison as verifyStepEvidence,
+                // 1B/1c) — otherwise this is a mismatch and the LLM
+                // loop re-plans. Screen-invariant steps (WAIT,
+                // SAVE_MEMORY, FLASHLIGHT, VOLUME, MEDIA_CONTROL)
+                // keep their existing ok semantics: their ok is a
+                // real system call or trivially true by construction,
+                // and no screen change is expected from them.
+                val preStepSnapshot = if (replayStepNeedsScreenChange(step.action)) acc?.captureScreenSnapshot() else null
                 val ok = executeLearnedStep(step, acc)
                 if (!ok) {
                     JarvisStateRepository.addLog("Learned replay mismatch at ${step.action} — falling back to LLM loop")
                     runAutonomousLoop(trimmed)
                     return@launch
+                }
+                if (preStepSnapshot != null) {
+                    // Brief settle so a cold-starting app can come
+                    // to the foreground before the post snapshot.
+                    // A still-unchanged screen is a mismatch, never
+                    // a success — the LLM loop re-observes.
+                    delay(800)
+                    val postStepSnapshot = acc?.captureScreenSnapshot()
+                    if (postStepSnapshot == null || !snapshotsDiffer(preStepSnapshot, postStepSnapshot)) {
+                        JarvisStateRepository.addLog("Learned replay no screen change at ${step.action} — falling back to LLM loop")
+                        runAutonomousLoop(trimmed)
+                        return@launch
+                    }
                 }
                 if (step.waitMs > 0) delay(step.waitMs)
             }
@@ -1134,6 +1212,26 @@ class JarvisAgentEngine(
             else -> false
         }
     }
+
+    /**
+     * 1.4.25-PRO Step 1C (1d): replay steps whose nature is
+     * screen-changing — the replay must observe a screen change
+     * after them. WAIT / SAVE_MEMORY / FLASHLIGHT / VOLUME /
+     * MEDIA_CONTROL are screen-invariant by nature and keep their
+     * dispatch / system-call ok.
+     */
+    private fun replayStepNeedsScreenChange(action: String): Boolean =
+        action.uppercase() in setOf("OPEN_APP", "SCROLL", "NAVIGATE", "YOUTUBE_SEARCH")
+
+    /**
+     * 1.4.25-PRO Step 1C (1d): the Step 1B screen-change
+     * comparison, shared by verifyStepEvidence and the replay
+     * check — formatted-tree hash, owning package, or element set.
+     */
+    private fun snapshotsDiffer(a: ScreenSnapshot, b: ScreenSnapshot): Boolean =
+        a.formattedTree.hashCode() != b.formattedTree.hashCode() ||
+            a.packageName != b.packageName ||
+            a.elements != b.elements
 
     /**
      * Records ONLY the safe, repeatable subset of a loop step
@@ -1826,6 +1924,17 @@ class JarvisAgentEngine(
                                     }
                                 }
                             } else {
+                                // 1.4.25-PRO Step 1C (1g, comment
+                                // only — no code change): the deferred
+                                // reply is the model's words for THIS
+                                // step only. It is spoken here because
+                                // this step's own evidence passed. A
+                                // multi-claim reply ("X bhej diya aur
+                                // Y bhi kar diya") is therefore bounded
+                                // to the verified step; the second
+                                // claim was never separately verified.
+                                // A second-claim guard is out of scope
+                                // for 1.4.25.
                                 deferredCompletionReply?.let {
                                     JarvisStateRepository.addChatMessage("Jarvis", it)
                                     persistChat()
@@ -1995,9 +2104,7 @@ class JarvisAgentEngine(
         // verified. A missing pre-snapshot cannot prove a change,
         // so it is ambiguous too.
         if (preSnapshot == null) return StepEvidence.AMBIGUOUS
-        val screenChanged = verifySnapshot.formattedTree.hashCode() != preSnapshot.formattedTree.hashCode() ||
-            verifySnapshot.packageName != preSnapshot.packageName ||
-            verifySnapshot.elements != preSnapshot.elements
+        val screenChanged = snapshotsDiffer(preSnapshot, verifySnapshot)
         return if (screenChanged) StepEvidence.VERIFIED else StepEvidence.AMBIGUOUS
     }
 

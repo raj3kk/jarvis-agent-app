@@ -456,7 +456,59 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Resolves an app name / package query to the package that
+     * launchApp() would launch, or null when nothing matches.
+     * 1.4.25-PRO Step 1C (1e): the quick-path open-app speak
+     * verifies the post-launch snapshot against this package —
+     * launchApp() itself only reports that an intent was fired.
+     * The alias map and the fuzzy predicate below MIRROR
+     * launchApp() exactly — if either changes, change both.
+     */
+    fun resolveAppPackage(appNameOrPackage: String): String? {
+        val query = appNameOrPackage.trim().lowercase()
+        if (query.isEmpty()) return null
+        val pm = packageManager
+
+        // Common aliases for popular Indian / global apps
+        val aliasMap = mapOf(
+            "whatsapp" to "com.whatsapp",
+            "youtube" to "com.google.android.youtube",
+            "instagram" to "com.instagram.android",
+            "chrome" to "com.android.chrome",
+            "gmail" to "com.google.android.gm",
+            "maps" to "com.google.android.apps.maps",
+            "spotify" to "com.spotify.music",
+            "zomato" to "com.application.zomato",
+            "swiggy" to "in.swiggy.android",
+            "uber" to "com.ubercab",
+            "ola" to "com.olacabs.customer",
+            "phonepe" to "com.phonepe.app",
+            "gpay" to "com.google.android.apps.nbu.paisa.user",
+            "paytm" to "net.one97.paytm",
+            "settings" to "com.android.settings"
+        )
+
+        aliasMap[query]?.let { mappedPkg ->
+            if (pm.getLaunchIntentForPackage(mappedPkg) != null) return mappedPkg
+        }
+
+        // Search all launchable apps
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveInfos = pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
+
+        return resolveInfos.firstOrNull { info ->
+            val label = info.loadLabel(pm).toString().lowercase()
+            val pkg = info.activityInfo.packageName.lowercase()
+            label == query || label.contains(query) || query.contains(label) || pkg.contains(query)
+        }?.activityInfo?.packageName
+    }
+
+    /**
      * Finds and launches any installed Android app by fuzzy name or package name.
+     * NOTE (1.4.25 Step 1C): the alias map and the fuzzy predicate
+     * here mirror resolveAppPackage() exactly — change both together.
      */
     fun launchApp(appNameOrPackage: String): Boolean {
         val query = appNameOrPackage.trim().lowercase()
