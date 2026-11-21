@@ -75,6 +75,42 @@ data class NotificationItem(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+// ---- 3c captcha assist (D3 human-assist-first) ----
+enum class CaptchaStatus { ACTIVE, SOLVING, SOLVED, TIMED_OUT, ABORTED }
+enum class CaptchaSource { LOCAL_WEBVIEW, HUB_EVENT }
+
+/** One live captcha assist (D3 §3.3). `screenshotB64` is a Base64
+ *  PNG (<200KB) or null when the WebView could not be captured —
+ *  the card degrades to site + task + countdown without an image.
+ *  No solution/token value is ever stored here. */
+data class CaptchaAssistState(
+    val taskId: String,
+    val site: String,
+    val taskName: String,
+    val url: String = "",
+    val screenshotB64: String? = null,
+    val receivedAtMs: Long,
+    val status: CaptchaStatus,
+    val source: CaptchaSource,
+    val assistCount: Int = 1
+)
+
+// ---- 3c doc confirm (3b /confirm contract) ----
+enum class DocConfirmStatus { PENDING, CONFIRMED, ERROR }
+
+/** One doc-confirm card: the /api/docs/extract response
+ *  (doc_job_id + fields + missing[] + confidence). `fields` holds
+ *  extracted values as strings; `missing` names the fields the
+ *  user must fill before Confirm & Proceed. */
+data class DocConfirmState(
+    val docJobId: Long,
+    val fields: Map<String, String>,
+    val missing: List<String>,
+    val confidence: Double,
+    val status: DocConfirmStatus = DocConfirmStatus.PENDING,
+    val message: String = ""
+)
+
 object JarvisStateRepository {
     private val _agentState = MutableStateFlow(AgentRunState.IDLE)
     val agentState: StateFlow<AgentRunState> = _agentState.asStateFlow()
@@ -417,6 +453,31 @@ object JarvisStateRepository {
      *  plan executor / store load; null = no plan. */
     fun setPlanState(view: PlanView?) {
         _planState.value = view
+    }
+
+    // ---- 3c captcha assist (D3 human-assist-first) ----
+    // One live assist at a time (a second CAPTCHA_ASSIST replaces
+    // the first — the server caps 3 assists per task, the phone
+    // shows the newest). Null = no assist showing.
+    private val _captchaAssist = MutableStateFlow<CaptchaAssistState?>(null)
+    val captchaAssist: StateFlow<CaptchaAssistState?> = _captchaAssist.asStateFlow()
+
+    fun setCaptchaAssist(state: CaptchaAssistState?) {
+        _captchaAssist.value = state
+    }
+
+    fun updateCaptchaAssist(transform: (CaptchaAssistState) -> CaptchaAssistState) {
+        _captchaAssist.value?.let { _captchaAssist.value = transform(it) }
+    }
+
+    // ---- 3c doc confirm (3b /confirm contract) ----
+    // Set by DocConfirmClient.loadExtract (3c entry point in the
+    // Command tab); null = no confirm card showing.
+    private val _docConfirm = MutableStateFlow<DocConfirmState?>(null)
+    val docConfirm: StateFlow<DocConfirmState?> = _docConfirm.asStateFlow()
+
+    fun setDocConfirm(state: DocConfirmState?) {
+        _docConfirm.value = state
     }
 
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())

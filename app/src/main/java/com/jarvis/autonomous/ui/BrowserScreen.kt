@@ -3,7 +3,10 @@ package com.jarvis.autonomous.ui
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
+import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -53,8 +56,16 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import com.jarvis.autonomous.data.AgentPlanStore
+import com.jarvis.autonomous.data.CaptchaAssistState
+import com.jarvis.autonomous.data.CaptchaSource
+import com.jarvis.autonomous.data.CaptchaStatus
+import com.jarvis.autonomous.data.HubWsClient
+import com.jarvis.autonomous.data.JarvisStateRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -135,7 +146,17 @@ enum class BrowserBrowseStatus {
     INTERRUPTED_PROCESS_KILLED,
 
     /** Load error or timeout (page never finished, JS stuck, etc.). */
-    FAILED
+    FAILED,
+
+    /**
+     * 3c (D3 human-assist-first): the page shows a captcha challenge.
+     * No content is extracted from a challenge page — the assist
+     * canvas takes over (CaptchaAssistCard) and the user solves it
+     * in the Browser tab. Timeout = pause, never fail, never
+     * auto-solve. The engine speaks the captcha line; the autonomous
+     * loop must NOT retry the URL while it waits.
+     */
+    CAPTCHA
 }
 
 data class BrowserPageResult(
@@ -449,6 +470,160 @@ object JarvisBackgroundBrowser {
     // slot, and each call's clearPending() wiped the other's marker.
     private val browseMutex = Mutex()
 
+    // -- 3c (D3 human-assist-first): captcha wait state ---------------
+    // A URL with a live challenge is never re-loaded by the engine
+    // loop — every browse short-circuits to CAPTCHA until the user
+    // solves (recheckCaptcha) or aborts (markCaptchaAborted).
+    private data class CaptchaWait(
+        val taskId: String,
+        val site: String,
+        val taskName: String,
+        val url: String
+    )
+
+    private val captchaWaiting = mutableMapOf<String, CaptchaWait>()
+    private val captchaBlocked = mutableSetOf<String>()
+
+    /** D3 §3.2: challenge detection (DOM markers only — never a solver). */
+    private val CAPTCHA_CHECK_JS = """
+        (function(){var d=document;function q(s){try{return !!d.querySelector(s)}catch(e){return false}}
+        if(q('iframe[src*="challenges.cloudflare.com"],[class*="cf-turnstile"]'))return 'turnstile';
+        if(q('iframe[src*="recaptcha"],.g-recaptcha'))return 'recaptcha';
+        if(q('iframe[src*="hcaptcha"],.h-captcha'))return 'hcaptcha';
+        if(q('[data-sitekey]'))return 'unknown';return 'none';})()
+    """.trimIndent()
+
+    private suspend fun checkCaptcha(webView: WebView, url: String): String {
+        val raw = runCatching { evaluateJs(webView, CAPTCHA_CHECK_JS, url) }.getOrDefault("")
+        val hit = raw.trim().lowercase()
+        return if (hit in setOf("turnstile", "recaptcha", "hcaptcha", "unknown")) hit else "none"
+    }
+
+    /** WebView -> Base64 PNG, <=200KB (downscale until it fits, then
+     *  null — the card degrades to text honestly, never blocks). */
+    private fun captureCaptchaScreenshot(webView: WebView): String? {
+        return runCatching {
+            val w = webView.width
+            val h = webView.height
+            if (w <= 0 || h <= 0) return null
+            var scale = 1.0f
+            while (scale >= 0.25f) {
+                val bw = (w * scale).toInt().coerceAtLeast(1)
+                val bh = (h * scale).toInt().coerceAtLeast(1)
+                val bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bitmap)
+                canvas.scale(scale, scale)
+                webView.draw(canvas)
+                val out = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                bitmap.recycle()
+                val bytes = out.toByteArray()
+                if (bytes.size <= 200 * 1024) {
+                    return Base64.encodeToString(bytes, Base64.NO_WRAP)
+                }
+                scale *= 0.5f
+            }
+            null
+        }.getOrNull()
+    }
+
+    private fun hostOfUrl(url: String): String? = runCatching {
+        Uri.parse(url).host
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /**
+     * 3c: a challenge was found during extraction. Publishes the
+     * assist state (card), reports a signed CAPTCHA_DETECTED to the
+     * hub, marks the running plan step AWAITING_USER, and completes
+     * the pending browse as CAPTCHA (prompt return, no hang).
+     */
+    private fun handleCaptchaFound(webView: WebView, pending: PendingExtraction, challenge: String) {
+        val url = pending.url
+        val site = hostOfUrl(url) ?: url
+        val taskName = "Browser task: $site"
+        val taskId = "bt-" + UUID.randomUUID().toString().replace("-", "").take(16)
+        val screenshotB64 = captureCaptchaScreenshot(webView)
+        JarvisStateRepository.setCaptchaAssist(
+            CaptchaAssistState(
+                taskId = taskId, site = site, taskName = taskName, url = url,
+                screenshotB64 = screenshotB64, receivedAtMs = System.currentTimeMillis(),
+                status = CaptchaStatus.ACTIVE, source = CaptchaSource.LOCAL_WEBVIEW, assistCount = 1
+            )
+        )
+        captchaWaiting[url] = CaptchaWait(taskId = taskId, site = site, taskName = taskName, url = url)
+        HubWsClient.instance?.sendCaptchaDetected(taskId, site, taskName, screenshotB64)
+        runCatching {
+            AgentPlanStore.markRunningStepAwaitingUser(webView.context.applicationContext, site, taskName)
+        }
+        JarvisStateRepository.addDiagnostic(
+            "browser", "BROWSER_CAPTCHA",
+            "Captcha mila ($challenge) — $site par madad chahiye"
+        )
+        pending.deferred.complete(
+            BrowserPageResult(
+                url = url,
+                status = BrowserBrowseStatus.CAPTCHA,
+                errorMessage = "Captcha — $site par madad chahiye. Browser tab me solve karo."
+            )
+        )
+    }
+
+    /**
+     * 3c: re-check a waiting captcha (card's [Dobara check karo]).
+     * Returns true only when the challenge is GONE from the
+     * displayed page. On gone: publishes SOLVED, reports a signed
+     * CAPTCHA_RESOLVED to the hub, clears the wait, and re-runs the
+     * browse so the page content lands in chat. The displayed URL
+     * must still be the task URL (or the task's site for hub events)
+     * — a different page can never "prove" the captcha is gone.
+     */
+    suspend fun recheckCaptcha(context: Context, taskId: String): Boolean {
+        val webView = obtainWebView(context)
+        val state = JarvisStateRepository.captchaAssist.value
+        if (state == null || state.taskId != taskId) return false
+        val shown = webView.url ?: return false
+        val url = if (state.url.isNotBlank()) state.url else shown
+        if (state.url.isNotBlank() && !urlsEqualIgnoringPreviewNonce(shown, url)) return false
+        if (state.url.isBlank() && hostOfUrl(url) != state.site) return false
+        val hit = checkCaptcha(webView, url)
+        if (hit != "none") return false
+        val durationS = ((System.currentTimeMillis() - state.receivedAtMs) / 1000L).coerceAtLeast(0L)
+        captchaWaiting.remove(url)
+        JarvisStateRepository.setCaptchaAssist(state.copy(status = CaptchaStatus.SOLVED))
+        HubWsClient.instance?.sendCaptchaResolved(taskId, state.site, solved = true, aborted = false, durationS = durationS)
+        JarvisStateRepository.addChatMessage(
+            "Jarvis",
+            "✓ Captcha solve ho gaya — ${state.site} ka page dobara padh raha hoon."
+        )
+        val result = browse(context, url)
+        if (result.status == BrowserBrowseStatus.COMPLETED) {
+            JarvisStateRepository.addChatMessage(
+                "Jarvis",
+                listOf(result.title, result.mainText).filter { it.isNotBlank() }.joinToString("\n")
+            )
+        } else {
+            JarvisStateRepository.addChatMessage(
+                "Jarvis",
+                "Page dobara padhne me fail: ${result.errorMessage}"
+            )
+        }
+        return true
+    }
+
+    /**
+     * 3c: the user tapped [Task rok do] — clear the wait and block
+     * this URL for the rest of the process. Foreground tab loads
+     * bypass this block (the user may still open the page by hand).
+     */
+    fun markCaptchaAborted(taskId: String, url: String) {
+        captchaWaiting.entries.removeAll { it.value.taskId == taskId }
+        if (url.isNotBlank()) captchaBlocked.add(url)
+        val current = JarvisStateRepository.captchaAssist.value
+        if (current?.taskId == taskId) {
+            JarvisStateRepository.setCaptchaAssist(current.copy(status = CaptchaStatus.ABORTED))
+        }
+    }
+
     private class PendingExtraction(
         val url: String,
         val deferred: CompletableDeferred<BrowserPageResult>
@@ -601,6 +776,59 @@ object JarvisBackgroundBrowser {
                 errorMessage = "Khaali ya blocked URL — sirf http/https pages allowed hain."
             )
         }
+        // 3c (D3): a URL the user aborted stays blocked for this
+        // process (foreground tab loads bypass this guard — only
+        // background browse() is gated).
+        if (captchaBlocked.any { urlsEqualIgnoringPreviewNonce(it, url) }) {
+            return@withLock BrowserPageResult(
+                url = url,
+                status = BrowserBrowseStatus.FAILED,
+                errorMessage = "User ne is task ko rok diya tha — dobara kholne ke liye Browser tab se kholo."
+            )
+        }
+        // 3c (D3): a URL whose captcha is still waiting returns
+        // CAPTCHA at once — no reload, no retry loop while the user
+        // solves. A dismissed card re-shows (fresh 60s window, same
+        // task); a timed-out card stays timed-out until the user
+        // reopens it ([Abhi solve karo]); SOLVED/ABORTED clears the
+        // wait and the load proceeds normally.
+        val wait = captchaWaiting.entries
+            .firstOrNull { urlsEqualIgnoringPreviewNonce(it.key, url) }?.value
+        if (wait != null) {
+            val state = JarvisStateRepository.captchaAssist.value
+            if (state?.taskId == wait.taskId) {
+                when (state.status) {
+                    CaptchaStatus.ACTIVE, CaptchaStatus.SOLVING, CaptchaStatus.TIMED_OUT -> {
+                        return@withLock BrowserPageResult(
+                            url = url,
+                            status = BrowserBrowseStatus.CAPTCHA,
+                            errorMessage = "Captcha — ${state.site} par madad chahiye. Browser tab me solve karo."
+                        )
+                    }
+                    CaptchaStatus.SOLVED, CaptchaStatus.ABORTED -> {
+                        captchaWaiting.remove(wait.url)
+                    }
+                }
+            } else {
+                // Dismissed ([Baad me]): re-show the canvas with a
+                // fresh window, same task — the hub counts this as
+                // the next assist for the task (cap 3).
+                JarvisStateRepository.setCaptchaAssist(
+                    CaptchaAssistState(
+                        taskId = wait.taskId, site = wait.site, taskName = wait.taskName, url = wait.url,
+                        screenshotB64 = null, receivedAtMs = System.currentTimeMillis(),
+                        status = CaptchaStatus.ACTIVE, source = CaptchaSource.LOCAL_WEBVIEW,
+                        assistCount = (state?.takeIf { it.taskId == wait.taskId }?.assistCount ?: 0) + 1
+                    )
+                )
+                HubWsClient.instance?.sendCaptchaDetected(wait.taskId, wait.site, wait.taskName, null)
+                return@withLock BrowserPageResult(
+                    url = url,
+                    status = BrowserBrowseStatus.CAPTCHA,
+                    errorMessage = "Captcha — ${wait.site} par madad chahiye. Browser tab me solve karo."
+                )
+            }
+        }
         markPending(context, url)
         val result: BrowserPageResult = try {
             withContext(Dispatchers.Main) {
@@ -684,6 +912,15 @@ object JarvisBackgroundBrowser {
                     "Page extraction se pehle badal gayi — galat page ka text nahi liya."
                 )
             ) {
+                return@launch
+            }
+            // 3c (D3): captcha check BEFORE extracting — a challenge
+            // page has no readable content; extracting it would be
+            // fabricated text. On a hit the browse completes as
+            // CAPTCHA and the assist canvas takes over.
+            val challenge = checkCaptcha(webView, pending.url)
+            if (challenge != "none") {
+                handleCaptchaFound(webView, pending, challenge)
                 return@launch
             }
             try {

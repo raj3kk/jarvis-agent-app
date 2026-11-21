@@ -35,7 +35,11 @@ import java.util.concurrent.TimeUnit
  * returned status string.
  */
 enum class PlanState {
-    PENDING, RUNNING, DONE, FAILED, BLOCKED, SKIPPED
+    PENDING, RUNNING, DONE, FAILED, BLOCKED, SKIPPED,
+    /** 3c: a browser step is waiting on the user (captcha assist).
+     *  Persisted like RUNNING; resume demotes it to PENDING with
+     *  verify-before-re-run (never blindly re-run). */
+    AWAITING_USER
 }
 
 data class PlanStep(
@@ -233,6 +237,39 @@ object AgentPlanStore {
             File(context.filesDir, FILE_NAME).delete()
             File(context.filesDir, TMP_NAME).delete()
         }
+    }
+
+    /**
+     * 3c: mark the currently RUNNING step AWAITING_USER (a browser
+     * captcha is waiting on the user). Called from the browser layer
+     * (JarvisBackgroundBrowser), NOT the executor — the executor's
+     * in-memory copy still says RUNNING and overwrites this mark
+     * when the step ends (DONE/FAILED). The mark is therefore a
+     * persisted display + kill-resume state only: if the process
+     * dies while waiting, resume demotes AWAITING_USER to PENDING
+     * with verify-before-re-run. No-op when no step is RUNNING (a
+     * direct browse with no plan, or the step already ended).
+     */
+    fun markRunningStepAwaitingUser(context: Context, site: String, taskName: String): Boolean {
+        val plan = load(context) ?: return false
+        if (plan.completed) return false
+        val running = plan.steps.firstOrNull { it.state == PlanState.RUNNING } ?: return false
+        val now = System.currentTimeMillis()
+        val updated = plan.copy(
+            steps = plan.steps.map {
+                if (it.id == running.id) {
+                    it.copy(
+                        state = PlanState.AWAITING_USER,
+                        evidence = (it.evidence + " | Captcha — $site par madad chahiye ($taskName)").take(300),
+                        updatedAtMs = now
+                    )
+                } else it
+            },
+            updatedAtMs = now
+        )
+        save(context, updated)
+        JarvisStateRepository.setPlanState(updated.toView())
+        return true
     }
 }
 

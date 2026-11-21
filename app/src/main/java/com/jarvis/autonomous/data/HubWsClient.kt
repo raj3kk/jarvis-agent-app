@@ -1,8 +1,15 @@
 package com.jarvis.autonomous.data
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.util.Base64
+import androidx.core.app.NotificationCompat
 import com.jarvis.autonomous.agent.JarvisAgentEngine
+import com.jarvis.autonomous.ui.MainActivity
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
@@ -37,13 +44,27 @@ import org.json.JSONObject
  *   never re-serialized (key-order fragility).
  * - HELLO_ACK -> CONNECTED; the hub flushes queued pending_steps.
  * - EXECUTE_STEP (hub -> device, currently only CRON_COMMAND from the
- *   cron dispatcher) -> execute via JarvisAgentEngine.handleUserCommand
- *   (the SAME choke point as a spoken command, so ALL standing gates
- *   apply) -> signed STEP_RESULT after completion observation.
- * - The hub does NOT sign EXECUTE_STEP (it cannot — it never has the
- *   device key, and does not need to: the channel is authenticated at
- *   establishment over TLS to the known hub URL). The device signs its
- *   OUTBOUND messages (HELLO, STEP_RESULT); the hub verifies.
+ *   cron dispatcher) is SIGNED by the hub (M-4, hub 3b.1+) and VERIFIED
+ *   here before any execution (HubStepVerifier — 7 checks: key_id,
+ *   device_id, ts ±5 min, nonce one-time, step_ts ≤24h, Ed25519 sig,
+ *   payload_raw parses with kind + job_id). ANY failure -> step
+ *   REJECTED, never executed; a signed STEP_RESULT (ok=false,
+ *   "Hub signature verify fail — step rejected") goes back. The
+ *   `step` envelope field is never executed from — only payload_raw.
+ *   (The old note here said the hub does NOT sign — that rationale
+ *   is SUPERSEDED by M-4; the hub signs with its OWN key, the device
+ *   key is never involved.)
+ * - HELLO_ACK bootstrap (M-4 §4.4): the hub sends its public key +
+ *   key_id. No stored key -> store it (first-seen). Stored key with
+ *   the SAME key_id -> ignore (confirm). A NEW key_id from HELLO_ACK
+ *   is NEVER accepted (rotation is re-pair-only) — on mismatch the
+ *   client stops with UNAUTH "Hub key badli — dobara pair karo".
+ * - CAPTCHA_ASSIST (3c, D3 human-assist-first): a display-only event
+ *   from the hub (server-side executor path) — the phone shows
+ *   CaptchaAssistCard (live canvas + 60s countdown) and notifies.
+ *   The phone ALSO reports its own WebView captchas to the hub via
+ *   signed CAPTCHA_DETECTED / CAPTCHA_RESOLVED messages. A captcha
+ *   solution/token value is NEVER sent, logged, or stored.
  * - Presence = the WS connection itself (C1). Reconnect backoff
  *   5s -> 10s -> 20s -> 30s cap (1.5.0 L1 pattern), reset on HELLO_ACK.
  *
@@ -104,7 +125,8 @@ class HubWsClient(
         private const val HELLO_TIMEOUT_MS = 30_000L
         private const val STEP_TIMEOUT_MS = 180_000L
         private val BACKOFF_MS = longArrayOf(5_000L, 10_000L, 20_000L, 30_000L)
-        private const val APP_VERSION = "1.6.1"
+        private const val APP_VERSION = "1.7.0"
+        private const val CAPTCHA_NOTIFICATION_ID = 9101
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -278,6 +300,32 @@ class HubWsClient(
             "HELLO_ACK" -> {
                 helloWatchdogJob?.cancel()
                 attempt = 0
+                // M-4 §4.4 HELLO_ACK bootstrap: the hub sends its public
+                // key + key_id. No stored key -> store (first-seen).
+                // Same key_id -> confirm, ignore. A NEW key_id is NEVER
+                // accepted from HELLO_ACK (rotation is re-pair-only).
+                val ackKey = json.optString("hub_public_key", "").ifBlank { null }
+                val ackKeyId = json.optString("key_id", "").ifBlank { null }
+                if (ackKey != null && ackKeyId != null) {
+                    val storedId = runCatching { PairingManager.hubKeyId(context) }.getOrNull()
+                    val storedKey = runCatching { PairingManager.hubPublicKeyB64(context) }.getOrNull()
+                    when {
+                        storedKey == null -> {
+                            runCatching { PairingManager.storeHubPublicKey(context, ackKey, ackKeyId) }
+                            diag("WS_HUB_KEY_BOOTSTRAP", "Hub key HELLO_ACK se mili (first-seen)")
+                        }
+                        storedId == ackKeyId -> {
+                            // Same key again — confirm, nothing to do.
+                        }
+                        else -> {
+                            terminalStop = true
+                            setStatus(WsState.UNAUTH, detail = "Hub key badli — dobara pair karo")
+                            diag("WS_HUB_KEY_CHANGED", "Hub key_id badla — re-pair chahiye")
+                            runCatching { webSocket?.close(1000, "hub_key_changed") }
+                            return
+                        }
+                    }
+                }
                 setStatus(
                     WsState.CONNECTED,
                     lastHelloAckAtMs = System.currentTimeMillis(),
@@ -287,11 +335,33 @@ class HubWsClient(
                 diag("WS_HELLO_ACK", "Hub se HELLO_ACK mila")
             }
             "EXECUTE_STEP" -> {
-                val step = json.optJSONObject("step")
-                if (step == null) {
-                    diag("WS_STEP_BAD", "EXECUTE_STEP bina step ke aaya")
+                // M-4 §6.2: verify FIRST, execute only on full pass.
+                handleSignedExecuteStep(json)
+            }
+            "CAPTCHA_ASSIST" -> {
+                // 3c (D3): display-only event from the hub — show the
+                // canvas + notify. Nothing here executes anything.
+                val taskId = json.optString("task_id", "")
+                val site = json.optString("site", "")
+                val taskName = json.optString("task_name", "")
+                val screenshotB64 = json.optString("screenshot_b64", "").ifBlank { null }
+                if (taskId.isBlank()) {
+                    diag("WS_CAPTCHA_BAD", "CAPTCHA_ASSIST bina task_id ke aaya")
                 } else {
-                    handleExecuteStep(step)
+                    JarvisStateRepository.setCaptchaAssist(
+                        CaptchaAssistState(
+                            taskId = taskId,
+                            site = site,
+                            taskName = taskName,
+                            screenshotB64 = screenshotB64,
+                            receivedAtMs = System.currentTimeMillis(),
+                            status = CaptchaStatus.ACTIVE,
+                            source = CaptchaSource.HUB_EVENT,
+                            assistCount = 1
+                        )
+                    )
+                    diag("WS_CAPTCHA_ASSIST", "Captcha assist aaya ($site)")
+                    postCaptchaNotification(site, taskName)
                 }
             }
             "PING" -> {
@@ -350,6 +420,129 @@ class HubWsClient(
             } else {
                 sendStepResult(jobId, true, "Task finished")
             }
+        }
+    }
+
+    /**
+     * M-4 §6.2: verify a hub-signed EXECUTE_STEP BEFORE executing.
+     * Any check failing -> REJECT (never execute) + a signed
+     * STEP_RESULT (ok=false) with a reason-code summary — the sig /
+     * nonce VALUES never appear in the summary or diagnostics.
+     */
+    private fun handleSignedExecuteStep(envelope: JSONObject) {
+        val storedKey = runCatching { PairingManager.hubPublicKeyB64(context) }.getOrNull()
+        val storedKeyId = runCatching { PairingManager.hubKeyId(context) }.getOrNull()
+        val now = System.currentTimeMillis()
+        val result = HubStepVerifier.verify(
+            envelope = envelope,
+            deviceId = deviceId,
+            storedKeyB64 = storedKey,
+            storedKeyId = storedKeyId,
+            nowMs = now,
+            isNonceSeen = { nonce ->
+                runCatching { PairingManager.isHubNonceSeen(context, nonce, now) }.getOrDefault(false)
+            },
+            markNonceSeen = { nonce ->
+                runCatching { PairingManager.markHubNonceSeen(context, nonce, now) }
+            },
+        )
+        when (result) {
+            is HubStepVerifier.Result.Ok -> handleExecuteStep(result.step)
+            is HubStepVerifier.Result.Reject -> {
+                val jobId = runCatching {
+                    JSONObject(envelope.optString("payload_raw", ""))
+                        .optString("job_id", "")
+                }.getOrDefault("").ifBlank { "unknown" }
+                val summary = if (result.reason == "no_hub_key") {
+                    "Hub key nahi mili — step rejected"
+                } else {
+                    "Hub signature verify fail — step rejected"
+                }
+                diag("WS_STEP_SIG_FAIL", "EXECUTE_STEP reject (${result.reason})")
+                if (result.reason == "ts_stale" || result.reason == "step_ts_stale") {
+                    // Fail-closed is correct, but the user needs the
+                    // fix: their clock. PairingCard shows this detail.
+                    setStatus(_status.value.state, detail = "Hub WS: time galat lagta hai — clock check karo")
+                    diag("WS_STEP_TS_SKEW", "Step ts stale — device clock check karo")
+                }
+                sendStepResult(jobId, false, summary)
+            }
+        }
+    }
+
+    /**
+     * 3c: report a WebView captcha to the hub (signed, like
+     * STEP_RESULT). The screenshot is the captcha IMAGE, not a
+     * solution — it is never stored server-side (DO traces only
+     * task_id/site). If the socket is down the report is lost
+     * (device->hub has no queue); the local card flow still works.
+     */
+    fun sendCaptchaDetected(taskId: String, site: String, taskName: String, screenshotB64: String?) {
+        val payloadRaw = JSONObject()
+            .put("task_id", taskId)
+            .put("site", site)
+            .put("task_name", taskName)
+            .apply { if (screenshotB64 != null) put("screenshot_b64", screenshotB64) }
+            .toString()
+        val msg = runCatching { signedMessage("CAPTCHA_DETECTED", payloadRaw) }.getOrNull() ?: run {
+            diag("WS_KEY_ERROR", "CAPTCHA_DETECTED sign nahi hua")
+            return
+        }
+        val sent = webSocket?.send(msg) ?: false
+        diag("WS_CAPTCHA_DETECTED", "CAPTCHA_DETECTED bheja (sent=$sent)")
+    }
+
+    /**
+     * 3c: report the assist outcome (solved / timeout / aborted).
+     * A solution/token value is NEVER sent — only the outcome.
+     */
+    fun sendCaptchaResolved(taskId: String, site: String, solved: Boolean, aborted: Boolean, durationS: Long) {
+        val payloadRaw = JSONObject()
+            .put("task_id", taskId)
+            .put("site", site)
+            .put("solved", solved)
+            .put("aborted", aborted)
+            .put("duration_s", durationS)
+            .toString()
+        val msg = runCatching { signedMessage("CAPTCHA_RESOLVED", payloadRaw) }.getOrNull() ?: run {
+            diag("WS_KEY_ERROR", "CAPTCHA_RESOLVED sign nahi hua")
+            return
+        }
+        val sent = webSocket?.send(msg) ?: false
+        diag("WS_CAPTCHA_RESOLVED", "CAPTCHA_RESOLVED bheja (solved=$solved, sent=$sent)")
+    }
+
+    /** 3c: 1-tap handoff — the notification opens the app to the canvas. */
+    private fun postCaptchaNotification(site: String, taskName: String) {
+        runCatching {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    "jarvis_autonomous_channel",
+                    "Jarvis",
+                    NotificationManager.IMPORTANCE_HIGH
+                )
+                nm.createNotificationChannel(channel)
+            }
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val pi = PendingIntent.getActivity(
+                context,
+                CAPTCHA_NOTIFICATION_ID,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(context, "jarvis_autonomous_channel")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Jarvis ko madad chahiye")
+                .setContentText("$site par captcha aaya hai ($taskName). Tap karke solve karo.")
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(CAPTCHA_NOTIFICATION_ID, notification)
+        }.onFailure {
+            diag("WS_CAPTCHA_NOTIFY_FAIL", "Captcha notification nahi bheji ja saki")
         }
     }
 

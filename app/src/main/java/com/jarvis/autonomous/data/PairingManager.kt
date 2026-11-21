@@ -40,6 +40,17 @@ import org.json.JSONObject
  * - The pending pairing TOKEN lives in the same encrypted prefs until
  *   register consumes it (one-time, 5-min). Token NEVER in plain prefs,
  *   NEVER logged, NEVER shown in UI.
+ * - The HUB PUBLIC key + key_id live in the same encrypted prefs
+ *   (M-4 §4, hub 3b.1+): delivered by /api/pairing/register (200) and
+ *   by HELLO_ACK bootstrap (first-seen only — a new key_id from
+ *   HELLO_ACK is NEVER accepted; rotation is re-pair-only). The hub
+ *   key is PUBLIC (base64 raw 32-byte) — storing it is safe; the
+ *   private key never leaves the hub. Unpair clears it.
+ * - Seen hub nonces (M-4 §3.5) live in the same prefs as a bounded
+ *   set (max 200, 10-min TTL, pruned on read/write) — a persisted
+ *   store, not memory-only, so a replayed EXECUTE_STEP cannot slip
+ *   through an FGS restart inside the 5-min window. Nonce VALUES are
+ *   never logged or shown in diagnostics (count only).
  * - The PUBLIC key is sent to the hub as STANDARD base64 of the RAW
  *   32-byte Ed25519 key (server importKey("raw") — NOT the 44-byte
  *   SPKI). Android's PublicKey.encoded is the SPKI, so the last 32
@@ -61,6 +72,13 @@ object PairingManager {
     private const val KEY_PENDING_EXPIRES_AT = "pairing_pending_expires_at"
     private const val KEY_FALLBACK_PRIVATE_B64 = "pairing_private_pkcs8_b64"
     private const val KEY_FALLBACK_PUBLIC_SPKI_B64 = "pairing_public_spki_b64"
+    // M-4 (hub 3b.1+): hub public key + key_id (register response /
+    // HELLO_ACK bootstrap) + seen-nonce store (replay protection).
+    private const val KEY_HUB_PUBLIC_B64 = "hub_public_key_b64"
+    private const val KEY_HUB_KEY_ID = "hub_key_id"
+    private const val KEY_HUB_SEEN_NONCES = "hub_seen_nonces"
+    private const val MAX_HUB_NONCES = 200
+    private const val HUB_NONCE_TTL_MS = 10 * 60 * 1000L
 
     enum class KeyStoreKind { ANDROID_KEYSTORE, ENCRYPTED_PREFS }
 
@@ -244,6 +262,68 @@ object PairingManager {
             .apply()
     }
 
+    // ---- Hub public key (M-4 §4 — register response / HELLO_ACK) ----
+
+    /** Stored hub public key (base64 raw 32-byte), null = never received. */
+    fun hubPublicKeyB64(context: Context): String? {
+        return secretsPrefs(context).getString(KEY_HUB_PUBLIC_B64, null)?.takeIf { it.isNotBlank() }
+    }
+
+    /** Stored hub key id (e.g. "hub-1"), null = never received. */
+    fun hubKeyId(context: Context): String? {
+        return secretsPrefs(context).getString(KEY_HUB_KEY_ID, null)?.takeIf { it.isNotBlank() }
+    }
+
+    /** Store the hub key (register response is authoritative — it
+     *  overwrites a HELLO_ACK bootstrap key on re-pair). */
+    fun storeHubPublicKey(context: Context, publicKeyB64: String, keyId: String) {
+        secretsPrefs(context).edit()
+            .putString(KEY_HUB_PUBLIC_B64, publicKeyB64)
+            .putString(KEY_HUB_KEY_ID, keyId)
+            .apply()
+    }
+
+    /** Clear the hub key (unpair — re-pair brings a new one). */
+    fun clearHubPublicKey(context: Context) {
+        secretsPrefs(context).edit()
+            .remove(KEY_HUB_PUBLIC_B64)
+            .remove(KEY_HUB_KEY_ID)
+            .apply()
+    }
+
+    // ---- Seen hub nonces (M-4 §3.5 — replay protection, persisted) ----
+
+    /** True when this hub nonce was already seen (replay). Entries are
+     *  "nonce:seen_at_ms" strings; >10-min entries are pruned here. */
+    fun isHubNonceSeen(context: Context, nonce: String, nowMs: Long = System.currentTimeMillis()): Boolean {
+        return prunedHubNonces(context, nowMs).any { it.substringBefore(":") == nonce }
+    }
+
+    /** Record a hub nonce as seen (call only after the signature
+     *  verified — a failed verify must not burn the nonce). Bounded
+     *  to 200 entries (oldest dropped first). */
+    fun markHubNonceSeen(context: Context, nonce: String, nowMs: Long = System.currentTimeMillis()) {
+        val fresh = prunedHubNonces(context, nowMs).toMutableList()
+        fresh.add("$nonce:$nowMs")
+        while (fresh.size > MAX_HUB_NONCES) fresh.removeAt(0)
+        secretsPrefs(context).edit().putStringSet(KEY_HUB_SEEN_NONCES, fresh.toSet()).apply()
+    }
+
+    /** Fresh (<=10-min) nonce entries; prunes stale ones (writes back
+     *  only when something was pruned). Values never leave this file. */
+    private fun prunedHubNonces(context: Context, nowMs: Long): List<String> {
+        val prefs = secretsPrefs(context)
+        val stored = prefs.getStringSet(KEY_HUB_SEEN_NONCES, emptySet()) ?: emptySet()
+        val fresh = stored.mapNotNull { entry ->
+            val at = entry.substringAfter(":", "").toLongOrNull() ?: return@mapNotNull null
+            if (nowMs - at <= HUB_NONCE_TTL_MS) entry else null
+        }
+        if (fresh.size != stored.size) {
+            prefs.edit().putStringSet(KEY_HUB_SEEN_NONCES, fresh.toSet()).apply()
+        }
+        return fresh
+    }
+
     // ---- Hub calls (blocking — call from Dispatchers.IO) ----
 
     /** POST /api/pairing/init {device_id, licence_key}. */
@@ -301,9 +381,23 @@ object PairingManager {
         val response = runCatching { httpClient.newCall(request).execute() }
             .getOrElse { return RegisterResult.Err(PairingError.NETWORK) }
         response.use { resp ->
+            val text = runCatching { resp.body?.string() ?: "" }.getOrDefault("")
             return when (resp.code) {
                 200 -> {
                     clearPendingToken(context)
+                    // M-4 §4.5: the register response carries the hub
+                    // public key + key_id (authoritative — overwrites
+                    // any HELLO_ACK bootstrap key). Old apps ignore
+                    // the extra fields; the key is PUBLIC (base64 raw
+                    // 32-byte), so storing it is safe.
+                    runCatching {
+                        val json = JSONObject(text)
+                        val hubKey = json.optString("hub_public_key", "")
+                        val hubKeyId = json.optString("key_id", "")
+                        if (hubKey.isNotBlank() && hubKeyId.isNotBlank()) {
+                            storeHubPublicKey(context, hubKey, hubKeyId)
+                        }
+                    }
                     RegisterResult.Ok
                 }
                 403 -> {

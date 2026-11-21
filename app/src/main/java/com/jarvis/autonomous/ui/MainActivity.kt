@@ -117,6 +117,11 @@ import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
+import com.jarvis.autonomous.data.CaptchaStatus
+import com.jarvis.autonomous.data.DocConfirmClient
+import com.jarvis.autonomous.data.DocConfirmState
+import com.jarvis.autonomous.data.DocConfirmStatus
+import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanView
@@ -495,7 +500,8 @@ fun JarvisMainApp(
                     onNavigatePermissions = { selectedTab = 1 },
                     voiceDisabled = micPermissionDenied,
                     onStopMic = onStopMic,
-                    onRetryMic = onRetryMic
+                    onRetryMic = onRetryMic,
+                    onNavigateBrowser = { selectedTab = 5 }
                 )
 
                 1 -> PermissionsChecklistScreen()
@@ -568,7 +574,9 @@ fun CommandCenterScreen(
     voiceDisabled: Boolean = false,
     /** 1.4.2: mic-off + Retry for a dead loop (see banner below). */
     onStopMic: () -> Unit = {},
-    onRetryMic: () -> Unit = {}
+    onRetryMic: () -> Unit = {},
+    /** 3c: captcha card's [Main solve karta hun] — opens tab 5. */
+    onNavigateBrowser: () -> Unit = {}
 ) {
     val agentState by JarvisStateRepository.agentState.collectAsState()
     // WAVE-2 (§D-8): true playback state — the avatar ring /
@@ -766,6 +774,176 @@ fun CommandCenterScreen(
                     }
                     if (bounceCopiedNote.isNotBlank()) {
                         Text(bounceCopiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                }
+            }
+        }
+        // 3c (D3 human-assist-first + 3b doc confirm): the captcha
+        // canvas + doc confirm card sit here, directly under the
+        // bounce/breaker cards — the user sees them the moment they
+        // open the Command tab. Neither card blocks the rest of the
+        // tab; both are one-shot (a dismiss hides the card, the
+        // underlying task stays paused/aborted as reported).
+        val uiScope = rememberCoroutineScope()
+        val captchaAssist by JarvisStateRepository.captchaAssist.collectAsState()
+        val docConfirm by JarvisStateRepository.docConfirm.collectAsState()
+        if (captchaAssist != null) {
+            val captcha = captchaAssist!!
+            CaptchaAssistCard(
+                state = captcha,
+                onSolveClick = onNavigateBrowser,
+                onAbortClick = {
+                    val durationS = ((System.currentTimeMillis() - captcha.receivedAtMs) / 1000L)
+                        .coerceAtLeast(0L)
+                    HubWsClient.instance?.sendCaptchaResolved(
+                        captcha.taskId, captcha.site, solved = false, aborted = true, durationS = durationS
+                    )
+                    JarvisBackgroundBrowser.markCaptchaAborted(captcha.taskId, captcha.url)
+                },
+                onTimeout = {
+                    JarvisStateRepository.setCaptchaAssist(
+                        captcha.copy(status = CaptchaStatus.TIMED_OUT)
+                    )
+                    JarvisStateRepository.addChatMessage(
+                        "Jarvis",
+                        "Captcha ka time khatam — task ruka hua hai. Jab solve karna ho, [Abhi solve karo] dabao."
+                    )
+                },
+                onRecheckClick = {
+                    uiScope.launch {
+                        JarvisBackgroundBrowser.recheckCaptcha(whiteboardContext, captcha.taskId)
+                    }
+                },
+                onReopenClick = {
+                    JarvisStateRepository.setCaptchaAssist(
+                        captcha.copy(
+                            status = CaptchaStatus.ACTIVE,
+                            receivedAtMs = System.currentTimeMillis()
+                        )
+                    )
+                },
+                onDismiss = { JarvisStateRepository.setCaptchaAssist(null) }
+            )
+        }
+        // 3c: Documents test section (3b /docs/extract + /confirm).
+        // The doc job itself comes from the 3b pipeline (ingest
+        // needs the Render worker live, U-2); this section is the
+        // minimal in-app trigger — job id + field names -> extract
+        // -> ConfirmCard -> confirm. No docs flow existed in-app
+        // before 3c; this is the whole trigger, kept deliberately
+        // small.
+        var docJobIdInput by remember { mutableStateOf("") }
+        var docFieldsInput by remember { mutableStateOf("name, dob, document_number") }
+        var docLoading by remember { mutableStateOf(false) }
+        if (docConfirm != null) {
+            val doc = docConfirm!!
+            ConfirmCard(
+                state = doc,
+                onConfirm = { fields ->
+                    uiScope.launch {
+                        val result = DocConfirmClient.confirmDoc(
+                            whiteboardContext, doc.docJobId, fields,
+                            (doc.missing + doc.fields.keys.toList()).distinct()
+                        )
+                        when (result) {
+                            is DocConfirmClient.ConfirmResult.Ok -> {
+                                JarvisStateRepository.setDocConfirm(
+                                    doc.copy(
+                                        status = DocConfirmStatus.CONFIRMED,
+                                        fields = result.fields,
+                                        message = "confirmed"
+                                    )
+                                )
+                                JarvisStateRepository.addChatMessage(
+                                    "Jarvis",
+                                    "Document confirm ho gaya — doc job #${doc.docJobId}."
+                                )
+                            }
+                            is DocConfirmClient.ConfirmResult.Missing -> {
+                                JarvisStateRepository.setDocConfirm(
+                                    doc.copy(
+                                        fields = result.fields, missing = result.missing,
+                                        status = DocConfirmStatus.PENDING,
+                                        message = "Kuch fields abhi bhi missing hain."
+                                    )
+                                )
+                            }
+                            is DocConfirmClient.ConfirmResult.Err -> {
+                                JarvisStateRepository.setDocConfirm(
+                                    doc.copy(status = DocConfirmStatus.ERROR, message = result.message)
+                                )
+                            }
+                        }
+                    }
+                },
+                onDismiss = { JarvisStateRepository.setDocConfirm(null) }
+            )
+        } else {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3EC))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Documents (test)",
+                        fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF2E7D5B)
+                    )
+                    Text(
+                        "Doc job id + field names daalo — extract dikhega, phir ek click confirm.",
+                        fontSize = 12.sp, color = Color(0xFF3B2F2A)
+                    )
+                    OutlinedTextField(
+                        value = docJobIdInput,
+                        onValueChange = { docJobIdInput = it },
+                        label = { Text("Doc job id") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = docFieldsInput,
+                        onValueChange = { docFieldsInput = it },
+                        label = { Text("Fields (comma se alag)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    Button(
+                        onClick = {
+                            val jobId = docJobIdInput.toLongOrNull() ?: return@Button
+                            val names = docFieldsInput.split(",")
+                                .map { it.trim() }.filter { it.isNotBlank() }
+                            uiScope.launch {
+                                docLoading = true
+                                val result = DocConfirmClient.loadExtract(whiteboardContext, jobId, names)
+                                docLoading = false
+                                when (result) {
+                                    is DocConfirmClient.ExtractResult.Ok -> {
+                                        JarvisStateRepository.setDocConfirm(
+                                            DocConfirmState(
+                                                docJobId = result.docJobId, fields = result.fields,
+                                                missing = result.missing, confidence = result.confidence,
+                                                status = DocConfirmStatus.PENDING
+                                            )
+                                        )
+                                    }
+                                    is DocConfirmClient.ExtractResult.Err -> {
+                                        JarvisStateRepository.setDocConfirm(
+                                            DocConfirmState(
+                                                docJobId = jobId, fields = emptyMap(), missing = names,
+                                                confidence = 0.0, status = DocConfirmStatus.ERROR,
+                                                message = result.message
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                        enabled = docJobIdInput.toLongOrNull() != null && !docLoading,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text(
+                            if (docLoading) "Extract ho raha hai…" else "Extract dikhao",
+                            color = Color.White, fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }

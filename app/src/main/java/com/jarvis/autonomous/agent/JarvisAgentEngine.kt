@@ -2557,6 +2557,20 @@ class JarvisAgentEngine(
                 speak("Browsing ruk gaya, dobara koshish karun?")
                 "OPEN_BROWSER interrupted '$url' (no content fabricated)"
             }
+            BrowserBrowseStatus.CAPTCHA -> {
+                // 3c (D3 human-assist-first): a challenge page is
+                // never auto-solved and never content-extracted. The
+                // assist canvas is already showing (browser layer
+                // published it); tell the user once, return the
+                // prompt string, and let the loop pause on the
+                // AWAITING_USER step — no retry loop while waiting.
+                speak("Captcha aaya hai — Browser tab me solve karo, phir main aage badhunga.")
+                JarvisStateRepository.addChatMessage(
+                    "Jarvis",
+                    "Captcha aaya hai — ${result.errorMessage}"
+                )
+                "OPEN_BROWSER captcha '$url' (human assist — no auto-solve)"
+            }
             BrowserBrowseStatus.FAILED -> {
                 speak(
                     "Page nahi khul paya: ${result.errorMessage}. Dobara koshish karun?"

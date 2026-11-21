@@ -102,7 +102,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         // no speak.
         val existing = AgentPlanStore.load(context)
         if (existing != null && !existing.completed &&
-            existing.steps.any { it.state == PlanState.PENDING || it.state == PlanState.RUNNING || it.state == PlanState.BLOCKED }
+            existing.steps.any { it.state == PlanState.PENDING || it.state == PlanState.RUNNING || it.state == PlanState.BLOCKED || it.state == PlanState.AWAITING_USER }
         ) {
             JarvisStateRepository.addChatMessage(
                 "Jarvis",
@@ -175,21 +175,28 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val loaded = AgentPlanStore.load(context) ?: return
         if (loaded.completed) return
         if (loaded.steps.none {
-                it.state == PlanState.PENDING || it.state == PlanState.RUNNING || it.state == PlanState.BLOCKED
+                it.state == PlanState.PENDING || it.state == PlanState.RUNNING || it.state == PlanState.BLOCKED ||
+                    it.state == PlanState.AWAITING_USER
             }
         ) return
         // answeredClarifications are restored into the engine list
         // (capped 12, as today) so the resumed plan never re-asks.
         engine.planRestoreClarifications(loaded.answeredClarifications)
-        // A RUNNING step is demoted to PENDING with attempts
-        // preserved and evidence appended — never blindly re-run.
+        // A RUNNING (or captcha-waiting AWAITING_USER) step is
+        // demoted to PENDING with attempts preserved and evidence
+        // appended — never blindly re-run.
         var plan = loaded
-        val running = plan.steps.firstOrNull { it.state == PlanState.RUNNING }
+        val running = plan.steps.firstOrNull { it.state == PlanState.RUNNING || it.state == PlanState.AWAITING_USER }
         if (running != null) {
+            val note = if (running.state == PlanState.AWAITING_USER) {
+                "captcha wait ke dauraan ruk gaya — verifying before re-running"
+            } else {
+                "interrupted by kill — verifying before re-running"
+            }
             plan = updateStep(plan, running.id) {
                 it.copy(
                     state = PlanState.PENDING,
-                    evidence = (it.evidence + " | interrupted by kill — verifying before re-running")
+                    evidence = (it.evidence + " | $note")
                         .trim().trimStart('|').trim()
                 )
             }.copy(currentStepId = null)
@@ -257,7 +264,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 // Verify-before-re-run for an interrupted step: if
                 // the check proves it actually completed, mark it
                 // DONE and advance — never re-execute a DONE step.
-                if (step.evidence.contains("interrupted by kill")) {
+                // (Both demote notes count: kill-interrupt and the
+                // 3c captcha-wait demote.)
+                if (step.evidence.contains("interrupted by kill") ||
+                    step.evidence.contains("captcha wait ke dauraan ruk gaya")
+                ) {
                     when (val verified = verifyStep(step, current)) {
                         is StepOutcome.Done -> {
                             current = updateStep(current, step.id) {

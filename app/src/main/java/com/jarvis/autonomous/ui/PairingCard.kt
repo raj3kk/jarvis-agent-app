@@ -164,7 +164,11 @@ fun PairingCard(prefs: JarvisPreferences) {
                     HubWsClient.WsState.UNAUTH -> "Pairing dobara karo"
                     HubWsClient.WsState.NOT_PAIRED -> "Paired nahi hai"
                 } + if (wsStatus.state == HubWsClient.WsState.CONNECTED) {
-                    " · HELLO_ACK ${timeFormat.format(Date(wsStatus.lastHelloAckAtMs))}"
+                    " · HELLO_ACK ${timeFormat.format(Date(wsStatus.lastHelloAckAtMs))}" +
+                        // 3c: a status detail (e.g. the clock-skew
+                        // hint) must show WHILE connected too — the
+                        // old rule hid it exactly when it mattered.
+                        if (wsStatus.detail.isNotBlank()) " (${wsStatus.detail})" else ""
                 } else if (wsStatus.detail.isNotBlank() &&
                     wsStatus.state != HubWsClient.WsState.OFFLINE
                 ) {
@@ -263,6 +267,11 @@ fun PairingCard(prefs: JarvisPreferences) {
                             prefs.pairingDeviceId = ""
                             prefs.pairingPairedAtMs = 0L
                             paired = false
+                            // 3c (M-4): unpair also drops the stored
+                            // hub public key — otherwise a stale key
+                            // would keep verifying a hub this device
+                            // no longer trusts. Re-pair re-stores it.
+                            PairingManager.clearHubPublicKey(cardContext)
                             message = "Unpaired (local). Server par device abhi hataya nahi ja sakta — Phase 2 backlog."
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
