@@ -125,6 +125,7 @@ import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
+import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.PreviousBounce
 import com.jarvis.autonomous.data.buildBounceReportText
 import com.jarvis.autonomous.data.clearStaleBounceReport
@@ -2434,6 +2435,10 @@ fun MemoryRoutinesLogsScreen(
     var newTrigger by remember { mutableStateOf("") }
     var newRoutinePrompt by remember { mutableStateOf("") }
 
+    // 1.5.3-PRO: learned-skills manifests (on-device only).
+    val skillStore = remember { LearnedRoutineStore(LocalContext.current) }
+    var skills by remember { mutableStateOf(skillStore.loadSkillManifests()) }
+
     val logs by JarvisStateRepository.executionLogs.collectAsState()
 
     Column(
@@ -2600,6 +2605,58 @@ fun MemoryRoutinesLogsScreen(
                     }
                 ) {
                     Text("+ Add Voice Routine")
+                }
+            }
+        }
+
+        // Section 1b: Learned Skills (1.5.3-PRO) — on-device
+        // skill manifests (versioned, user-approved, phone par
+        // hi). These NEVER leave the phone: no upload, no
+        // server, no global publish. A disabled skill never
+        // replays — the LLM loop handles the command instead.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Learned Skills (On-Device Only)", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D5B))
+                Text(
+                    "Ye skills sirf is phone par rehti hain — kahin upload nahi hoti. Band ki hui skill dobara nahi chalegi.",
+                    fontSize = 11.sp, color = Color(0xFF8A7A70)
+                )
+                if (skills.isEmpty()) {
+                    Text(
+                        "Abhi koi skill seekhi nahi — koi multi-step kaam dobara karne par Jarvis use seekh lega.",
+                        fontSize = 12.sp, color = Color(0xFF8A7A70)
+                    )
+                }
+                skills.forEach { skill ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFFFFF1DC))
+                            .padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Say: \"${skill.displayName}\"", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
+                            Text("Used ${skill.useCount} times", fontSize = 11.sp, color = Color.LightGray)
+                        }
+                        Switch(
+                            checked = skill.enabled,
+                            onCheckedChange = { checked ->
+                                skillStore.setSkillEnabled(skill.id, checked)
+                                skills = skillStore.loadSkillManifests()
+                            }
+                        )
+                        IconButton(onClick = {
+                            skillStore.deleteSkill(skill.id)
+                            skills = skillStore.loadSkillManifests()
+                        }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFFFF5252))
+                        }
+                    }
                 }
             }
         }

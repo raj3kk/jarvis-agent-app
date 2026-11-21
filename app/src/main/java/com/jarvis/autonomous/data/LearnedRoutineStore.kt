@@ -56,6 +56,38 @@ data class LearnedRoutine(
     val createdAtMs: Long = 0L
 )
 
+/**
+ * One on-device skill manifest (Phase 1, 1.5.3-PRO).
+ *
+ * A skill is a learned routine PLUS its lifecycle metadata:
+ * how often it replayed, when it last ran, whether the user
+ * left it enabled, and which content version it is on.
+ * The manifest is the source of truth for the Skills UI and
+ * for replay gating; the routine JSON stays as the legacy
+ * step store (unchanged format, still the replay input).
+ *
+ * PRIVACY: manifests NEVER leave the phone. No network call
+ * touches them; the learned-pattern upload path
+ * (maybeUploadLearnedPattern) stays templates-only and does
+ * not read manifests. No server, no global publish.
+ *
+ * Schema v1 (frozen in Pehle-Jaanch §3.1): schemaVersion is
+ * the envelope version, checked on load — an unknown version
+ * fails closed (skill skipped, routine untouched).
+ */
+data class LocalSkillManifest(
+    val id: String,
+    val trigger: String,
+    val displayName: String,
+    val steps: List<LearnedStep>,
+    val source: String = "learned",
+    val createdAtMs: Long = 0L,
+    val lastUsedAtMs: Long = 0L,
+    val useCount: Int = 0,
+    val enabled: Boolean = true,
+    val version: Int = 1
+)
+
 /** Trigger normalization, shared by recording and lookup (idempotent). */
 object RoutineNormalization {
     // Filler words dropped ONLY for the close-match comparison, never
@@ -140,6 +172,10 @@ class LearnedRoutineStore(context: Context) {
         val replaced = all.filterNot { it.trigger == normalized }.toMutableList()
         replaced.add(routine)
         saveRoutines(replaced)
+        // 1.5.3-PRO: the routine just learned (or re-learned) gets
+        // its skill manifest upserted (version+1 on re-learn,
+        // useCount / lastUsedAtMs / enabled preserved).
+        upsertSkillManifest(routine)
         return routine
     }
 
@@ -161,7 +197,16 @@ class LearnedRoutineStore(context: Context) {
      * The input phrase is normalized inside, so callers may pass raw
      * user text; normalization is idempotent.
      */
-    fun findRoutine(phrase: String): LearnedRoutine? {
+    /**
+     * 1.5.3-PRO: disabled skills never replay. A matched routine
+     * whose manifest is disabled returns null, so the caller
+     * falls through to the LLM loop. No manifest (legacy
+     * routine, learned before 1.5.3) counts as enabled.
+     */
+    fun findRoutine(phrase: String): LearnedRoutine? =
+        findMatchedRoutine(phrase)?.takeIf { isSkillEnabled(it.id) }
+
+    private fun findMatchedRoutine(phrase: String): LearnedRoutine? {
         val normalized = RoutineNormalization.normalize(phrase)
         if (normalized.isBlank()) return null
         val all = loadRoutines()
@@ -238,6 +283,189 @@ class LearnedRoutineStore(context: Context) {
      */
     fun isNetworkDependent(action: String): Boolean =
         action.trim().uppercase() in NETWORK_ACTIONS
+
+    // ------------------------------------------------------------------
+    // SKILL MANIFESTS v1 (1.5.3-PRO) — on-device only, never uploaded
+    // ------------------------------------------------------------------
+
+    /**
+     * Loads all skill manifests. Unknown schemaVersion entries
+     * are skipped (fail-closed); the routine JSON is untouched.
+     * Public — the Skills UI reads through this.
+     */
+    fun loadSkillManifests(): List<LocalSkillManifest> {
+        val raw = prefs.getString(KEY_SKILLS_JSON, "[]") ?: "[]"
+        return runCatching {
+            val arr = JSONArray(raw)
+            val out = ArrayList<LocalSkillManifest>()
+            for (i in 0 until arr.length()) {
+                val manifest = manifestFromJson(arr.getJSONObject(i))
+                if (manifest != null) {
+                    out.add(manifest)
+                }
+            }
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveSkillManifests(manifests: List<LocalSkillManifest>) {
+        val arr = JSONArray()
+        for (manifest in manifests) {
+            arr.put(manifestToJson(manifest))
+        }
+        prefs.edit().putString(KEY_SKILLS_JSON, arr.toString()).apply()
+    }
+
+    /**
+     * Creates or refreshes the manifest for a just-learned (or
+     * re-learned) routine. Match is by TRIGGER: re-learning the
+     * same task bumps version by 1 and keeps useCount /
+     * lastUsedAtMs / enabled (never reset), while the id follows
+     * the current routine (finishRoutine replaces by trigger, so
+     * the old id is stale). Prune runs after every upsert.
+     */
+    private fun upsertSkillManifest(routine: LearnedRoutine) {
+        val all = loadSkillManifests().toMutableList()
+        val existing = all.firstOrNull { it.trigger == routine.trigger }
+        val manifest = if (existing != null) {
+            existing.copy(
+                id = routine.id,
+                steps = routine.steps,
+                version = existing.version + 1
+            )
+        } else {
+            LocalSkillManifest(
+                id = routine.id,
+                trigger = routine.trigger,
+                displayName = routine.trigger,
+                steps = routine.steps,
+                createdAtMs = routine.createdAtMs
+            )
+        }
+        val replaced = all.filterNot { it.trigger == routine.trigger }.toMutableList()
+        replaced.add(manifest)
+        saveSkillManifests(replaced)
+        pruneSkillsIfNeeded()
+    }
+
+    /**
+     * Counts one successful replay (full replay passed — the
+     * engine calls this only after every step passed). A
+     * half-finished or mismatched replay never counts.
+     * No manifest (legacy routine) = no-op.
+     */
+    fun recordSkillUse(id: String) {
+        val all = loadSkillManifests().toMutableList()
+        val idx = all.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val m = all[idx]
+        all[idx] = m.copy(
+            useCount = m.useCount + 1,
+            lastUsedAtMs = System.currentTimeMillis()
+        )
+        saveSkillManifests(all)
+    }
+
+    /** User toggle from the Skills UI. No manifest = no-op. */
+    fun setSkillEnabled(id: String, enabled: Boolean) {
+        val all = loadSkillManifests().toMutableList()
+        val idx = all.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        all[idx] = all[idx].copy(enabled = enabled)
+        saveSkillManifests(all)
+    }
+
+    /**
+     * Deletes a skill: its manifest AND its routine (both stay
+     * in sync — a deleted skill must never replay from a stale
+     * routine entry).
+     */
+    fun deleteSkill(id: String) {
+        saveSkillManifests(loadSkillManifests().filterNot { it.id == id })
+        saveRoutines(loadRoutines().filterNot { it.id == id })
+    }
+
+    /** No manifest (legacy routine) counts as enabled. */
+    fun isSkillEnabled(id: String): Boolean =
+        loadSkillManifests().firstOrNull { it.id == id }?.enabled ?: true
+
+    /**
+     * Cap 50 + prune. Over the cap, one victim at a time: (1)
+     * disabled + lowest useCount first; (2) otherwise the
+     * oldest lastUsedAtMs (0 = never used) + lowest useCount.
+     * The victim's routine goes with its manifest (sync).
+     * Diagnostic carries id + useCount ONLY — never trigger
+     * text (a trigger is the user's own spoken phrase).
+     */
+    private fun pruneSkillsIfNeeded() {
+        var all = loadSkillManifests()
+        while (all.size > MAX_SKILLS) {
+            val disabled = all.filter { !it.enabled }
+            val victim = if (disabled.isNotEmpty()) {
+                disabled.minWithOrNull(compareBy({ it.useCount }, { it.lastUsedAtMs }))
+            } else {
+                all.minWithOrNull(compareBy({ it.lastUsedAtMs }, { it.useCount }))
+            } ?: break
+            runCatching {
+                JarvisStateRepository.addDiagnostic(
+                    "skill", "SKILL_PRUNED",
+                    "id=${victim.id} useCount=${victim.useCount}"
+                )
+            }
+            saveSkillManifests(all.filterNot { it.id == victim.id })
+            saveRoutines(loadRoutines().filterNot { it.id == victim.id })
+            all = loadSkillManifests()
+        }
+    }
+
+    private fun manifestToJson(manifest: LocalSkillManifest): JSONObject {
+        val obj = JSONObject()
+        obj.put("schemaVersion", SKILL_SCHEMA_VERSION)
+        obj.put("id", manifest.id)
+        obj.put("trigger", manifest.trigger)
+        obj.put("displayName", manifest.displayName)
+        val stepsArr = JSONArray()
+        for (step in manifest.steps) {
+            stepsArr.put(stepToJson(step))
+        }
+        obj.put("steps", stepsArr)
+        obj.put("source", manifest.source)
+        obj.put("createdAtMs", manifest.createdAtMs)
+        obj.put("lastUsedAtMs", manifest.lastUsedAtMs)
+        obj.put("useCount", manifest.useCount)
+        obj.put("enabled", manifest.enabled)
+        obj.put("version", manifest.version)
+        return obj
+    }
+
+    private fun manifestFromJson(obj: JSONObject): LocalSkillManifest? {
+        // Unknown schema version = fail-closed (skip the entry).
+        if (obj.optInt("schemaVersion", -1) != SKILL_SCHEMA_VERSION) return null
+        val id = obj.optString("id", "")
+        val trigger = obj.optString("trigger", "")
+        if (id.isBlank() || trigger.isBlank()) return null
+        val stepsArr = obj.optJSONArray("steps") ?: return null
+        val steps = ArrayList<LearnedStep>()
+        for (i in 0 until stepsArr.length()) {
+            val step = stepFromJson(stepsArr.optJSONObject(i))
+            if (step != null) {
+                steps.add(step)
+            }
+        }
+        if (steps.isEmpty()) return null
+        return LocalSkillManifest(
+            id = id,
+            trigger = trigger,
+            displayName = obj.optString("displayName", trigger).ifBlank { trigger },
+            steps = steps,
+            source = obj.optString("source", "learned"),
+            createdAtMs = obj.optLong("createdAtMs", 0L),
+            lastUsedAtMs = obj.optLong("lastUsedAtMs", 0L),
+            useCount = obj.optInt("useCount", 0),
+            enabled = obj.optBoolean("enabled", true),
+            version = obj.optInt("version", 1).coerceAtLeast(1)
+        )
+    }
 
     // ------------------------------------------------------------------
     // Safety-pattern backstop for recordStep()
@@ -346,6 +574,12 @@ class LearnedRoutineStore(context: Context) {
     companion object {
         private const val PREFS_NAME = "jarvis_learned_routines"
         private const val KEY_JSON = "learned_routines_json"
+        // 1.5.3-PRO: skill manifests v1 — a SEPARATE key, so the
+        // routine JSON format never changes (legacy routines keep
+        // working with no migration).
+        private const val KEY_SKILLS_JSON = "local_skills_json_v1"
+        private const val SKILL_SCHEMA_VERSION = 1
+        private const val MAX_SKILLS = 50
         private const val MAX_WAIT_MS = 10_000L
         private const val MAX_VALUE_LENGTH = 200
 

@@ -1317,6 +1317,8 @@ class JarvisAgentEngine(
                 }
                 if (step.waitMs > 0) delay(step.waitMs)
             }
+            // 1.5.3-PRO: full replay passed — count the use.
+            learnedRoutineStore.recordSkillUse(routine.id)
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Learned replay done")
             speak("Ho gaya — seekha hua kaam dobara kar diya. Aur kya karna hai?")
         }
