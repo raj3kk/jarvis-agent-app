@@ -2420,6 +2420,11 @@ fun AiBrainSettingsScreen(
                 }
             }
         }
+
+        // 1.6.0 (Phase 2, 2b-1): Control-plane pairing — Ed25519
+        // keypair + hub register. Poora card apni file me hai
+        // (PairingCard.kt); yahan sirf ek line ka call hai.
+        PairingCard(prefs)
     }
 }
 

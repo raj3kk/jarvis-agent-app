@@ -122,6 +122,24 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getBoolean("live_mode_enabled", false)
         set(value) = prefs.edit().putBoolean("live_mode_enabled", value).apply()
 
+    // 1.6.0 (Phase 2, 2b-1): control-plane pairing status — flag +
+    // metadata ONLY. No secrets in plain prefs, ever: the Ed25519
+    // private key lives in the Android Keystore (or encrypted prefs
+    // on API < 31) and the pending pairing token in
+    // EncryptedSharedPreferences (PairingManager). Set ONLY by the
+    // pairing card's own buttons, never by the AI Brain Save button.
+    var pairingPaired: Boolean
+        get() = prefs.getBoolean("pairing_paired", false)
+        set(value) = prefs.edit().putBoolean("pairing_paired", value).apply()
+
+    var pairingDeviceId: String
+        get() = prefs.getString("pairing_device_id", "") ?: ""
+        set(value) = prefs.edit().putString("pairing_device_id", value).apply()
+
+    var pairingPairedAtMs: Long
+        get() = prefs.getLong("pairing_paired_at_ms", 0L)
+        set(value) = prefs.edit().putLong("pairing_paired_at_ms", value).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the
