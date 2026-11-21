@@ -586,6 +586,64 @@ class JarvisAgentEngine(
         activeTaskJob = scope.launch { quickPathFallback(trimmed, failureLine) }
     }
 
+    /**
+     * 1.5.2-PRO (second-claim guard): completion-claim verbs
+     * (Hinglish + English, lowercase match). A reply with
+     * claim verbs in 2+ segments is spoken only up to the
+     * first claim — see guardSecondClaim.
+     */
+    private val claimVerbs = listOf(
+        "bhej diya", "bhej diya hai", "laga diya", "khol diya",
+        "chala diya", "kar diya", "ho gaya", "ban gaya",
+        "save kar diya", "sent", "done", "completed", "opened", "played"
+    )
+
+    private fun containsClaimVerb(text: String): Boolean {
+        val lower = text.lowercase()
+        return claimVerbs.any { lower.contains(it) }
+    }
+
+    /**
+     * 1.5.2-PRO (second-claim guard, closes 1.4.25 Step 1g):
+     * a multi-claim reply ("X bhej diya aur Y bhi kar diya")
+     * is spoken only up to the first claim. Split points:
+     * " aur ", " and ", ", ", "; ". Fires ONLY when the part
+     * before AND the part after a split both contain a claim
+     * verb. Returns (speakText, secondClaim?) — the second
+     * claim is truncated to 80 chars for the chat note.
+     * Deterministic, no LLM, no NLP library. The guard only
+     * shortens what is SPOKEN — the full reply stays in chat
+     * with a note; evidence, routine, index and state are
+     * untouched. Worst case of a false positive: the second
+     * half of a long reply is not spoken (still visible in
+     * chat) — the safe direction.
+     */
+    private fun guardSecondClaim(reply: String): Pair<String, String?> {
+        val lower = reply.lowercase()
+        var bestSplit: Int? = null
+        var bestSepLen = 0
+        for (sep in listOf(" aur ", " and ", ", ", "; ")) {
+            var idx = lower.indexOf(sep)
+            while (idx >= 0) {
+                val first = lower.substring(0, idx)
+                val rest = lower.substring(idx + sep.length)
+                if (containsClaimVerb(first) && containsClaimVerb(rest)) {
+                    if (bestSplit == null || idx < bestSplit) {
+                        bestSplit = idx
+                        bestSepLen = sep.length
+                    }
+                    break
+                }
+                idx = lower.indexOf(sep, idx + 1)
+            }
+        }
+        if (bestSplit == null) return reply to null
+        val speakText = reply.substring(0, bestSplit).trim()
+        val secondClaim = reply.substring(bestSplit + bestSepLen).trim().take(80)
+        if (speakText.isBlank()) return reply to null
+        return speakText to secondClaim
+    }
+
     private fun tryNoAiRoutine(lower: String, trimmed: String): Boolean {
         val acc = JarvisAccessibilityService.instance
         // Patterns suggestions (1.4.1 audit gap): "patterns dikhao" /
@@ -2006,28 +2064,48 @@ class JarvisAgentEngine(
                                     JarvisStateRepository.addChatMessage("Jarvis", summary)
                                     speak(summary, alreadyPostedToChat = true)
                                 } else {
-                                    deferredCompletionReply?.let {
-                                        JarvisStateRepository.addChatMessage("Jarvis", it)
+                                    deferredCompletionReply?.let { raw ->
+                                        JarvisStateRepository.addChatMessage("Jarvis", raw)
                                         persistChat()
-                                        speak(it, alreadyPostedToChat = true)
+                                        // 1.5.2-PRO (second-claim
+                                        // guard): chat me FULL reply,
+                                        // speak sirf pehla claim.
+                                        val (guarded, secondClaim) = guardSecondClaim(raw)
+                                        secondClaim?.let { claim ->
+                                            JarvisStateRepository.addChatMessage(
+                                                "Jarvis",
+                                                "Note: dusra daava ($claim) is step me verify nahi hua — dobara check karke bataunga."
+                                            )
+                                            persistChat()
+                                        }
+                                        speak(guarded, alreadyPostedToChat = true)
                                     }
                                 }
                             } else {
-                                // 1.4.25-PRO Step 1C (1g, comment
-                                // only — no code change): the deferred
+                                // 1.5.2-PRO (second-claim guard,
+                                // closes 1.4.25 Step 1g): the deferred
                                 // reply is the model's words for THIS
                                 // step only. It is spoken here because
-                                // this step's own evidence passed. A
-                                // multi-claim reply ("X bhej diya aur
-                                // Y bhi kar diya") is therefore bounded
-                                // to the verified step; the second
-                                // claim was never separately verified.
-                                // A second-claim guard is out of scope
-                                // for 1.4.25.
-                                deferredCompletionReply?.let {
-                                    JarvisStateRepository.addChatMessage("Jarvis", it)
+                                // this step's own evidence passed —
+                                // but only up to the FIRST completion
+                                // claim. A multi-claim reply ("X bhej
+                                // diya aur Y bhi kar diya") speaks its
+                                // first claim; the second claim goes to
+                                // chat with a note that it was not
+                                // verified in this step. Chat always
+                                // keeps the FULL reply.
+                                deferredCompletionReply?.let { raw ->
+                                    JarvisStateRepository.addChatMessage("Jarvis", raw)
                                     persistChat()
-                                    speak(it, alreadyPostedToChat = true)
+                                    val (guarded, secondClaim) = guardSecondClaim(raw)
+                                    secondClaim?.let { claim ->
+                                        JarvisStateRepository.addChatMessage(
+                                            "Jarvis",
+                                            "Note: dusra daava ($claim) is step me verify nahi hua — dobara check karke bataunga."
+                                        )
+                                        persistChat()
+                                    }
+                                    speak(guarded, alreadyPostedToChat = true)
                                 }
                             }
                             // Verified completion: persist the learned
