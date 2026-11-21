@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 37
-        versionName = "1.5.3-PRO"
+        versionCode = 38
+        versionName = "1.5.4-PRO"
 
         // Owner's HF token for the gated Gemma download (user order
         // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
@@ -82,7 +82,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // 1.5.4-PRO: R8 on (keep-all app code — proguard-rules.pro
+            // UNCHANGED, safe baseline; shrink sirf dependencies ka).
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

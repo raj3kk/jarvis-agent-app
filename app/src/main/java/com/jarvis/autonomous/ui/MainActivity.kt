@@ -1666,6 +1666,26 @@ fun AiBrainSettingsScreen(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
+                    // 1.5.4-PRO: honest storage-footprint disclosure
+                    // (Pehle-Jaanch §3.6). APK size runtime PackageManager
+                    // se (hardcode nahi); model size downloaded bytes se
+                    // (na ho to ~304 MB estimate); total = APK + model.
+                    // Model pehli baar download hota hai, APK me nahi hai.
+                    Text(
+                        text = run {
+                            val apkBytes = try {
+                                val pkgInfo = localContext.packageManager.getPackageInfo(localContext.packageName, 0)
+                                java.io.File(pkgInfo.applicationInfo?.sourceDir ?: "").length()
+                            } catch (e: Exception) { 0L }
+                            val modelBytes = LocalLlmManager.downloadedBytes(localContext)
+                            val apkLabel = if (apkBytes > 0) "${apkBytes / 1_000_000L} MB" else "?"
+                            val modelLabel = if (modelBytes > 0) "${modelBytes / 1_000_000L} MB" else "~304 MB (download hone par)"
+                            val totalLabel = if (apkBytes > 0 && modelBytes > 0) "${(apkBytes + modelBytes) / 1_000_000L} MB" else "APK + model ≈ 600 MB+"
+                            "Storage footprint — APK: $apkLabel · Model: $modelLabel · Total: $totalLabel. Model pehli baar download hota hai, APK me nahi hai."
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                     if (localProgress.isNotBlank()) {
                         Text(localProgress, fontSize = 12.sp)
                     }
