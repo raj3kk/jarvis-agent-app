@@ -44,9 +44,9 @@ import kotlinx.coroutines.withContext
  * 6-digit code (5-min) -> "Confirm pairing" -> hub
  * /api/pairing/register (one-time token + public key) -> Paired.
  * No QR scan (camera = new permission — NOT in Phase 2b), no token
- * on screen, no private key anywhere in the UI. Until the D1
- * licence-verify migration lands, init answers 503 and the card
- * shows the honest setup-pending line.
+ * on screen, no private key anywhere in the UI. D1 licence-verify
+ * migration is live (2026-11-21) — init no longer answers 503
+ * config_missing; the CONFIG_MISSING branch is a defensive branch only.
  *
  * 2b-2: the card also shows the hub WebSocket status (HubWsClient
  * process-wide flow — FGS-owned client, started in the foreground
@@ -296,7 +296,7 @@ private data class LoadedPairingInfo(
 private fun pairingErrorText(kind: PairingManager.PairingError): String {
     return when (kind) {
         PairingManager.PairingError.CONFIG_MISSING ->
-            "Control plane ka licence check abhi setup me hai — baad me try karo."
+            "Server abhi licence check nahi kar paya — dobara try karo."
         PairingManager.PairingError.LICENCE_INVALID ->
             "Licence active nahi hai — Licence tab check karo."
         PairingManager.PairingError.RATE_LIMITED ->

@@ -47,8 +47,9 @@ import org.json.JSONObject
  *
  * Errors are typed (PairingError) — the UI maps each to one honest
  * Hinglish line; no invented wording, no fake "paired" state.
- * Until B-A (Supabase service key) lands, init answers 503
- * config_missing — handled, not hidden.
+ * D1 migration (2026-11-21): licence check is D1-backed; the hub never
+ * answers 503 config_missing anymore (B-A closed by Supabase removal).
+ * The 503 mapping below is a defensive branch only.
  */
 object PairingManager {
 
