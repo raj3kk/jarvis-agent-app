@@ -8,6 +8,7 @@ import com.jarvis.autonomous.data.ProjectStore
 import com.jarvis.autonomous.data.WebsiteBuildSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -219,6 +220,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             }
             var lastError: Exception? = null
             var rawJson: String? = null
+            // 1.5.0-PRO (L1): 429s inside one call. Same project
+            // quota backs every candidate, so a 429 here predicts
+            // a 429 on the next model too — count them, back off,
+            // and stop the chain early (the loop's RATE_LIMITED
+            // path owns the retry budget from there).
+            var rate429Count = 0
             for ((attemptIndex, candidate) in candidates.withIndex()) {
                 // attemptStartMs is declared OUTSIDE the try: the
                 // catch below must also see it for the END marker.
@@ -277,6 +284,23 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                     // the next candidate model, as before. Model
                     // choice and timeout values are untouched.
                     if (isNonRetryableLlmError(e)) throw e
+                    // 1.5.0-PRO (L1): 429 backoff. Wait 2 s
+                    // before the next candidate (same quota, so
+                    // hammering it immediately just burns RPD);
+                    // after the 2nd 429 in this call, stop the
+                    // chain — the loop's RATE_LIMITED path (retry
+                    // 2 x 5 s) owns the retry budget from here.
+                    if (isRateLimitError(e)) {
+                        rate429Count++
+                        runCatching {
+                            JarvisStateRepository.addDiagnostic(
+                                "llm", "LLM_429_BACKOFF",
+                                "attempt=${attemptIndex + 1}/${candidates.size} model=$candidate count=$rate429Count"
+                            )
+                        }
+                        if (rate429Count >= 2) throw e
+                        delay(2000L)
+                    }
                     // else: fall through to the next candidate model
                 }
             }
@@ -364,6 +388,17 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
     private fun isNonRetryableLlmError(e: Exception): Boolean {
         val msg = (e.message ?: "").trim()
         return msg.startsWith("HTTP 401") || msg.startsWith("HTTP 404")
+    }
+
+    /**
+     * 1.5.0-PRO (L1): 429 detection — same "HTTP <code>: ..."
+     * prefix both API callers throw, as isNonRetryableLlmError.
+     * A 429 means the shared per-project quota is hit, so the
+     * other candidates (same project, same quota) will 429 too.
+     */
+    private fun isRateLimitError(e: Exception): Boolean {
+        val msg = (e.message ?: "").trim()
+        return msg.startsWith("HTTP 429")
     }
 
     /**
@@ -1016,7 +1051,10 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             )
         }
         // PLAN retry budget (§3d): 1 re-plan on a parse error, then ask.
+        // 1.5.0-PRO (L1): 1 extra re-plan on a transient 429, separate
+        // counter — a rate limit must not fail the whole plan at once.
         var attempt = 0
+        var rateLimitRetried = false
         while (attempt < 2) {
             attempt++
             try {
@@ -1088,6 +1126,19 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
+                // 1.5.0-PRO (L1): transient 429 gets ONE re-plan
+                // retry (2 s backoff) instead of failing the whole
+                // plan at once. Separate counter from the parse
+                // retry above — both may fire (max 2 re-plans per
+                // planNext call). attempt-- undoes this iteration's
+                // increment so the retry does not eat parse budget.
+                if (isRateLimitError(e) && !rateLimitRetried) {
+                    rateLimitRetried = true
+                    JarvisStateRepository.addDiagnostic("llm", "PLAN_429_BACKOFF", "attempt=$attempt")
+                    delay(2000L)
+                    attempt--
+                    continue
+                }
                 val detail = (e.message ?: "Unknown error").take(200)
                 JarvisStateRepository.addDiagnostic("llm", "PLAN_ERROR", detail)
                 runCatching {

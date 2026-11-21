@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
@@ -306,6 +307,16 @@ class AlwaysOnMicManager(
     private var reconnecting: Boolean = false
     private var reconnectAttempt: Int = 0
     private var reconnectRunnable: Runnable? = null
+    /**
+     * 1.5.0-PRO (L1 fast-revive): network callback for
+     * airplane-off / network-return. Fires onAvailable the
+     * moment a default network appears; the capped backoff
+     * stays the fallback (max 30 s) if the callback never
+     * fires. Registered in start(), unregistered in stop()
+     * and stopPermanently(). Revival itself runs on the main
+     * thread via mainHandler (see onNetworkAvailable).
+     */
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     // 1.4.24-PRO step 1 (RC-B): bounded fast retry for consecutive
     // BUSY (8) / CLIENT (5) errors — max 2 fast retries, 500ms
     // apart, then the normal capped backoff. The count resets on
@@ -740,6 +751,10 @@ class AlwaysOnMicManager(
         enabled = true
         reconnecting = false
         reconnectAttempt = 0
+        // 1.5.0-PRO (L1 fast-revive): register BEFORE the
+        // hasNetwork branch below, so a no-network start is
+        // already listening for the network's return.
+        registerNetworkCallback()
         busyRetryCount = 0
         quarantinedWhileSpeaking.clear()
         turnDetector.reset()
@@ -1008,6 +1023,62 @@ class AlwaysOnMicManager(
     }
 
     /**
+     * 1.5.0-PRO (L1 fast-revive): default-network callback.
+     * onAvailable fires the moment a network appears (and
+     * once immediately at registration if one is already up
+     * — harmless: onNetworkAvailable no-ops unless the loop
+     * is reconnecting). No speak, no state change here — the
+     * revive itself runs on the main thread.
+     */
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val cm = appContext.getSystemService(
+            Context.CONNECTIVITY_SERVICE
+        ) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                mainHandler.post { onNetworkAvailable() }
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(callback) }.onSuccess {
+            networkCallback = callback
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        val cm = appContext.getSystemService(
+            Context.CONNECTIVITY_SERVICE
+        ) as? ConnectivityManager ?: return
+        runCatching { cm.unregisterNetworkCallback(callback) }
+    }
+
+    /**
+     * 1.5.0-PRO (L1 fast-revive): a network just appeared
+     * while the loop was backing off. Cancel the pending
+     * backoff tick and try a session now instead of waiting
+     * up to 30 s for it. Fail-closed: if the network check
+     * disagrees, the backoff stays the path (re-enter it).
+     */
+    private fun onNetworkAvailable() {
+        if (!enabled || livePaused) return
+        if (!reconnecting) return
+        if (!hasNetwork()) {
+            scheduleReconnect()
+            return
+        }
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        reconnecting = false
+        JarvisStateRepository.addDiagnostic(
+            "stt", "NETWORK_REVIVE",
+            "Network returned while reconnecting — reviving mic now (attempt ${reconnectAttempt + 1})."
+        )
+        startSession()
+    }
+
+    /**
      * PERMANENT stop (only for failures retrying cannot fix:
      * permission revoked, recognition unavailable, language
      * unsupported for both locales). Everything else goes through
@@ -1018,6 +1089,7 @@ class AlwaysOnMicManager(
     private fun stopPermanently(reason: String, recognizerErrorCode: Int = -1) {
         enabled = false
         reconnecting = false
+        unregisterNetworkCallback()
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
         busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -1247,6 +1319,9 @@ class AlwaysOnMicManager(
         busyRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         busyRetryRunnable = null
         busyRetryCount = 0
+        // 1.5.0-PRO (L1 fast-revive): a stopped loop must never
+        // be revived by a later network change.
+        unregisterNetworkCallback()
         quarantinedWhileSpeaking.clear()
         speakingDepth = 0
         isSpeaking = false
