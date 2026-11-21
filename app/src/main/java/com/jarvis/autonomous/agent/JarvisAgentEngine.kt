@@ -557,6 +557,35 @@ class JarvisAgentEngine(
         return tokens.intersect(questionWords).isNotEmpty()
     }
 
+    /**
+     * 1.5.1-PRO (L2): quick-path failure -> LLM re-plan.
+     * Speaks the honest failure line (the quick path's own
+     * contract), posts it to chat with a "dobara koshish"
+     * note, then runs the autonomous loop on the same
+     * command — the LLM re-observes the screen and re-plans.
+     * Exactly once: runAutonomousLoop never calls
+     * tryNoAiRoutine, so there is no ping-pong. Declines
+     * never come here (decline-abort stays a stop).
+     */
+    private suspend fun quickPathFallback(trimmed: String, failureLine: String) {
+        JarvisStateRepository.addChatMessage("Jarvis", "$failureLine — dobara koshish kar raha hoon.")
+        persistChat()
+        speak(failureLine, alreadyPostedToChat = true)
+        JarvisStateRepository.addDiagnostic("l2", "QUICK_FALLBACK", "Quick-path fail — LLM loop re-plan.")
+        runAutonomousLoop(trimmed)
+    }
+
+    /**
+     * 1.5.1-PRO (L2): sync-branch entry to quickPathFallback.
+     * Cancels any previous task and runs the fallback as the
+     * new activeTaskJob (same pattern as the YouTube /
+     * WhatsApp flows, which own their job already).
+     */
+    private fun launchQuickFallback(trimmed: String, failureLine: String) {
+        activeTaskJob?.cancel()
+        activeTaskJob = scope.launch { quickPathFallback(trimmed, failureLine) }
+    }
+
     private fun tryNoAiRoutine(lower: String, trimmed: String): Boolean {
         val acc = JarvisAccessibilityService.instance
         // Patterns suggestions (1.4.1 audit gap): "patterns dikhao" /
@@ -583,7 +612,9 @@ class JarvisAgentEngine(
                     try {
                         speak("YouTube par $query dhoondh raha hoon.")
                         if (!acc.searchYouTube(query)) {
-                            speak("YouTube nahi khul paya.")
+                            // 1.5.1-PRO (L2): search fail -> LLM
+                            // re-plan (re-observe + retry), not a stop.
+                            quickPathFallback(trimmed, "YouTube nahi khul paya.")
                             return@launch
                         }
                         // 1.4.7 (B): no blind 3000ms wait here —
@@ -592,7 +623,7 @@ class JarvisAgentEngine(
                         // blind wait only added 3s on every path.
                         val video = acc.findFirstYouTubeVideo()
                         if (video == null) {
-                            speak("Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
+                            quickPathFallback(trimmed, "Pehli video nahi mili. Search results khule hain, tum khud tap kar lo.")
                             return@launch
                         }
                         val title = video.text.ifBlank { video.contentDesc }
@@ -603,7 +634,7 @@ class JarvisAgentEngine(
                         if (reply != null && isYesReply(reply)) {
                             val ok = acc.tapNode(video.id)
                             if (!ok) {
-                                speak("Tap nahi ho paya.")
+                                quickPathFallback(trimmed, "Tap nahi ho paya.")
                             } else {
                                 // 1.4.25-PRO Step 1C (1e): tap dispatch
                                 // alone proves nothing — verify the
@@ -623,7 +654,14 @@ class JarvisAgentEngine(
                                             (titleProbe.isNotBlank() &&
                                                 (el.text.contains(titleProbe) || el.contentDesc.contains(titleProbe)))
                                     }
-                                speak(if (playing) "Chala diya." else "Video tap ho gaya, par play hota dikh nahi raha — screen par check karo.")
+                                if (playing) {
+                                    speak("Chala diya.")
+                                } else {
+                                    // 1.5.1-PRO (L2): tap dispatched
+                                    // but no play signal — LLM
+                                    // re-observes instead of stopping.
+                                    quickPathFallback(trimmed, "Video tap ho gaya, par play hota dikh nahi raha — screen par check karo.")
+                                }
                             }
                         } else {
                             speak("Theek hai, nahi chalaya.")
@@ -663,7 +701,13 @@ class JarvisAgentEngine(
                             // dispatch, not delivery) — no stronger
                             // signal is observable here.
                             val ok = acc.sendWhatsAppMessage(contact, message)
-                            speak(if (ok) "Message bhej diya." else "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
+                            if (ok) {
+                                speak("Message bhej diya.")
+                            } else {
+                                // 1.5.1-PRO (L2): send fail -> LLM
+                                // re-plan (Send button dobara dhoondho).
+                                quickPathFallback(trimmed, "Send button nahi mila — chat khula hai, message likha hua hai, tum send tap kar do.")
+                            }
                         } else {
                             speak("Theek hai, message nahi bheja.")
                         }
@@ -770,7 +814,9 @@ class JarvisAgentEngine(
                     }
                 } catch (e: Exception) {
                     JarvisStateRepository.addLog("Live search error: ${e.message}")
-                    speak("Live search nahi mila — dobara koshish karo ya Browser me kholo.")
+                    // 1.5.1-PRO (L2): even the browser fallback
+                    // threw — LLM loop re-plans from here.
+                    quickPathFallback(trimmed, "Live search nahi mila — dobara koshish karo ya Browser me kholo.")
                 }
             }
             return true
@@ -781,14 +827,24 @@ class JarvisAgentEngine(
                 lower.contains("flashlight on")
             ) {
                 val ok = acc.toggleFlashlight(true)
-                scope.launch { speak(if (ok) "Torch on kar diya." else "Torch on nahi ho payi.") }
+                if (!ok) {
+                    // 1.5.1-PRO (L2): torch fail -> LLM re-plan.
+                    launchQuickFallback(trimmed, "Torch on nahi ho payi.")
+                } else {
+                    scope.launch { speak("Torch on kar diya.") }
+                }
                 return true
             }
             if (lower.contains("torch off") || lower.contains("torch bujhao") ||
                 lower.contains("flashlight off")
             ) {
                 val ok = acc.toggleFlashlight(false)
-                scope.launch { speak(if (ok) "Torch off kar diya." else "Torch off nahi ho payi.") }
+                if (!ok) {
+                    // 1.5.1-PRO (L2): torch fail -> LLM re-plan.
+                    launchQuickFallback(trimmed, "Torch off nahi ho payi.")
+                } else {
+                    scope.launch { speak("Torch off kar diya.") }
+                }
                 return true
             }
             // Volume: "volume 70 kar do"
@@ -796,7 +852,12 @@ class JarvisAgentEngine(
             if (volMatch != null) {
                 val pct = volMatch.groupValues[1].toInt().coerceIn(0, 100)
                 val ok = acc.setMediaVolumePercent(pct)
-                scope.launch { speak(if (ok) "Volume $pct percent kar diya." else "Volume set nahi ho paya.") }
+                if (!ok) {
+                    // 1.5.1-PRO (L2): volume fail -> LLM re-plan.
+                    launchQuickFallback(trimmed, "Volume set nahi ho paya.")
+                } else {
+                    scope.launch { speak("Volume $pct percent kar diya.") }
+                }
                 return true
             }
             // Media: play/pause/next/previous
@@ -823,17 +884,15 @@ class JarvisAgentEngine(
                 val ok = acc.controlMediaPlayback("PLAY_PAUSE")
                 scope.launch {
                     if (!ok) {
-                        speak("Music pause nahi ho paya.")
+                        quickPathFallback(trimmed, "Music pause nahi ho paya.")
                     } else {
                         delay(700)
                         val postActive = acc.isMusicActive()
-                        speak(
-                            when {
-                                preActive && !postActive -> "Music pause kar diya."
-                                !preActive -> "Music pehle se nahi baj raha tha, isliye pause karne ko kuch nahi tha."
-                                else -> "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
-                            }
-                        )
+                        when {
+                            preActive && !postActive -> speak("Music pause kar diya.")
+                            !preActive -> speak("Music pehle se nahi baj raha tha, isliye pause karne ko kuch nahi tha.")
+                            else -> quickPathFallback(trimmed, "Music state badla nahi dikh raha — player khula hai ya nahi check karo.")
+                        }
                     }
                 }
                 return true
@@ -845,17 +904,15 @@ class JarvisAgentEngine(
                 val ok = acc.controlMediaPlayback("PLAY_PAUSE")
                 scope.launch {
                     if (!ok) {
-                        speak("Music play nahi ho paya.")
+                        quickPathFallback(trimmed, "Music play nahi ho paya.")
                     } else {
                         delay(700)
                         val postActive = acc.isMusicActive()
-                        speak(
-                            when {
-                                !preActive && postActive -> "Music play kar diya."
-                                preActive && postActive -> "Music pehle se baj raha tha."
-                                else -> "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
-                            }
-                        )
+                        when {
+                            !preActive && postActive -> speak("Music play kar diya.")
+                            preActive && postActive -> speak("Music pehle se baj raha tha.")
+                            else -> quickPathFallback(trimmed, "Music state badla nahi dikh raha — player khula hai ya nahi check karo.")
+                        }
                     }
                 }
                 return true
@@ -866,13 +923,14 @@ class JarvisAgentEngine(
                 val ok = acc.controlMediaPlayback("NEXT")
                 scope.launch {
                     if (!ok) {
-                        speak("Agla gaana nahi chal paya.")
+                        quickPathFallback(trimmed, "Agla gaana nahi chal paya.")
                     } else {
                         delay(700)
-                        speak(
-                            if (acc.isMusicActive()) "Agla gaana chala diya."
-                            else "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
-                        )
+                        if (acc.isMusicActive()) {
+                            speak("Agla gaana chala diya.")
+                        } else {
+                            quickPathFallback(trimmed, "Music state badla nahi dikh raha — player khula hai ya nahi check karo.")
+                        }
                     }
                 }
                 return true
@@ -881,13 +939,14 @@ class JarvisAgentEngine(
                 val ok = acc.controlMediaPlayback("PREVIOUS")
                 scope.launch {
                     if (!ok) {
-                        speak("Pichla gaana nahi chal paya.")
+                        quickPathFallback(trimmed, "Pichla gaana nahi chal paya.")
                     } else {
                         delay(700)
-                        speak(
-                            if (acc.isMusicActive()) "Pichla gaana chala diya."
-                            else "Music state badla nahi dikh raha — player khula hai ya nahi check karo."
-                        )
+                        if (acc.isMusicActive()) {
+                            speak("Pichla gaana chala diya.")
+                        } else {
+                            quickPathFallback(trimmed, "Music state badla nahi dikh raha — player khula hai ya nahi check karo.")
+                        }
                     }
                 }
                 return true
@@ -907,7 +966,13 @@ class JarvisAgentEngine(
                         reason == "permission_denied" -> "Contact dekhne ki permission nahi hai, isliye call nahi lag payi."
                         else -> "$contact ko call nahi lag payi."
                     }
-                    scope.launch { speak(msg) }
+                    if (!ok) {
+                        // 1.5.1-PRO (L2): call fail -> LLM re-plan
+                        // (contact dhoondhna / poochhna).
+                        launchQuickFallback(trimmed, msg)
+                    } else {
+                        scope.launch { speak(msg) }
+                    }
                     return true
                 }
             }
@@ -923,7 +988,12 @@ class JarvisAgentEngine(
                     // only means the ACTION_SET_ALARM intent fired —
                     // never claim the alarm is stored. Intent-fired
                     // wording; the user checks Clock.
-                    scope.launch { speak(if (ok) "Alarm $hour baj kar $minute minute par lagane ke liye bhej diya — Clock app me check kar lo ki alarm set hua." else "Alarm nahi lag paya.") }
+                    if (!ok) {
+                        // 1.5.1-PRO (L2): alarm fail -> LLM re-plan.
+                        launchQuickFallback(trimmed, "Alarm nahi lag paya.")
+                    } else {
+                        scope.launch { speak("Alarm $hour baj kar $minute minute par lagane ke liye bhej diya — Clock app me check kar lo ki alarm set hua.") }
+                    }
                     return true
                 }
             }
@@ -941,7 +1011,7 @@ class JarvisAgentEngine(
                     // "bhej diya" line, never a done claim.
                     scope.launch {
                         if (!ok) {
-                            speak("$app nahi khul paya.")
+                            quickPathFallback(trimmed, "$app nahi khul paya.")
                         } else {
                             delay(1200)
                             val post = acc.captureScreenSnapshot()
@@ -949,7 +1019,10 @@ class JarvisAgentEngine(
                             if (expectedPkg != null && post.packageName == expectedPkg) {
                                 speak("$app khol diya.")
                             } else {
-                                speak("$app kholne ke liye bhej diya — screen par check karo.")
+                                // 1.5.1-PRO (L2): launch fired but
+                                // the app never came forward — LLM
+                                // re-observes instead of stopping.
+                                quickPathFallback(trimmed, "$app kholne ke liye bhej diya — screen par check karo.")
                             }
                         }
                     }
@@ -1544,6 +1617,10 @@ class JarvisAgentEngine(
         var consecutiveSameScreenCount = 0
         var parseErrorRetries = 0
         var rateLimitRetries = 0
+        // 1.5.1-PRO (L2): FAILED-evidence retries — one re-plan
+        // when the action itself failed (ok=false). See the
+        // FAILED branch below.
+        var failedEvidenceRetries = 0
 
         try {
             while (step <= maxSteps) {
@@ -1978,6 +2055,21 @@ class JarvisAgentEngine(
                             return
                         }
                         StepEvidence.FAILED -> {
+                            // 1.5.1-PRO (L2): ONE re-plan retry when
+                            // the ACTION itself failed (ok=false) —
+                            // a tap miss / cold start is transient
+                            // and the LLM re-decides with the failure
+                            // in previousActions. No retry when
+                            // ok=true: the action dispatched but its
+                            // evidence failed, and re-running it
+                            // could double-act (second tap/send).
+                            if (stepResult?.ok == false && failedEvidenceRetries < 1) {
+                                failedEvidenceRetries++
+                                previousActions.add("Step $step: action fail hua (${stepResult?.summary ?: decision.action}) — ek baar dobara koshish kar raha hoon.")
+                                JarvisStateRepository.addLog("L2: FAILED-evidence retry (1/1) — ${stepResult?.summary ?: decision.action}")
+                                step++
+                                continue
+                            }
                             // C4: definite failure — fixed line, no
                             // routine persisted, no memory indexed, no
                             // "Task Completed" wording anywhere. The
