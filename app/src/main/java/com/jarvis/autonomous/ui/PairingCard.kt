@@ -13,6 +13,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,8 +25,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.PairingManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -39,8 +44,13 @@ import kotlinx.coroutines.withContext
  * 6-digit code (5-min) -> "Confirm pairing" -> hub
  * /api/pairing/register (one-time token + public key) -> Paired.
  * No QR scan (camera = new permission — NOT in Phase 2b), no token
- * on screen, no private key anywhere in the UI. Until B-A the init
- * call answers 503 and the card shows the honest setup-pending line.
+ * on screen, no private key anywhere in the UI. Until the D1
+ * licence-verify migration lands, init answers 503 and the card
+ * shows the honest setup-pending line.
+ *
+ * 2b-2: the card also shows the hub WebSocket status (HubWsClient
+ * process-wide flow — FGS-owned client, started in the foreground
+ * service; the card only reads, never starts the socket).
  *
  * Compose rule (1.5.3 lesson): LocalContext.current is captured ONCE
  * at the composable level (cardContext) and never inside remember { }
@@ -51,6 +61,10 @@ import kotlinx.coroutines.withContext
 fun PairingCard(prefs: JarvisPreferences) {
     val cardContext = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 2b-2: hub WS status — process-wide flow, identity never
+    // changes, so the card always sees updates.
+    val wsStatus by HubWsClient.statusFlow.collectAsState()
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
     var paired by remember { mutableStateOf(prefs.pairingPaired) }
     var keyStoreLabel by remember { mutableStateOf("") }
@@ -139,6 +153,33 @@ fun PairingCard(prefs: JarvisPreferences) {
             }
             if (selfTest.isNotEmpty()) {
                 Text(text = selfTest, fontSize = 12.sp)
+            }
+            // 2b-2: hub WebSocket status (presence = the connection
+            // itself). Times are last HELLO_ACK / last STEP_RESULT.
+            Text(
+                text = "Hub WS: " + when (wsStatus.state) {
+                    HubWsClient.WsState.OFFLINE -> "Band hai"
+                    HubWsClient.WsState.CONNECTING -> "Jud raha hai…"
+                    HubWsClient.WsState.CONNECTED -> "Juda hua"
+                    HubWsClient.WsState.UNAUTH -> "Pairing dobara karo"
+                    HubWsClient.WsState.NOT_PAIRED -> "Paired nahi hai"
+                } + if (wsStatus.state == HubWsClient.WsState.CONNECTED) {
+                    " · HELLO_ACK ${timeFormat.format(Date(wsStatus.lastHelloAckAtMs))}"
+                } else if (wsStatus.detail.isNotBlank() &&
+                    wsStatus.state != HubWsClient.WsState.OFFLINE
+                ) {
+                    " (${wsStatus.detail})"
+                } else {
+                    ""
+                },
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (wsStatus.lastStepResultAtMs > 0L) {
+                Text(
+                    text = "Last hub result: ${timeFormat.format(Date(wsStatus.lastStepResultAtMs))}",
+                    fontSize = 12.sp
+                )
             }
             if (code.isNotEmpty()) {
                 Text(
@@ -255,7 +296,7 @@ private data class LoadedPairingInfo(
 private fun pairingErrorText(kind: PairingManager.PairingError): String {
     return when (kind) {
         PairingManager.PairingError.CONFIG_MISSING ->
-            "Control plane ka licence check abhi setup me hai (B-A) — baad me try karo."
+            "Control plane ka licence check abhi setup me hai — baad me try karo."
         PairingManager.PairingError.LICENCE_INVALID ->
             "Licence active nahi hai — Licence tab check karo."
         PairingManager.PairingError.RATE_LIMITED ->

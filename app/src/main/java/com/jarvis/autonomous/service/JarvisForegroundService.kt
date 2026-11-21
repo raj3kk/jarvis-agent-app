@@ -27,6 +27,7 @@ import androidx.core.content.FileProvider
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.AiProvider
+import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.PlanState
@@ -99,6 +100,9 @@ class JarvisForegroundService : Service() {
     private lateinit var prefs: JarvisPreferences
     private lateinit var voiceManager: VoiceManager
     private lateinit var agentEngine: JarvisAgentEngine
+    // 2b-2: control-plane WS client (FGS-managed). Created in onCreate
+    // after the engine, stopped in onDestroy. Single-use instance.
+    private var hubWsClient: HubWsClient? = null
     private lateinit var micManager: AlwaysOnMicManager
     private var floatingOverlay: FloatingJarvisOverlay? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -444,6 +448,15 @@ class JarvisForegroundService : Service() {
             // false when the Activity/host does not exist yet).
             isBrowserTabVisible = { JarvisBrowserHost.current?.isBrowserTabVisible == true }
         )
+
+        // 2b-2: control-plane WS client — created after the engine
+        // (it needs the engine for EXECUTE_STEP), started at once.
+        // start() is a no-op display-wise when not paired (status
+        // NOT_PAIRED); the socket opens only for paired devices.
+        hubWsClient = HubWsClient(this, agentEngine, prefs).also {
+            HubWsClient.setInstance(it)
+            it.start()
+        }
 
         voiceManager = VoiceManager(
             context = this,
@@ -1835,6 +1848,11 @@ class JarvisForegroundService : Service() {
         // NOTHING after the last marker — that absence is the
         // kill-vs-crash signal in the next report.
         JarvisStateRepository.addDiagnostic("nav", "SVC_DESTROY", "Foreground service destroyed.")
+        // 2b-2: stop the hub WS client first — no STEP_RESULT may
+        // race the destroy, and the UI must see OFFLINE at once.
+        hubWsClient?.stop()
+        HubWsClient.setInstance(null)
+        hubWsClient = null
         floatingOverlay?.hide()
         // 1.4.17: explicit Live end on destroy — audio + WS
         // released, loop NOT resumed (shutdown below stops it).
