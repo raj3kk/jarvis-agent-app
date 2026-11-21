@@ -1692,7 +1692,7 @@ fun AiBrainSettingsScreen(
                     OutlinedTextField(
                         value = hfToken,
                         onValueChange = { hfToken = it },
-                        label = { Text("Hugging Face Token (optional — khali chhodo to owner ka token use hoga)", fontSize = 12.sp) },
+                        label = { Text("Hugging Face Token (apna free token — Gemma download ke liye zaroori)", fontSize = 12.sp) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )

@@ -41,25 +41,15 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 40
-        versionName = "1.6.1-PRO"
+        versionCode = 41
+        versionName = "1.6.2-PRO"
 
-        // Owner's HF token for the gated Gemma download (user order
-        // 2026-11-02 21:28 IST: "User kyun dega HF token? Mera wala
-        // token use karo"). CI passes the GitHub Actions secret
-        // HF_TOKEN as an env var; when absent the field is "" and
-        // the app falls back to asking for a token in AI Brain.
-        // HONEST: this token IS embedded in the APK and CAN be
-        // extracted by a determined user — it is the owner's
-        // read-only Gemma-download token, revocable/rotatable from
-        // Hugging Face settings. It is never claimed unextractable.
-        // It is never printed to build logs (Gradle does not log
-        // buildConfigField values).
-        buildConfigField(
-            "String", "HF_TOKEN",
-            "\"" + (System.getenv("HF_TOKEN") ?: "")
-                .replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-        )
+        // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
+        // download uses ONLY the token the phone's owner types in AI
+        // Brain (JarvisPreferences.hfToken) — the old BuildConfig
+        // .HF_TOKEN field (CI secret HF_TOKEN) was deleted here and in
+        // the workflow because the literal is extractable from DEX
+        // strings. No token + no downloaded model = an honest message.
 
         vectorDrawables {
             useSupportLibrary = true

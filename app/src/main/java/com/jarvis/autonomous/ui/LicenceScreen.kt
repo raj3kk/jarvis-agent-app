@@ -1,8 +1,6 @@
 package com.jarvis.autonomous.ui
 
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.provider.Settings
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -62,11 +60,11 @@ import org.json.JSONObject
  *   banner below and the app keeps working fully. NOTHING on this
  *   screen locks, gates, or disables any existing feature.
  *
- * Server (CORRECTED 2026-11-02 — see note below):
- * https://jarvis-server-webbuilder1.vercel.app
- *   1. Open the server link -> Signup / Login
- *   2. Dashboard -> Generate licence -> Copy the key
- *   3. Paste the key here -> Activate
+ * Server (2b-3, 2026-11-21 — D1 migration; Vercel server SUPERSEDED, 402-down):
+ * https://jarvis-licence.rajraj3kk.workers.dev (Cloudflare Worker + D1)
+ *   Web signup / dashboard abhi nahi hai (Phase 2 me aayega) — licence
+ *   abhi owner se milti hai. Key milne par:
+ *   1. Paste the key here -> Activate
  *
  * Device binding: device_id is ANDROID_ID
  * (Settings.Secure.ANDROID_ID), the same id sent on every verify.
@@ -80,22 +78,23 @@ import org.json.JSONObject
  *     b. Otherwise Release sends { key, device_id } — the server
  *        (release route, updated 2026-11-02) clears the binding ONLY
  *        when the key is active AND bound to exactly this device.
- *   The dashboard's own Release Device button (server website, where
- *   the user IS logged in) also still works. No path releases a
+ *   No web dashboard exists on the Worker (Phase 2) — release is
+ *   in-app only (this screen's Release section). No path releases a
  *   licence bound to a different device.
  *
  * 1.4.1 fixes in this file (C-B11/C-B3/C-B15):
  *   - Session-token field is MASKED (PasswordVisualTransformation)
  *     and is NEVER persisted: it lives only in composable state and
  *     is never written to SharedPreferences (grep-verified).
- *   - Licence-server calls use postLicence(): primary URL first,
- *     fallback URL on network failure only, one retry per base.
+ *   - Licence-server calls use postLicence(): the Worker URL, up to
+ *     2 attempts (initial + one retry) on network failure only.
+ *     (2b-3: the dead Vercel fallback deployment was removed.)
  *   - Activation writes use commit() + read-back verify: the key +
  *     activated flag are read back and confirmed before "Activated"
  *     is shown; a save failure is surfaced, never silently assumed.
  *   - Recovery card (C-B3): explains the debug->release ANDROID_ID
- *     change lockout honestly, links to the server dashboard for
- *     owner-session release, and gives release + re-activate steps.
+ *     change lockout honestly and gives in-app release + re-activate
+ *     steps (no dashboard link — none exists on the Worker yet).
  *     Grace stays WARN-ONLY — no enforcement/lockout UI was added.
  *
  * Global-learning opt-out:
@@ -114,22 +113,18 @@ object LicencePrefs {
     const val KEY_ACTIVATED = "licence_activated"
 }
 
-const val LICENCE_SERVER_URL = "https://jarvis-server-webbuilder1.vercel.app"
+const val LICENCE_SERVER_URL = "https://jarvis-licence.rajraj3kk.workers.dev"
 
-// 1.4.1 fix C-B11: the server URL is NOT a single hardcoded endpoint
-// any more. LICENCE_SERVER_URL (primary, kept under its old name
-// because JarvisAgentEngine.kt imports it) is tried first; on a
-// NETWORK failure only (never on an HTTP error code — a 404/409
-// from the primary is authoritative), the fallback deployment is
-// tried. Each base gets up to 2 attempts (initial + one retry) on
-// network failure before moving on. Change these two constants to
-// point the app at a new deployment; no other file needs editing
-// for the LicenceScreen's own calls.
-const val LICENCE_SERVER_FALLBACK_URL = "https://jarvis-server-seven-chi.vercel.app"
-private val LICENCE_SERVER_URLS = listOf(
-    LICENCE_SERVER_URL,
-    LICENCE_SERVER_FALLBACK_URL
-)
+// 2b-3 (D1 migration, 2026-11-21): the licence server is now the Cloudflare
+// Worker (D1-backed) at the URL above. The old Vercel deployment is 402-down
+// and SUPERSEDED, and its fallback deployment is dead too — so there is NO
+// fallback base any more: LICENCE_SERVER_URLS has one entry. postLicence()
+// still retries (initial + one retry) on NETWORK failure only; an HTTP error
+// code (404/409/...) from the Worker is authoritative and is never retried.
+// Change this one constant to point the app at a new deployment; no other
+// file needs editing for the LicenceScreen's own calls (JarvisAgentEngine.kt
+// imports this constant for its /api/patterns calls too).
+private val LICENCE_SERVER_URLS = listOf(LICENCE_SERVER_URL)
 
 private val licenceHttp = OkHttpClient()
 
@@ -264,21 +259,21 @@ fun LicenceScreen() {
                 )
                 Text(text = LICENCE_SERVER_URL, fontSize = 13.sp, color = Color(0xFFB85C38))
                 Text(
-                    text = "Fallback (primary se network fail hone par): $LICENCE_SERVER_FALLBACK_URL",
+                    text = "Web signup / dashboard abhi nahi hai (Phase 2 me aayega) — " +
+                        "licence abhi owner se milti hai. Key milne par neeche " +
+                        "paste karke Activate dabao.",
                     fontSize = 12.sp,
                     color = Color(0xFF8A7A70)
                 )
                 Text(
-                    text = "1. Open the server link above (in your browser).\n" +
-                        "2. Signup / Login on the server.\n" +
-                        "3. Dashboard -> Generate licence -> Copy the key.\n" +
-                        "4. Paste the key below and tap Activate.",
+                    text = "1. Licence key owner se lo.\n" +
+                        "2. Paste the key below and tap Activate.",
                     fontSize = 13.sp
                 )
                 Text(
                     text = "One licence = one device at a time. " +
-                        "Moving to a new phone? Tap Release below (or Release Device " +
-                        "on the server dashboard), then Activate on the new phone.",
+                        "Moving to a new phone? Tap Release below, " +
+                        "then Activate on the new phone.",
                     fontSize = 12.sp,
                     color = Color(0xFF8A7A70)
                 )
@@ -318,28 +313,13 @@ fun LicenceScreen() {
                     fontSize = 13.sp
                 )
                 Text(
-                    text = "Steps: 1. Neeche Dashboard kholo aur server par Login karo " +
-                        "(wahi email jisse licence bani thi). " +
-                        "2. Dashboard par Release Device dabao. " +
-                        "3. Is app me wahi licence key se dobara Activate karo.",
+                    text = "Steps: 1. Neeche Release section se purani binding release karo. " +
+                        "2. Is app me wahi licence key se dobara Activate karo.",
                     fontSize = 13.sp
                 )
-                Button(
-                    onClick = {
-                        val intent = Intent(
-                            Intent.ACTION_VIEW,
-                            Uri.parse("$LICENCE_SERVER_URL/dashboard")
-                        )
-                        context.startActivity(intent)
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Open server dashboard")
-                }
                 Text(
-                    text = "Dashboard par Release Device ke liye server login chahiye — " +
-                        "ye button browser me dashboard kholta hai. " +
-                        "Agar is phone par hi Release karna hai to neeche Release section bhi hai.",
+                    text = "Release is phone par hi hota hai — neeche Release section dekho. " +
+                        "Web dashboard abhi nahi hai (Phase 2 me aayega).",
                     fontSize = 12.sp,
                     color = Color(0xFF8A7A70)
                 )
@@ -424,7 +404,7 @@ fun LicenceScreen() {
                                 }
                             } else if (code == 409) {
                                 status = "Ye licence kisi aur device se bound hai. " +
-                                    "Pehle us device se Release karo, ya dashboard se Release Device karo."
+                                    "Pehle us device se Release karo (us phone ki app me Release dabao), phir yahan dobara Activate karo."
                             } else if (code == 404) {
                                 status = "Invalid licence — key dobara check karo."
                             } else if (code == -1) {

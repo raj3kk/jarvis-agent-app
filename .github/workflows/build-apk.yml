@@ -41,10 +41,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=39, previous delivered 1.6.0-PRO)"
+          echo "versionCode in tree: $VC (floor PREV_VC=40, previous delivered 1.6.1-PRO)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=39
+          PREV_VC=40
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
@@ -99,11 +99,9 @@ jobs:
           EOF
 
       - name: Build Debug & Release APK
-        # Owner's HF token (read-only Gemma-download token) goes into
-        # BuildConfig.HF_TOKEN so the end user enters no token. The
-        # value is masked by GitHub in logs; Gradle never prints it.
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # 2b-3 (B1 fix): no HF_TOKEN env any more — the gated Gemma
+        # download uses only the user-entered token (AI Brain). The
+        # old BuildConfig.HF_TOKEN secret is deleted from code + here.
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 
       - name: Verify APKs (exist + badging + signature)

@@ -2,7 +2,6 @@ package com.jarvis.autonomous.agent
 
 import android.content.Context
 import android.os.Build
-import com.jarvis.autonomous.BuildConfig
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
@@ -27,14 +26,15 @@ import java.util.concurrent.TimeUnit
  * GATED: the user's Hugging Face account (raj3kk) accepted the free
  * Gemma licence on 2026-11-02 and the file was downloaded +
  * size/header-verified (304,005,120 bytes, LITERTLM magic).
- * TOKEN POLICY (user order 2026-11-02 21:28 IST: "User kyun dega
- * HF token? Mera wala token use karo"): the end user enters NO
- * token. Download uses the owner's read-only Gemma-download token
- * embedded via BuildConfig.HF_TOKEN (CI secret HF_TOKEN); an
- * optionally typed AI Brain token overrides it. HONEST: the embedded
- * token CAN be extracted from the APK by a determined user — it is
- * read-only for the Gemma download and revocable/rotatable from
- * Hugging Face settings, and is never claimed unextractable.
+ * TOKEN POLICY (2b-3, 2026-11-21 — B1 fix; the 2026-11-02 "owner token"
+ * order is SUPERSEDED because the embedded token is extractable from
+ * the APK's DEX strings): the end user enters their OWN free HF
+ * read-only token in AI Brain (account that accepted the Gemma
+ * licence). NO token is embedded in the APK any more — the DEX must
+ * contain no hf_... literal. Token is stored on the phone only
+ * (JarvisPreferences.hfToken), never in the repo. No token +
+ * no downloaded model = an honest "token dalo" message, never a
+ * silent failure. A model downloaded earlier keeps working.
  * Qwen has been fully removed from Jarvis — no Qwen code, file or
  * download path remains.
  *
@@ -93,26 +93,18 @@ object LocalLlmManager {
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
                 .build()
-            // TOKEN POLICY (user order 2026-11-02 21:28 IST: "User
-            // kyun dega HF token? Mera wala token use karo"):
-            // resolution order — 1) token the phone's owner typed in
-            // AI Brain (optional field), 2) the owner's token embedded
-            // via BuildConfig.HF_TOKEN from the CI secret HF_TOKEN.
-            // HONEST: the embedded token CAN be extracted from the APK
-            // by a determined user. It is the owner's READ-ONLY
-            // Gemma-download token (only used to download the gated
-            // Gemma model file from Hugging Face) and is revocable /
-            // rotatable from Hugging Face settings at any time.
-            // It is never printed to logs.
+            // TOKEN POLICY (2b-3 B1 fix): the ONLY token source is the
+            // one the phone's owner typed in AI Brain (JarvisPreferences
+            // .hfToken, passed in as hfToken). NO embedded token exists
+            // any more — BuildConfig.HF_TOKEN was deleted with the CI
+            // secret (extractable from DEX strings). The token is never
+            // printed to logs.
             val effectiveToken = hfToken?.takeIf { it.isNotBlank() }
-                ?: BuildConfig.HF_TOKEN.takeIf { it.isNotBlank() }
                 ?: throw IllegalStateException(
                     "Gemma download ke liye koi token nahi mila — AI Brain me apna Hugging Face access token daalo (jis account ne Gemma licence accept ki hai), phir dobara download karo."
                 )
             val requestBuilder = Request.Builder().url(MODEL_URL)
-            if (!effectiveToken.isNullOrBlank()) {
-                requestBuilder.header("Authorization", "Bearer ${effectiveToken.trim()}")
-            }
+                .header("Authorization", "Bearer ${effectiveToken.trim()}")
             val request = requestBuilder.build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
