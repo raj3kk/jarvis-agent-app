@@ -133,9 +133,10 @@ object PairingManager {
     }
 
     private fun generateKeystoreKey(digest: String) {
-        val kpg = KeyPairGenerator.getInstance(
-            KeyProperties.KEY_ALGORITHM_ED25519, "AndroidKeyStore"
-        )
+        // NOTE: KeyProperties has NO KEY_ALGORITHM_ED25519 constant
+        // (compileSdk 34) — the algorithm is the plain string
+        // "Ed25519" (Keystore supports it from API 31).
+        val kpg = KeyPairGenerator.getInstance("Ed25519", "AndroidKeyStore")
         kpg.initialize(
             KeyGenParameterSpec.Builder(
                 KEYSTORE_ALIAS,
