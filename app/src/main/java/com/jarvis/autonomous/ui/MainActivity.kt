@@ -2436,7 +2436,11 @@ fun MemoryRoutinesLogsScreen(
     var newRoutinePrompt by remember { mutableStateOf("") }
 
     // 1.5.3-PRO: learned-skills manifests (on-device only).
-    val skillStore = remember { LearnedRoutineStore(LocalContext.current) }
+    // 1.5.3-PRO fix: LocalContext.current is a @Composable call — it
+    // must NOT sit inside remember { } (CI: "invocations can only
+    // happen from the context of a @Composable function"). Hoist it.
+    val skillContext = LocalContext.current
+    val skillStore = remember { LearnedRoutineStore(skillContext) }
     var skills by remember { mutableStateOf(skillStore.loadSkillManifests()) }
 
     val logs by JarvisStateRepository.executionLogs.collectAsState()
