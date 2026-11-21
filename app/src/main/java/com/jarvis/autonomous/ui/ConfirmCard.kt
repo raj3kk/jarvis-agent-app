@@ -45,10 +45,10 @@ fun ConfirmCard(
     modifier: Modifier = Modifier
 ) {
     // Editable values for the missing fields only — keyed on the
-    // job so a new job never reuses stale inputs.
+    // job so a new job never reuses stale inputs. Merged record =
+    // extracted fields + user-filled missing fields.
     var edited by remember(state.docJobId) { mutableStateOf(mapOf<String, String>()) }
-    val merged: Map<String, String>
-        get() = state.fields + edited
+    val merged: Map<String, String> = state.fields + edited
 
     Card(
         modifier = modifier.fillMaxWidth(),

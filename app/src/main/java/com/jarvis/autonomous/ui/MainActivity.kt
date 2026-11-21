@@ -1430,6 +1430,8 @@ fun PlanCard(plan: PlanView) {
                     PlanState.BLOCKED -> "BLOCKED ⏸" to Color(0xFFB3261E)
                     PlanState.SKIPPED -> "SKIPPED –" to Color.Gray
                     PlanState.PENDING -> "PENDING …" to Color.Gray
+                    // 3c: browser step waiting on the user (captcha).
+                    PlanState.AWAITING_USER -> "WAITING ⏳" to Color(0xFFB85C38)
                 }
                 Text(
                     text = "${index + 1}. ${step.title} — $mark",
@@ -1442,6 +1444,7 @@ fun PlanCard(plan: PlanView) {
                     step.state == PlanState.RUNNING && step.detail.isNotBlank() -> step.detail
                     step.state == PlanState.FAILED && step.evidence.isNotBlank() -> step.evidence
                     step.state == PlanState.BLOCKED && step.evidence.isNotBlank() -> step.evidence
+                    step.state == PlanState.AWAITING_USER && step.evidence.isNotBlank() -> step.evidence
                     else -> ""
                 }
                 if (subLine.isNotBlank()) {
