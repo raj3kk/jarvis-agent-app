@@ -20,6 +20,7 @@ import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.MemoryIndex
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
+import com.jarvis.autonomous.data.SaveResult
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
 import com.jarvis.autonomous.service.ScreenSnapshot
@@ -444,11 +445,11 @@ class JarvisAgentEngine(
      * document. Returns the store result (ok/id/evicted ids). The
      * text stays on the phone; this function performs no network call.
      */
-    fun rememberDocument(title: String, text: String, source: String): DocumentMemoryStore.SaveResult {
+    fun rememberDocument(title: String, text: String, source: String): SaveResult {
         val result = runCatching {
             documentMemory.saveDocument(title, text, source)
         }.getOrElse {
-            DocumentMemoryStore.SaveResult(ok = false, reason = "save_error")
+            SaveResult(ok = false, reason = "save_error")
         }
         if (result.ok) {
             // Metadata only in the log — never doc text.
