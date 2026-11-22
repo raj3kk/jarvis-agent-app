@@ -191,7 +191,7 @@ class SelfExtensionLoop(
         signature: String,
         hasRealInput: Boolean,
         retryOriginal: (suspend () -> Boolean)?,
-        stepRunner: (SkillStep) -> Boolean
+        stepRunner: suspend (SkillStep) -> Boolean
     ): LoopOutcome {
         // No real input -> UNVERIFIED, never passed, never installed.
         if (!hasRealInput) {

@@ -724,6 +724,42 @@ class JarvisAgentEngine(
             EvidenceKind.SUPABASE_TABLES -> checkSupabaseTablesRef(ref)
             EvidenceKind.VERCEL_DEPLOY -> checkVercelDeployRef(ref)
             EvidenceKind.SCREEN_STATE, EvidenceKind.MESSAGE_SENT -> checkScreenRef(ref)
+            // 1.11.0-PRO (self-extension, DESIGN §7): SKILL_TEST refs
+            // are re-read against persisted state (below), never
+            // trusted from the verifier's in-memory claim alone.
+            EvidenceKind.SKILL_TEST -> checkSkillTestRef(ref)
+        }
+    }
+
+    /**
+     * 1.11.0-PRO (self-extension, DESIGN §7): re-read a SKILL_TEST
+     * ref against persisted state. The ref is "<testId>:step<N>"
+     * (testId "selfext-<sig8>") and the verifier marks the skill
+     * "verified:<testId>" + enabled only on a passed test. PASSED
+     * iff a manifest carries that verification AND is enabled AND
+     * the ref itself recorded "ok"; anything else is FAILED (a
+     * rolled-back skill leaves no manifest behind).
+     */
+    private fun checkSkillTestRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val testId = ref.ref.substringBefore(":")
+        val verified = learnedRoutineStore.loadSkillManifests().any { manifest ->
+            manifest.origin == "self_extended" &&
+                manifest.provenance?.verification == "verified:$testId" &&
+                learnedRoutineStore.isSkillEnabled(manifest.id)
+        }
+        return when {
+            ref.value != "ok" -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "skill test step fail hua"
+            )
+            !verified -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "skill verified nahi mila"
+            )
+            else -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.PASSED
+            )
         }
     }
 
