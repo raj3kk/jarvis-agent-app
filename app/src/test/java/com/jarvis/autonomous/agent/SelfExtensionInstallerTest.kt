@@ -187,17 +187,29 @@ class SelfExtensionInstallerTest {
         assertTrue(SelfExtensionReplayGate.isEnabled("learned", false, "", true))
     }
 
+    /** Source root for [noDynamicLoadInNewFiles]: explicit override,
+     * then walk up from the test working dir, then the local default. */
+    private fun selfExtensionSourceRoot(): File {
+        System.getProperty("selfext.workdir")?.let { return File(it) }
+        var dir: File? = File(System.getProperty("user.dir") ?: ".").absoluteFile
+        while (dir != null) {
+            val candidate = File(dir, "src/main/java/com/jarvis/autonomous")
+            if (File(candidate, "agent/SelfExtensionDetector.kt").isFile) return candidate
+            dir = dir.parentFile
+        }
+        return File("/home/hatch/workspace/selfext-work/app/app/src/main/java/com/jarvis/autonomous")
+    }
+
     @Test
     fun noDynamicLoadInNewFiles() {
         // DESIGN §10 G0, in-test form: the new self-extension files
-        // must contain zero dynamic-loading tokens. The working-copy
-        // root comes from -Dselfext.workdir (harness passes it).
-        val root = File(
-            System.getProperty(
-                "selfext.workdir",
-                "/home/hatch/workspace/selfext-work/app/app/src/main/java/com/jarvis/autonomous"
-            )
-        )
+        // must contain zero dynamic-loading tokens. The source root
+        // resolves in three environments: (1) -Dselfext.workdir
+        // (local harness passes it); (2) walk up from the test
+        // working dir (Gradle runs tests with the module dir as
+        // user.dir, so CI finds src/main/java this way); (3) the
+        // harness working-copy default (local only).
+        val root = selfExtensionSourceRoot()
         val forbidden = listOf(
             "DexClassLoader", "PathClassLoader", "ScriptEngine",
             "Runtime.exec", "System.load"
