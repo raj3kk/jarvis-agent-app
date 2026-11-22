@@ -122,6 +122,17 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getBoolean("live_mode_enabled", false)
         set(value) = prefs.edit().putBoolean("live_mode_enabled", value).apply()
 
+    // Captcha auto-solve (DESIGN §1.1, D3 LOCKED 2026-11-22): one-time
+    // "always allow", default FALSE. The solver NEVER runs unless
+    // this is true at the moment the challenge is detected — the
+    // flag is re-read on every challenge, never cached across tasks,
+    // so revoking in Settings → AI Brain takes effect immediately,
+    // including mid-task. Grant happens only deliberately in
+    // Settings (no in-context mid-task grant prompt, §1.2).
+    var captchaAutoSolveAllowed: Boolean
+        get() = prefs.getBoolean("captcha_auto_solve_allowed", false)
+        set(value) = prefs.edit().putBoolean("captcha_auto_solve_allowed", value).apply()
+
     // 1.6.0 (Phase 2, 2b-1): control-plane pairing status — flag +
     // metadata ONLY. No secrets in plain prefs, ever: the Ed25519
     // private key lives in the Android Keystore (or encrypted prefs

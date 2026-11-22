@@ -117,6 +117,7 @@ import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
+import com.jarvis.autonomous.data.CaptchaSolveLog
 import com.jarvis.autonomous.data.CaptchaStatus
 import com.jarvis.autonomous.data.DocConfirmClient
 import com.jarvis.autonomous.data.DocConfirmState
@@ -1889,6 +1890,14 @@ fun AiBrainSettingsScreen(
     // Captured at composition level for use inside onClick handlers
     // (CompositionLocals cannot be read inside a non-composable lambda).
     val aiBrainContext = LocalContext.current
+    // Captcha auto-solve (DESIGN §1, D3 LOCKED 2026-11-22): the
+    // toggle is applied IMMEDIATELY, not via the Save button —
+    // grant happens only on the permission card (deliberate, in
+    // Settings), revoke is instant on tap. The flag is re-read by
+    // the browser engine on every challenge.
+    var captchaAutoSolveOn by remember { mutableStateOf(prefs.captchaAutoSolveAllowed) }
+    var showCaptchaPermission by remember { mutableStateOf(false) }
+    var captchaLogLines by remember { mutableStateOf(CaptchaSolveLog.readLast(aiBrainContext, 20)) }
 
     Column(
         modifier = Modifier
@@ -1903,6 +1912,79 @@ fun AiBrainSettingsScreen(
             fontWeight = FontWeight.Bold,
             color = Color(0xFFB85C38)
         )
+
+        // Captcha auto-solve (DESIGN §1.2–§1.3): Settings → AI Brain
+        // row + permission card + on-device log (§4.2). Grant ONLY
+        // here, deliberately — never in-context mid-task.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Captcha auto-solve",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = if (captchaAutoSolveOn) {
+                                "ON — risk note padh kar allow kiya gaya. Band karne ke liye tap karo."
+                            } else {
+                                "OFF — har captcha par human-assist card khulega."
+                            },
+                            fontSize = 12.sp
+                        )
+                    }
+                    Switch(
+                        checked = captchaAutoSolveOn,
+                        onCheckedChange = { wantOn ->
+                            if (wantOn) {
+                                // Tapping ON opens the permission
+                                // screen — the user must read and
+                                // confirm; no bare toggle flip.
+                                showCaptchaPermission = true
+                            } else {
+                                // Revoke instantly, no confirm needed.
+                                prefs.captchaAutoSolveAllowed = false
+                                captchaAutoSolveOn = false
+                                CaptchaSolveLog.recordRevocation(aiBrainContext)
+                                captchaLogLines = CaptchaSolveLog.readLast(aiBrainContext, 20)
+                            }
+                        }
+                    )
+                }
+                if (showCaptchaPermission) {
+                    CaptchaAutoSolvePermissionCard(
+                        onAllow = {
+                            prefs.captchaAutoSolveAllowed = true
+                            captchaAutoSolveOn = true
+                            showCaptchaPermission = false
+                            CaptchaSolveLog.recordGrant(aiBrainContext)
+                            captchaLogLines = CaptchaSolveLog.readLast(aiBrainContext, 20)
+                        },
+                        onKeepHuman = { showCaptchaPermission = false }
+                    )
+                }
+                Text(
+                    text = "Auto-solve log (last 20 — answer-free audit):",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+                if (captchaLogLines.isEmpty()) {
+                    Text(text = "Abhi tak koi auto-solve attempt nahi hua.", fontSize = 12.sp)
+                } else {
+                    captchaLogLines.forEach { line ->
+                        Text(text = line, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
 
         // Provider Selector
         Text("1. Select AI Provider:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)

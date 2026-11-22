@@ -157,7 +157,32 @@ fun CaptchaAssistCard(
                         OutlinedButton(onClick = onDismiss) { Text("Baad me") }
                     }
                 }
-                CaptchaStatus.ACTIVE, CaptchaStatus.SOLVING -> {
+                CaptchaStatus.SOLVING -> {
+                    // Auto-solve phase (DESIGN §3.4): "Auto-solve kar
+                    // raha hun… koshish <n>/3" with a spinner and NO
+                    // buttons that can interfere. The user normally
+                    // never sees this state — auto runs before the
+                    // first human card; the card appears only after
+                    // auto has failed. The 60 s countdown does NOT
+                    // run here (the LaunchedEffect above fires only
+                    // for ACTIVE), so the auto phase never consumes
+                    // the human-assist window.
+                    androidx.compose.material3.CircularProgressIndicator(
+                        color = Color(0xFFB85C38)
+                    )
+                    Text(
+                        text = "Auto-solve kar raha hun… koshish ${state.autoSolveAttempts.coerceAtLeast(1)}/3",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = Color(0xFF3B2F2A)
+                    )
+                    Text(
+                        text = "Agar solve na hua, to aap khud solve karenge — wahi purana card khulega.",
+                        fontSize = 13.sp,
+                        color = Color(0xFF3B2F2A)
+                    )
+                }
+                CaptchaStatus.ACTIVE -> {
                     // Screenshot (pinch-zoom) — or the honest fallback.
                     var scale by remember(state.taskId) { mutableStateOf(1f) }
                     var offset by remember(state.taskId) { mutableStateOf(Offset.Zero) }

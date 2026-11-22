@@ -61,11 +61,18 @@ import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import com.jarvis.autonomous.data.AgentPlanStore
+import com.jarvis.autonomous.data.AutoSolveStatus
 import com.jarvis.autonomous.data.CaptchaAssistState
+import com.jarvis.autonomous.data.CaptchaSolveClient
+import com.jarvis.autonomous.data.CaptchaSolveLog
+import com.jarvis.autonomous.data.CaptchaSolvePolicy
 import com.jarvis.autonomous.data.CaptchaSource
 import com.jarvis.autonomous.data.CaptchaStatus
 import com.jarvis.autonomous.data.HubWsClient
+import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.service.JarvisAccessibilityService
+import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -484,13 +491,36 @@ object JarvisBackgroundBrowser {
     private val captchaWaiting = mutableMapOf<String, CaptchaWait>()
     private val captchaBlocked = mutableSetOf<String>()
 
-    /** D3 §3.2: challenge detection (DOM markers only — never a solver). */
+    // -- Captcha auto-solve (DESIGN §3, D3 LOCKED 2026-11-22) ---------
+    // Per-browser-task auto-solve count (key = task URL; the engine
+    // has no separate task id — one URL = one browser task here).
+    // 2 auto-solved challenges per task, 3rd = human-only (§3.1).
+    private val autoSolvedByTask = mutableMapOf<String, Int>()
+    // Challenges that already had their ONE submission (§3.1:
+    // MAX_SUBMISSIONS_PER_CHALLENGE = 1 — a wrong submission ends
+    // auto for that challenge, never a second auto round).
+    private val autoSubmittedChallenges = mutableSetOf<String>()
+
+    private data class AutoOutcome(val solved: Boolean, val attempts: Int)
+
+    /** D3 §3.2: challenge detection (DOM markers only — never a solver).
+     *  'text' = a simple distorted-text captcha (img/input carrying
+     *  "captcha" in src/name/id). reCAPTCHA/hCaptcha are checked
+     *  first, so their pages never fall through to 'text'. */
     private val CAPTCHA_CHECK_JS = """
         (function(){var d=document;function q(s){try{return !!d.querySelector(s)}catch(e){return false}}
         if(q('iframe[src*="challenges.cloudflare.com"],[class*="cf-turnstile"]'))return 'turnstile';
         if(q('iframe[src*="recaptcha"],.g-recaptcha'))return 'recaptcha';
         if(q('iframe[src*="hcaptcha"],.h-captcha'))return 'hcaptcha';
+        if(q('img[src*="captcha"],input[name*="captcha"],input[id*="captcha"]'))return 'text';
         if(q('[data-sitekey]'))return 'unknown';return 'none';})()
+    """.trimIndent()
+
+    /** Widget rect for crop + grid tap geometry (§2.1, §2.5): the
+     *  challenge iframe/element's bounding rect in CSS px, measured
+     *  at tap time (never cached — scroll/zoom would stale it). */
+    private val WIDGET_RECT_JS = """
+        (function(){var el=document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],.g-recaptcha,.h-captcha,[data-sitekey]');if(!el)return '';var r=el.getBoundingClientRect();return r.left+','+r.top+','+r.width+','+r.height;})()
     """.trimIndent()
 
     private suspend fun checkCaptcha(webView: WebView, url: String): String {
@@ -531,23 +561,96 @@ object JarvisBackgroundBrowser {
         Uri.parse(url).host
     }.getOrNull()?.takeIf { it.isNotBlank() }
 
+    /** SHA-256 of the challenge PNG (audit/dedup only — §4.3: the
+     *  image itself is never stored or logged, only its hash). */
+    private fun sha256Hex(b64: String?): String = runCatching {
+        if (b64.isNullOrBlank()) return "-"
+        val bytes = Base64.decode(b64, Base64.DEFAULT)
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+    }.getOrDefault("-")
+
+    private fun logSolveAttempt(
+        context: Context,
+        solveId: String,
+        taskId: String,
+        site: String,
+        challengeType: String,
+        model: String,
+        outcome: String,
+        confidence: Double?,
+        latencyMs: Long,
+        imageB64: String?
+    ) {
+        // Answer-free by construction: CaptchaSolveLog.Entry has no
+        // answer/token/image field (§4.2–§4.3).
+        CaptchaSolveLog.append(
+            context,
+            CaptchaSolveLog.Entry(
+                solveId = solveId,
+                taskId = taskId,
+                site = site,
+                challengeType = challengeType,
+                model = model,
+                outcome = outcome,
+                confidence = confidence,
+                latencyMs = latencyMs,
+                imageSha256 = sha256Hex(imageB64)
+            )
+        )
+    }
+
     /**
-     * 3c: a challenge was found during extraction. Publishes the
-     * assist state (card), reports a signed CAPTCHA_DETECTED to the
-     * hub, marks the running plan step AWAITING_USER, and completes
-     * the pending browse as CAPTCHA (prompt return, no hang).
+     * 3c + auto-solve (DESIGN §2.5, §3): a challenge was found
+     * during extraction.
+     *
+     * Auto-solve runs FIRST, before any human card — but ONLY when
+     * the flag is true at this exact moment (re-read per challenge,
+     * §1.1) AND the type is in scope (grids/text — audio/Turnstile/
+     * v3/sliders → human-only, unchanged) AND the per-task cap (2)
+     * and the one-submission rule allow it.
+     *
+     * Returns true when auto-solve cleared the challenge: the
+     * caller then continues extraction in the SAME browse (no
+     * re-browse — we are inside the browse mutex). Returns false
+     * when the human card was shown: the pending browse completes
+     * as CAPTCHA exactly as in 3c, with a FRESH 60 s countdown —
+     * the auto phase never consumes the human window (§3.4), and
+     * auto attempts never consume the 3-assist budget.
      */
-    private fun handleCaptchaFound(webView: WebView, pending: PendingExtraction, challenge: String) {
+    private suspend fun handleCaptchaFound(webView: WebView, pending: PendingExtraction, challenge: String): Boolean {
         val url = pending.url
         val site = hostOfUrl(url) ?: url
         val taskName = "Browser task: $site"
         val taskId = "bt-" + UUID.randomUUID().toString().replace("-", "").take(16)
         val screenshotB64 = captureCaptchaScreenshot(webView)
+        val challengeType = CaptchaSolvePolicy.challengeTypeForDetected(challenge)
+        // Flag re-read per challenge (§1.1) — never cached.
+        val flagAllowed = runCatching {
+            JarvisPreferences(webView.context.applicationContext).captchaAutoSolveAllowed
+        }.getOrDefault(false)
+        val solvedInTask = autoSolvedByTask[url] ?: 0
+        var autoOutcome: AutoOutcome? = null
+        if (CaptchaSolvePolicy.shouldAutoSolve(
+                flagAllowed = flagAllowed,
+                challengeType = challengeType,
+                autoSolvedInTask = solvedInTask,
+                alreadySubmitted = autoSubmittedChallenges.contains(taskId)
+            ) && challengeType != null
+        ) {
+            autoOutcome = runAutoSolve(webView, pending, taskId, site, challengeType, screenshotB64)
+            if (autoOutcome.solved) {
+                autoSolvedByTask[url] = solvedInTask + 1
+                return true
+            }
+        }
         JarvisStateRepository.setCaptchaAssist(
             CaptchaAssistState(
                 taskId = taskId, site = site, taskName = taskName, url = url,
                 screenshotB64 = screenshotB64, receivedAtMs = System.currentTimeMillis(),
-                status = CaptchaStatus.ACTIVE, source = CaptchaSource.LOCAL_WEBVIEW, assistCount = 1
+                status = CaptchaStatus.ACTIVE, source = CaptchaSource.LOCAL_WEBVIEW, assistCount = 1,
+                autoSolveStatus = if (autoOutcome == null) AutoSolveStatus.OFF else AutoSolveStatus.FAILED,
+                autoSolveAttempts = autoOutcome?.attempts ?: 0
             )
         )
         captchaWaiting[url] = CaptchaWait(taskId = taskId, site = site, taskName = taskName, url = url)
@@ -566,6 +669,149 @@ object JarvisBackgroundBrowser {
                 errorMessage = "Captcha — $site par madad chahiye. Browser tab me solve karo."
             )
         )
+        return false
+    }
+
+    /**
+     * One auto-solve phase (§2.5, §3.2): capture → signed solve call
+     * → apply answer → recheck. Whole phase bounded by the 60 s
+     * budget; expiry aborts at once, no partial answer ever
+     * submitted. On ANY failure the caller shows the normal human
+     * card. The answer lives only in local vars here — never
+     * logged, never stored, never sent back to the hub.
+     */
+    private suspend fun runAutoSolve(
+        webView: WebView,
+        pending: PendingExtraction,
+        taskId: String,
+        site: String,
+        challengeType: String,
+        screenshotB64: String?
+    ): AutoOutcome {
+        val context = webView.context
+        val image = screenshotB64
+            ?: return AutoOutcome(solved = false, attempts = 0)
+        JarvisStateRepository.setCaptchaAssist(
+            CaptchaAssistState(
+                taskId = taskId, site = site, taskName = "Browser task: $site",
+                url = pending.url, screenshotB64 = screenshotB64,
+                receivedAtMs = System.currentTimeMillis(),
+                status = CaptchaStatus.SOLVING, source = CaptchaSource.LOCAL_WEBVIEW,
+                assistCount = 1, autoSolveStatus = AutoSolveStatus.TRYING,
+                autoSolveAttempts = 1
+            )
+        )
+        val result = withTimeoutOrNull(CaptchaSolvePolicy.PHASE_BUDGET_MS) {
+            CaptchaSolveClient.solve(context, taskId, site, challengeType, image)
+        }
+        if (result == null) {
+            logSolveAttempt(context, "-", taskId, site, challengeType, "", "timeout", null, CaptchaSolvePolicy.PHASE_BUDGET_MS, image)
+            return AutoOutcome(solved = false, attempts = 0)
+        }
+        when (result) {
+            is CaptchaSolveClient.SolveResult.Failed -> {
+                logSolveAttempt(context, result.solveId ?: "-", taskId, site, challengeType, "", result.error, null, result.latencyMs, image)
+                return AutoOutcome(solved = false, attempts = result.attempts.coerceAtLeast(1))
+            }
+            is CaptchaSolveClient.SolveResult.Ok -> {
+                // ONE submission per challenge ever (§3.1): mark
+                // BEFORE applying, so no path can submit twice.
+                autoSubmittedChallenges.add(taskId)
+                val applied = runCatching {
+                    when (val answer = result.answer) {
+                        is CaptchaSolvePolicy.SolveAnswer.Text ->
+                            applyTextAnswer(webView, answer.text, pending.url)
+                        is CaptchaSolvePolicy.SolveAnswer.Tiles ->
+                            applyGridAnswer(webView, answer, pending.url)
+                    }
+                }.getOrDefault(false)
+                if (!applied) {
+                    // Nothing reached the page — this was not a
+                    // submission, so the one-submission mark is
+                    // lifted; the human card follows.
+                    autoSubmittedChallenges.remove(taskId)
+                    logSolveAttempt(context, result.solveId, taskId, site, challengeType, result.model, "apply_failed", result.confidence, result.latencyMs, image)
+                    return AutoOutcome(solved = false, attempts = result.attempts.coerceAtLeast(1))
+                }
+                delay(1500L)
+                val stillThere = checkCaptcha(webView, pending.url) != "none"
+                if (!stillThere) {
+                    logSolveAttempt(context, result.solveId, taskId, site, challengeType, result.model, "submitted_ok", result.confidence, result.latencyMs, image)
+                    val state = JarvisStateRepository.captchaAssist.value
+                    if (state?.taskId == taskId) {
+                        JarvisStateRepository.setCaptchaAssist(
+                            state.copy(status = CaptchaStatus.SOLVED, autoSolveStatus = AutoSolveStatus.SOLVED_AUTO)
+                        )
+                    }
+                    HubWsClient.instance?.sendCaptchaResolved(taskId, site, solved = true, aborted = false, durationS = 0L)
+                    JarvisStateRepository.addChatMessage(
+                        "Jarvis",
+                        "✓ Captcha auto-solve ho gaya — $site ka page dobara padh raha hoon."
+                    )
+                    return AutoOutcome(solved = true, attempts = result.attempts.coerceAtLeast(1))
+                }
+                // Wrong submission: recheck still sees the challenge
+                // → auto is OVER for this challenge (§3.2). No second
+                // auto round, no second submission — human card at once.
+                logSolveAttempt(context, result.solveId, taskId, site, challengeType, result.model, "submitted_wrong", result.confidence, result.latencyMs, image)
+                return AutoOutcome(solved = false, attempts = result.attempts.coerceAtLeast(1))
+            }
+        }
+    }
+
+    /** Text captcha: set the input value via DOM + submit the page's
+     *  own form (§2.5). The answer text is a local var only. */
+    private suspend fun applyTextAnswer(webView: WebView, text: String, url: String): Boolean {
+        if (text.isBlank()) return false
+        val escaped = text.replace("\\", "\\\\").replace("'", "\\'")
+        val js = "(function(){var inp=document.querySelector('input[name*=\"captcha\"],input[id*=\"captcha\"]');" +
+            "if(!inp)return 'no-input';" +
+            "var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;" +
+            "s.call(inp,'$escaped');" +
+            "inp.dispatchEvent(new Event('input',{bubbles:true}));" +
+            "inp.dispatchEvent(new Event('change',{bubbles:true}));" +
+            "var f=inp.form;if(f){f.submit();return 'submitted';}return 'set';})()"
+        val raw = runCatching { evaluateJs(webView, js, url) }.getOrDefault("")
+        return raw == "submitted" || raw == "set"
+    }
+
+    /**
+     * Grid captcha (reCAPTCHA v2 / hCaptcha — cross-origin iframe,
+     * so DOM clicks are impossible): screen-coordinate taps through
+     * the existing AccessibilityService gesture path (§2.5, R-1).
+     * Rect is measured at tap time; tap points come from
+     * CaptchaSolvePolicy (out-of-range indices/dims → null → no
+     * tap at all). A VERIFY tap at the widget's bottom-centre
+     * follows the tile taps. S-T4 is the ship gate for this path —
+     * if taps mis-land, grids stay human-only.
+     */
+    private suspend fun applyGridAnswer(
+        webView: WebView,
+        answer: CaptchaSolvePolicy.SolveAnswer.Tiles,
+        url: String
+    ): Boolean {
+        val rectRaw = runCatching { evaluateJs(webView, WIDGET_RECT_JS, url) }.getOrDefault("")
+        val rect = CaptchaSolvePolicy.parseWidgetRect(rectRaw) ?: return false
+        val loc = IntArray(2)
+        runCatching { webView.getLocationOnScreen(loc) }
+        val scale = runCatching { webView.scale }.getOrDefault(1f)
+        val points = CaptchaSolvePolicy.tileCenters(
+            rect, answer.rows, answer.cols, answer.tiles, loc[0], loc[1], scale
+        ) ?: return false
+        val acc = JarvisAccessibilityService.instance ?: return false
+        for ((x, y) in points) {
+            if (!acc.tapCoordinates(x, y)) return false
+            delay(350L)
+        }
+        // VERIFY button (inside the iframe): best-effort tap at
+        // the widget's bottom-centre. Its failure does not fail the
+        // apply — the recheck decides, and some grids auto-submit.
+        val verify = CaptchaSolvePolicy.verifyTapPoint(rect, loc[0], loc[1], scale)
+        if (verify != null) {
+            delay(400L)
+            runCatching { acc.tapCoordinates(verify.first, verify.second) }
+        }
+        return true
     }
 
     /**
@@ -916,12 +1162,14 @@ object JarvisBackgroundBrowser {
             }
             // 3c (D3): captcha check BEFORE extracting — a challenge
             // page has no readable content; extracting it would be
-            // fabricated text. On a hit the browse completes as
-            // CAPTCHA and the assist canvas takes over.
+            // fabricated text. Auto-solve (if gated in) runs inside
+            // handleCaptchaFound; true = it cleared the challenge,
+            // so extraction continues in this same browse.
             val challenge = checkCaptcha(webView, pending.url)
             if (challenge != "none") {
-                handleCaptchaFound(webView, pending, challenge)
-                return@launch
+                if (!handleCaptchaFound(webView, pending, challenge)) {
+                    return@launch
+                }
             }
             try {
                 val title = evaluateJs(webView, "document.title", pending.url)

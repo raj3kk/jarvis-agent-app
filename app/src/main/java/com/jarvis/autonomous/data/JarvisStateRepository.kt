@@ -79,6 +79,9 @@ data class NotificationItem(
 enum class CaptchaStatus { ACTIVE, SOLVING, SOLVED, TIMED_OUT, ABORTED }
 enum class CaptchaSource { LOCAL_WEBVIEW, HUB_EVENT }
 
+/** Auto-solve phase state (DESIGN §7.2). No answer field — ever. */
+enum class AutoSolveStatus { OFF, TRYING, FAILED, SOLVED_AUTO }
+
 /** One live captcha assist (D3 §3.3). `screenshotB64` is a Base64
  *  PNG (<200KB) or null when the WebView could not be captured —
  *  the card degrades to site + task + countdown without an image.
@@ -92,7 +95,11 @@ data class CaptchaAssistState(
     val receivedAtMs: Long,
     val status: CaptchaStatus,
     val source: CaptchaSource,
-    val assistCount: Int = 1
+    val assistCount: Int = 1,
+    /** Auto-solve phase state for this challenge (DESIGN §7.2). */
+    val autoSolveStatus: AutoSolveStatus = AutoSolveStatus.OFF,
+    /** Auto-solve attempts used for this challenge (0 = never tried). */
+    val autoSolveAttempts: Int = 0
 )
 
 // ---- 3c doc confirm (3b /confirm contract) ----
