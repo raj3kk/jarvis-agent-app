@@ -29,6 +29,7 @@ import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
 import com.jarvis.autonomous.data.RoutineNormalization
 import com.jarvis.autonomous.data.SaveResult
+import com.jarvis.autonomous.data.SelfExtensionStore
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
 import com.jarvis.autonomous.service.ScreenSnapshot
@@ -40,6 +41,7 @@ import com.jarvis.autonomous.ui.LicencePrefs
 import com.jarvis.autonomous.ui.browserTargetForInput
 import com.jarvis.autonomous.ui.normalizeBrowserUrl
 import kotlinx.coroutines.CancellationException
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1731,6 +1733,59 @@ class JarvisAgentEngine(
     internal fun planLlm(): LlmClient = llmClient
     internal fun planPrefs(): JarvisPreferences = prefs
     internal fun planContext(): Context = context
+
+    // 1.11.0-PRO (self-extension, DESIGN §1): the loop lives inside
+    // the Executor's single job — owned here like llmClient above,
+    // lazy so it receives a fully-constructed engine. No new service,
+    // no WorkManager, no second Executor job.
+    private val selfExtensionLoop: SelfExtensionLoop by lazy {
+        SelfExtensionLoop(context, llmClient, learnedRoutineStore)
+    }
+
+    /**
+     * 1.11.0-PRO (self-extension): the Executor's entry into the
+     * loop (used by AgentPlanExecutor after a step Failed and by the
+     * engine loop after a loop action fails with a capability
+     * error). Runs inside the current job; never launches its own
+     * scope. The loop's terminal outcome reaches the Talker through
+     * the EXISTING result path — the loop posts its one honest line
+     * to chat, and the task's terminal DONE/FAILED/BLOCKED result
+     * still flows through reportExecutorOutcome -> the bus ->
+     * deliverVerifiedExecutorResult (DONE) / deliverExecutorResult
+     * (other statuses). No second result is emitted mid-loop, so
+     * the single-result invariant stays intact.
+     */
+    internal suspend fun planMaybeExtend(
+        failure: ExecutorFailure,
+        runId: String,
+        hasRealInput: Boolean,
+        retryOriginal: (suspend () -> Boolean)? = null,
+        stepRunner: (suspend (SkillStep) -> Boolean)? = null
+    ): SelfExtensionLoop.LoopOutcome = selfExtensionLoop.maybeExtend(
+        failure = failure,
+        runId = runId,
+        hasRealInput = hasRealInput,
+        retryOriginal = retryOriginal,
+        stepRunner = stepRunner ?: { skillStep ->
+            planExecuteLearnedStep(
+                LearnedStep(
+                    action = skillStep.action,
+                    target = skillStep.target,
+                    input = skillStep.input
+                )
+            )
+        }
+    )
+
+    /**
+     * 1.11.0-PRO (self-extension, §7): executes one candidate skill
+     * step through the SAME path `findRoutine` replay uses
+     * ([executeLearnedStep]) — the verifier's real-invocation path.
+     * Steps outside the replay vocabulary return false (a mismatch),
+     * never a faked success.
+     */
+    internal suspend fun planExecuteLearnedStep(step: LearnedStep): Boolean =
+        executeLearnedStep(step, JarvisAccessibilityService.instance)
     internal suspend fun planSpeak(text: String): Boolean = speak(text)
     internal suspend fun planAsk(prompt: String): String? = askUserVoice(prompt)
     internal fun planIsOnline(): Boolean = isOnline()
@@ -3862,6 +3917,35 @@ class JarvisAgentEngine(
                     val actionResult = executeDecisionAction(decision, accService)
                     stepResult = actionResult
                     previousActions.add("Step $step: ${actionResult.summary}")
+                    // 1.11.0-PRO (self-extension, DESIGN §1): same
+                    // detector call in the loop-action failure path.
+                    // Only an UNKNOWN_ACTION failure can trigger it
+                    // (parseDecisionJson already rejects actions
+                    // outside the known set, so this is the narrow
+                    // handler-missing case). The loop runs inside
+                    // this same job; on EXTENDED_AND_VERIFIED the
+                    // next LLM step can use the new skill via the
+                    // normal findRoutine path, and the terminal
+                    // outcome still flows through the existing
+                    // reportExecutorOutcome -> bus -> verification
+                    // gate (no second result emitted here).
+                    if (!actionResult.ok && actionResult.summary.contains("UNKNOWN_ACTION")) {
+                        val extOutcome = planMaybeExtend(
+                            failure = ExecutorFailure(
+                                stepKind = "LOOP_ACTION",
+                                action = decision.action,
+                                reason = actionResult.summary,
+                                goalText = "",
+                                planId = activeExecutorCommand?.id ?: ""
+                            ),
+                            runId = activeExecutorCommand?.id ?: "loop",
+                            hasRealInput = true,
+                            retryOriginal = null
+                        )
+                        previousActions.add(
+                            "Step $step self-extension: ${extOutcome::class.simpleName}"
+                        )
+                    }
                     // 1.4.25-PRO Step 2A (H4): record only ok steps.
                     // stepResult is non-null here — action != NONE,
                     // so executeDecisionAction just ran above.

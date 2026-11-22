@@ -135,6 +135,7 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.PreviousBounce
+import com.jarvis.autonomous.data.SelfExtensionStore
 import com.jarvis.autonomous.data.buildBounceReportText
 import com.jarvis.autonomous.data.clearStaleBounceReport
 import com.jarvis.autonomous.data.detectPreviousBounce
@@ -142,6 +143,7 @@ import com.jarvis.autonomous.data.writeBounceReportFile
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisForegroundService
 import com.jarvis.autonomous.service.JarvisWhiteboardService
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -2846,6 +2848,12 @@ fun MemoryRoutinesLogsScreen(
     val skillContext = LocalContext.current
     val skillStore = remember { LearnedRoutineStore(skillContext) }
     var skills by remember { mutableStateOf(skillStore.loadSkillManifests()) }
+    // 1.11.0-PRO (self-extension): quarantined CODE proposals
+    // (read-only rows below — no enable button, no install).
+    val selfExtStore = remember {
+        SelfExtensionStore(File(skillContext.filesDir, "device-memory/self-extension"))
+    }
+    var proposals by remember { mutableStateOf(selfExtStore.loadProposals()) }
 
     val logs by JarvisStateRepository.executionLogs.collectAsState()
 
@@ -3049,6 +3057,14 @@ fun MemoryRoutinesLogsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Say: \"${skill.displayName}\"", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
+                            // 1.11.0-PRO (self-extension): self-added
+                            // skills show their origin + licence.
+                            if (skill.origin == "self_extended") {
+                                Text("Jarvis ne khud joda", fontSize = 11.sp, color = Color(0xFF2E7D5B))
+                                skill.provenance?.let { prov ->
+                                    Text("Licence: ${prov.licence} · Cost: ${prov.costUsd}", fontSize = 11.sp, color = Color(0xFF8A7A70))
+                                }
+                            }
                             Text("Used ${skill.useCount} times", fontSize = 11.sp, color = Color.LightGray)
                         }
                         Switch(
@@ -3063,6 +3079,24 @@ fun MemoryRoutinesLogsScreen(
                             skills = skillStore.loadSkillManifests()
                         }) {
                             Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFFFF5252))
+                        }
+                    }
+                }
+                // 1.11.0-PRO (self-extension, §6): quarantined CODE
+                // proposals — read-only "pending approval" rows, no
+                // enable button, nothing installed from here.
+                proposals.forEach { proposal ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFFF3E5F5))
+                            .padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Proposal: ${proposal.capability}", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF6A1B9A))
+                            Text("pending approval · ${proposal.status} · Licence: ${proposal.licence}", fontSize = 11.sp, color = Color(0xFF8A7A70))
                         }
                     }
                 }

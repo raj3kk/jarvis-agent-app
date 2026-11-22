@@ -58,7 +58,10 @@ enum class EvidenceKind(val wire: String) {
     SUPABASE_TABLES("SUPABASE_TABLES"),
     VERCEL_DEPLOY("VERCEL_DEPLOY"),
     SCREEN_STATE("SCREEN_STATE"),
-    MESSAGE_SENT("MESSAGE_SENT");
+    MESSAGE_SENT("MESSAGE_SENT"),
+    // 1.11.0-PRO (self-extension, DESIGN §7): a candidate skill's
+    // real-invocation test step (check "step_ok:<ACTION>").
+    SKILL_TEST("SKILL_TEST");
 
     companion object {
         fun fromWire(wire: String?): EvidenceKind? =
@@ -114,7 +117,8 @@ object EvidenceRefs {
         EvidenceKind.FILE_LIST,
         EvidenceKind.SUPABASE_TABLES,
         EvidenceKind.SCREEN_STATE,
-        EvidenceKind.MESSAGE_SENT
+        EvidenceKind.MESSAGE_SENT,
+        EvidenceKind.SKILL_TEST
     )
 
     /** Serialise refs as `{"refs":[{...}, …]}`. */

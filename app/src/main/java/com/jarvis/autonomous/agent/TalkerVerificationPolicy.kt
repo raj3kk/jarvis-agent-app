@@ -75,6 +75,9 @@ object TalkerVerificationPolicy {
         EvidenceKind.VERCEL_DEPLOY -> "Vercel deploy nahi mila"
         EvidenceKind.SCREEN_STATE -> "screen par confirm nahi hua"
         EvidenceKind.MESSAGE_SENT -> "screen par confirm nahi hua"
+        // 1.11.0-PRO (self-extension, DESIGN §7): the candidate
+        // skill's real-invocation test did not run / pass.
+        EvidenceKind.SKILL_TEST -> "skill test nahi chala"
     }
 
     fun missingPhraseFor(kinds: List<EvidenceKind>): String {
@@ -151,6 +154,7 @@ object TalkerVerificationPolicy {
             EvidenceKind.GITHUB_COMMIT -> "GitHub commit"
             EvidenceKind.SUPABASE_TABLES -> "Supabase tables"
             EvidenceKind.VERCEL_DEPLOY -> "Vercel deploy"
+            EvidenceKind.SKILL_TEST -> "skill test"
             EvidenceKind.SCREEN_STATE, EvidenceKind.MESSAGE_SENT -> "screen"
             null -> "kaam"
         }

@@ -547,6 +547,71 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         }
     }
 
+    /**
+     * 1.11.0-PRO (self-extension, DESIGN §3.1 as deviated per parent
+     * decision D0.4): research LLM leg.
+     *
+     * DEVIATION from DESIGN D0.4 (hub `search_grounding` route): there
+     * is NO app→hub LLM call path to reuse. `LlmClient` calls Gemini
+     * directly (`generativelanguage.googleapis.com`) or OpenAI-compatible
+     * endpoints (Groq/OpenRouter) with the user's saved BYOK key, and
+     * the hub `/api/llm/route` requires `x-internal-secret`
+     * (server-to-server only) — the phone MUST never hold that secret,
+     * so a hub-routed research client is NOT buildable and NOT wanted.
+     * This method therefore EXTENDS the existing client: it reuses the
+     * private callers `callGeminiApi` / `callOpenAiCompatibleApi` with
+     * the same `prefs.modelName` + `prefs.provider.fallbackModels`
+     * chain, the same OkHttp client/timeouts, and the same
+     * non-retryable-error fail-fast as `decideNextStep`. The caller
+     * (SelfExtensionResearcher) supplies the fixed English research
+     * prompt and parses the reply STRICTLY (malformed → research
+     * failure, never best-effort prose parsing). No new LLM client,
+     * no new route, no new key. LOCAL provider cannot research (no
+     * cloud key path) — throws, and the loop treats it as no-leads.
+     *
+     * Returns the model's RAW reply text (first successful model in
+     * the chain). The API key is never included in any return value
+     * or diagnostic (same rule as testApiKey).
+     */
+    suspend fun researchCandidates(prompt: String): String = withContext(Dispatchers.IO) {
+        if (prefs.provider == AiProvider.LOCAL) {
+            throw IllegalStateException("LOCAL provider: research needs Gemini/Groq/OpenRouter BYOK")
+        }
+        val apiKey = prefs.apiKey
+        if (apiKey.isBlank()) throw IllegalStateException("API key missing in preferences")
+        val systemPrompt = "You are a research assistant. Reply with JSON only, exactly in the shape the user asks for. No prose, no markdown fences."
+        val candidates = (listOf(prefs.modelName) + prefs.provider.fallbackModels)
+            .map { it.trim().removePrefix("models/") }
+            .filter { it.isNotBlank() }.distinct()
+        var lastError: Exception? = null
+        for (candidate in candidates) {
+            try {
+                return@withContext when (prefs.provider) {
+                    AiProvider.GEMINI -> callGeminiApi(
+                        apiKey = apiKey,
+                        model = candidate,
+                        systemPrompt = systemPrompt,
+                        userPrompt = prompt
+                    )
+                    else -> callOpenAiCompatibleApi(
+                        provider = prefs.provider,
+                        baseUrl = prefs.provider.baseUrl,
+                        apiKey = apiKey,
+                        model = candidate,
+                        systemPrompt = systemPrompt,
+                        userPrompt = prompt
+                    )
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastError = e
+                if (isNonRetryableLlmError(e)) throw e
+            }
+        }
+        throw (lastError ?: IllegalStateException("No model responded"))
+    }
+
     private fun callGeminiApi(
         apiKey: String,
         model: String,

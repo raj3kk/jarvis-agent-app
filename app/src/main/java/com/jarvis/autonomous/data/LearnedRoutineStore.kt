@@ -57,6 +57,23 @@ data class LearnedRoutine(
 )
 
 /**
+ * Provenance for a self-extended skill (DESIGN §5.3, additive).
+ * `researchedBy` is the fixed literal "self-extension" — never a
+ * model name + version free text. `verification` is
+ * "verified:<test-id>" once §7 passes, "" until then.
+ */
+data class SkillProvenance(
+    val researchedBy: String,
+    val sources: List<String>,
+    val licence: String,
+    val costUsd: String,
+    val addedAtMs: Long,
+    val autoAdded: Boolean,
+    val researchSignature: String,
+    val verification: String
+)
+
+/**
  * One on-device skill manifest (Phase 1, 1.5.3-PRO).
  *
  * A skill is a learned routine PLUS its lifecycle metadata:
@@ -74,6 +91,10 @@ data class LearnedRoutine(
  * Schema v1 (frozen in Pehle-Jaanch §3.1): schemaVersion is
  * the envelope version, checked on load — an unknown version
  * fails closed (skill skipped, routine untouched).
+ *
+ * 1.11.0-PRO (self-extension, DESIGN §5.3): additive `origin` /
+ * `provenance` fields, both optional with safe defaults, so v1
+ * readers keep working. `origin="learned"` is the default.
  */
 data class LocalSkillManifest(
     val id: String,
@@ -85,7 +106,9 @@ data class LocalSkillManifest(
     val lastUsedAtMs: Long = 0L,
     val useCount: Int = 0,
     val enabled: Boolean = true,
-    val version: Int = 1
+    val version: Int = 1,
+    val origin: String = "learned",
+    val provenance: SkillProvenance? = null
 )
 
 /** Trigger normalization, shared by recording and lookup (idempotent). */
@@ -386,8 +409,67 @@ class LearnedRoutineStore(context: Context) {
     }
 
     /** No manifest (legacy routine) counts as enabled. */
-    fun isSkillEnabled(id: String): Boolean =
-        loadSkillManifests().firstOrNull { it.id == id }?.enabled ?: true
+    fun isSkillEnabled(id: String): Boolean {
+        val manifest = loadSkillManifests().firstOrNull { it.id == id } ?: return true
+        // 1.11.0-PRO (self-extension, §8 E3, fail-closed): delegates
+        // to SelfExtensionReplayGate — an unverified self-added skill
+        // never replays even if a bug flips `enabled`.
+        return com.jarvis.autonomous.agent.SelfExtensionReplayGate.isEnabled(
+            origin = manifest.origin,
+            autoAdded = manifest.provenance?.autoAdded == true,
+            verification = manifest.provenance?.verification ?: "",
+            enabledFlag = manifest.enabled
+        )
+    }
+
+    /**
+     * 1.11.0-PRO (self-extension, DESIGN §5.2/§5.3): installs a
+     * STEP skill found by the loop. The manifest starts
+     * `enabled=false` + empty `verification`; ONLY the verifier
+     * flips it on (via [markSkillVerified] + [setSkillEnabled]).
+     * The routine is saved alongside (same sync rule as
+     * [deleteSkill]) so `findRoutine` can replay it once enabled.
+     * Callers MUST have passed the classifier + installer gates —
+     * this function does not re-classify, it only stores.
+     */
+    fun upsertSelfExtendedSkill(routine: LearnedRoutine, provenance: SkillProvenance): LocalSkillManifest {
+        val allRoutines = loadRoutines().filterNot { it.id == routine.id }.toMutableList()
+        allRoutines.add(routine)
+        saveRoutines(allRoutines)
+        val manifest = LocalSkillManifest(
+            id = routine.id,
+            trigger = routine.trigger,
+            displayName = routine.trigger,
+            steps = routine.steps,
+            source = "self_extended",
+            createdAtMs = routine.createdAtMs,
+            enabled = false,
+            version = 1,
+            origin = "self_extended",
+            provenance = provenance
+        )
+        val all = loadSkillManifests().filterNot { it.id == routine.id }.toMutableList()
+        all.add(manifest)
+        saveSkillManifests(all)
+        pruneSkillsIfNeeded()
+        return manifest
+    }
+
+    /**
+     * 1.11.0-PRO (self-extension, §7): records a passed §7 test on
+     * a self-added skill. Returns false when the skill is absent or
+     * is not a self-added skill (learned skills never carry one).
+     */
+    fun markSkillVerified(id: String, verification: String): Boolean {
+        val all = loadSkillManifests().toMutableList()
+        val idx = all.indexOfFirst { it.id == id }
+        if (idx < 0) return false
+        val m = all[idx]
+        if (m.origin != "self_extended" || m.provenance == null) return false
+        all[idx] = m.copy(provenance = m.provenance.copy(verification = verification))
+        saveSkillManifests(all)
+        return true
+    }
 
     /**
      * Cap 50 + prune. Over the cap, one victim at a time: (1)
@@ -435,6 +517,24 @@ class LearnedRoutineStore(context: Context) {
         obj.put("useCount", manifest.useCount)
         obj.put("enabled", manifest.enabled)
         obj.put("version", manifest.version)
+        // 1.11.0-PRO (self-extension, §5.3, additive): origin +
+        // provenance serialise only when present, so v1 JSON for
+        // learned skills is byte-identical to before.
+        obj.put("origin", manifest.origin)
+        manifest.provenance?.let { prov ->
+            val provObj = JSONObject()
+            provObj.put("researchedBy", prov.researchedBy)
+            val sourcesArr = JSONArray()
+            for (source in prov.sources.take(5)) sourcesArr.put(source)
+            provObj.put("sources", sourcesArr)
+            provObj.put("licence", prov.licence)
+            provObj.put("costUsd", prov.costUsd)
+            provObj.put("addedAtMs", prov.addedAtMs)
+            provObj.put("autoAdded", prov.autoAdded)
+            provObj.put("researchSignature", prov.researchSignature)
+            provObj.put("verification", prov.verification)
+            obj.put("provenance", provObj)
+        }
         return obj
     }
 
@@ -453,6 +553,36 @@ class LearnedRoutineStore(context: Context) {
             }
         }
         if (steps.isEmpty()) return null
+        // 1.11.0-PRO (self-extension, §5.3, additive): origin
+        // defaults to "learned"; provenance absent -> null (old
+        // manifests and learned skills are unaffected). A manifest
+        // whose provenance licence is not in the §3.4 allowlist /
+        // copyleft sets (or "UNKNOWN") is skipped (fail-closed).
+        val origin = obj.optString("origin", "learned").ifBlank { "learned" }
+        var provenance: SkillProvenance? = null
+        val provObj = obj.optJSONObject("provenance")
+        if (provObj != null) {
+            val licence = provObj.optString("licence", "UNKNOWN").ifBlank { "UNKNOWN" }
+            if (licence !in STORABLE_LICENCES) return null
+            val sources = ArrayList<String>()
+            val sourcesArr = provObj.optJSONArray("sources")
+            if (sourcesArr != null) {
+                for (i in 0 until sourcesArr.length()) {
+                    val source = sourcesArr.optString(i, "")
+                    if (source.isNotBlank()) sources.add(source)
+                }
+            }
+            provenance = SkillProvenance(
+                researchedBy = provObj.optString("researchedBy", "self-extension"),
+                sources = sources.take(5),
+                licence = licence,
+                costUsd = provObj.optString("costUsd", "UNKNOWN"),
+                addedAtMs = provObj.optLong("addedAtMs", 0L),
+                autoAdded = provObj.optBoolean("autoAdded", false),
+                researchSignature = provObj.optString("researchSignature", ""),
+                verification = provObj.optString("verification", "")
+            )
+        }
         return LocalSkillManifest(
             id = id,
             trigger = trigger,
@@ -463,7 +593,9 @@ class LearnedRoutineStore(context: Context) {
             lastUsedAtMs = obj.optLong("lastUsedAtMs", 0L),
             useCount = obj.optInt("useCount", 0),
             enabled = obj.optBoolean("enabled", true),
-            version = obj.optInt("version", 1).coerceAtLeast(1)
+            version = obj.optInt("version", 1).coerceAtLeast(1),
+            origin = origin,
+            provenance = provenance
         )
     }
 
@@ -582,6 +714,18 @@ class LearnedRoutineStore(context: Context) {
         private const val MAX_SKILLS = 50
         private const val MAX_WAIT_MS = 10_000L
         private const val MAX_VALUE_LENGTH = 200
+
+        // 1.11.0-PRO (self-extension, §5.3): licence strings a
+        // stored self-added manifest may carry — the §3.4 allowlist
+        // ∪ copyleft sets ∪ "UNKNOWN" (mirrors the server's
+        // SELF_EXT_LICENSE_ALLOWLIST / COPYLEFT; kept literal here
+        // so data/ never imports agent/).
+        private val STORABLE_LICENCES = setOf(
+            "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+            "MPL-2.0", "CC0-1.0", "Unlicense", "Zlib",
+            "GPL-2.0", "GPL-3.0", "LGPL-2.1", "LGPL-3.0", "AGPL-3.0", "EPL-2.0",
+            "UNKNOWN"
+        )
 
         // Confirmation-required actions (see isConfirmationRequired()).
         private val CONFIRMATION_ACTIONS = setOf(

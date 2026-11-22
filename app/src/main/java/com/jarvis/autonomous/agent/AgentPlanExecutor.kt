@@ -6,6 +6,7 @@ import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanStep
 import com.jarvis.autonomous.data.ProjectPreviewServer
@@ -262,6 +263,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         var current = plan
         // Steps that already had one ask-driven re-run in this run.
         val retriedAfterAsk = mutableSetOf<String>()
+        // 1.11.0-PRO (self-extension): steps already retried once
+        // via the self-extension loop — the loop never retries the
+        // original step more than once (DESIGN §2.5).
+        val extendedAfterExtension = mutableSetOf<String>()
         // 1.9.0 (v2, DESIGN §4.2): typed evidence refs collected
         // from DONE steps — finishPlan attaches them to the DONE
         // claim so the Talker can re-read them.
@@ -416,6 +421,85 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                             saveAndPublish(current)
                             finishPlan(current, allDone = false)
                             return
+                        }
+                        // 1.11.0-PRO (self-extension, DESIGN §1 trigger
+                        // point): after a step Failed — BEFORE
+                        // parkBlocked/finishPlan decides — try the
+                        // loop once for a missing capability. The
+                        // loop runs inside this same job, under the
+                        // same timeout; it never launches its own
+                        // scope. Goal text is NEVER passed (S8): the
+                        // detector works from step kind/action/reason
+                        // only, so goalText stays "".
+                        if (step.id !in extendedAfterExtension) {
+                            var retryOutcome: StepOutcome? = null
+                            val extOutcome = engine.planMaybeExtend(
+                                failure = ExecutorFailure(
+                                    stepKind = step.kind,
+                                    action = step.kind,
+                                    reason = outcome.reason,
+                                    goalText = "",
+                                    planId = current.planId
+                                ),
+                                runId = current.planId,
+                                hasRealInput = true,
+                                retryOriginal = {
+                                    retryOutcome = executeStep(current.steps[idx], current)
+                                    retryOutcome is StepOutcome.Done
+                                },
+                                stepRunner = { skillStep ->
+                                    engine.planExecuteLearnedStep(
+                                        LearnedStep(
+                                            action = skillStep.action,
+                                            target = skillStep.target,
+                                            input = skillStep.input
+                                        )
+                                    )
+                                }
+                            )
+                            when (extOutcome) {
+                                is SelfExtensionLoop.LoopOutcome.ExtendedAndVerified -> {
+                                    extendedAfterExtension.add(step.id)
+                                    val done = retryOutcome as? StepOutcome.Done
+                                    if (done != null) {
+                                        // V3 passed: the retried step
+                                        // is DONE — same bookkeeping
+                                        // as the normal Done branch.
+                                        stepDurationsMs.add(
+                                            System.currentTimeMillis() - stepStartMs
+                                        )
+                                        current = updateStep(current, step.id) {
+                                            it.copy(state = PlanState.DONE, evidence = done.evidence)
+                                        }
+                                        saveAndPublish(current)
+                                        JarvisStateRepository.addChatMessage(
+                                            "Jarvis",
+                                            "✓ ${step.title} — ${done.evidence.take(200)}"
+                                        )
+                                        engine.planPersistChat()
+                                        collectedRefs.addAll(done.refs)
+                                        emitPlanProgress(
+                                            current, idx, phase = "DONE",
+                                            etaSeconds = planEtaSeconds(stepDurationsMs, current.steps.size - idx - 1)
+                                        )
+                                        idx++
+                                        continue
+                                    }
+                                    // Retry reported success but left
+                                    // no Done outcome — fall through
+                                    // to the existing ask flow below.
+                                }
+                                is SelfExtensionLoop.LoopOutcome.ProposalFiled -> {
+                                    // CODE skill: original step stays
+                                    // BLOCKED, user told honestly
+                                    // (the loop already posted its
+                                    // line; parkBlocked reports it).
+                                    parkBlocked(current, step, extOutcome.userLine)
+                                    return
+                                }
+                                is SelfExtensionLoop.LoopOutcome.UserItem,
+                                is SelfExtensionLoop.LoopOutcome.GiveUp -> Unit
+                            }
                         }
                         when (val ans = askStepQuestion(
                             "Step '${step.title}' fail ho gaya: ${outcome.reason.take(150)}. Dobara koshish karun ya chhod dun?"
@@ -748,7 +832,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             "SUPABASE_TABLES" -> executeSupabaseTables(step, plan)
             "VERCEL_DEPLOY" -> executeVercelDeploy(step, plan)
             "HTTP_CHECK" -> executeHttpCheck(step)
-            else -> StepOutcome.Failed("Unknown step kind: ${step.kind}")
+            // 1.11.0-PRO (self-extension): the T-NO-HANDLER marker
+            // names the trigger for the detector (§2.2) while keeping
+            // the v1 "Unknown step kind:" wording intact.
+            else -> StepOutcome.Failed("Unknown step kind: ${step.kind} (T-NO-HANDLER)")
         }
     }
 
