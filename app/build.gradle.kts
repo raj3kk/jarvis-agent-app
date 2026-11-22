@@ -200,6 +200,13 @@ dependencies {
     // bus, dispatcher and reply policy (pure-Kotlin modules).
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.11.1")
+    // 1.14.0 (M-I-30): real org.json on the TEST classpath only.
+    // android.jar's org.json is a stub that throws RuntimeException
+    // ("Stub!") in local unit tests, so any test that builds a
+    // JSONObject (CronJobClientTest) fails without this. The real jar
+    // shadows the stub on the unit-test classpath; production code
+    // still uses the device's org.json — nothing ships differently.
+    testImplementation("org.json:json:20240303")
 }
 
 // 1.13.0 Gecko browser — D-1 TOOLCHAIN DECISION (suppression, not the
