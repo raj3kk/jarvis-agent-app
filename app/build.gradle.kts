@@ -155,6 +155,11 @@ dependencies {
     // broke CI dependency resolution on 2026-11-02, so it is NOT used.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
 
+    // 1.12.0 FCM: kotlinx-coroutines-play-services provides the
+    // `Task.await()` extension used by FcmTokenClient (Firebase token
+    // fetch). Same version as kotlinx-coroutines-android (1.8.1).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+
     // 1.12.0 FCM: Firebase Cloud Messaging for hub -> phone push
     // (data-only messages; the app renders the notification). Direct
     // pin, no BOM, so resolution cannot drift. google-services.json
