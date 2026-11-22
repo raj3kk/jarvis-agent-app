@@ -164,6 +164,25 @@ jobs:
           cp app/build/outputs/apk/release/*.apk Jarvis2026.apk
           ls -lh Jarvis2026.apk
 
+      # GeckoView spike: uploads sit BEFORE the size gate on purpose.
+      # The gate below FAILS the run when the APK is over 100 MB (that
+      # IS the S-1 result), but the APK must still be preserved as an
+      # artifact — the phone tests (S-2–S-8) run from this very APK,
+      # and a failing gate must not destroy the only copy of it.
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-Autonomous-Debug-APK${{ env.ARTIFACT_SUFFIX }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis2026-APK${{ env.ARTIFACT_SUFFIX }}
+          path: Jarvis2026.apk
+          retention-days: 30
+
       # GeckoView spike S-1 (branch geckoview-spike only): release APK
       # size gate — Play APK cap is 100 MB. Echoes the exact size
       # every run and FAILS the build over the cap. Also confirms
@@ -186,17 +205,3 @@ jobs:
             exit 1
           fi
           echo "S-1 PASS: $SIZE_MB MB <= 100 MB, arm64-v8a only"
-
-      - name: Upload Debug APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Jarvis-Autonomous-Debug-APK${{ env.ARTIFACT_SUFFIX }}
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-      - name: Upload Release APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Jarvis2026-APK${{ env.ARTIFACT_SUFFIX }}
-          path: Jarvis2026.apk
-          retention-days: 30
