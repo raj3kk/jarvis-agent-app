@@ -11,6 +11,7 @@ import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.FilePatternStorage
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.DocumentSearch
 import com.jarvis.autonomous.data.DocumentText
@@ -1704,8 +1705,13 @@ class JarvisAgentEngine(
      * model is not downloaded, the attempt timed out / errored, or the
      * reply came back blank — the caller falls through to today's
      * cloud loop (or the busy line while an Executor runs).
+     * M-I-2 (1.14.0): [docContext] is the I1 recall output
+     * ([DocumentText.buildDocContext] — max 3 docs, snippets ≤400
+     * chars, labelled). It joins the system prompt as context only,
+     * via [DocContextPrompt.talkerSystemPrompt]; blank means no
+     * recall and the prompt is the persona prompt untouched.
      */
-    private suspend fun tryTalkerLocalReply(text: String): Boolean {
+    private suspend fun tryTalkerLocalReply(text: String, docContext: String = ""): Boolean {
         if (!LocalLlmManager.isDownloaded(context)) return false
         val recent = JarvisStateRepository.chatHistory.value.takeLast(6).mapNotNull { entry ->
             val sender = entry.sender
@@ -1717,7 +1723,7 @@ class JarvisAgentEngine(
             runCatching {
                 LocalLlmManager.chat(
                     context = context,
-                    systemPrompt = prefs.personaPrompt,
+                    systemPrompt = DocContextPrompt.talkerSystemPrompt(prefs.personaPrompt, docContext),
                     userText = text,
                     recentChat = recent
                 )
@@ -2837,10 +2843,15 @@ class JarvisAgentEngine(
                 )
                 if (workKind == ExecutorWorkKind.PLAN) {
                     launchExecutorCommand(cmd) {
+                        // M-I-2 (1.14.0): recalled doc context rides
+                        // the planner prompt (context only) — the
+                        // EXECUTE_LOOP branch already had it via
+                        // buildMemoryContext; EXECUTE_PLAN did not.
                         planExecutor.startNewPlan(
                             effectiveGoal,
                             guidance?.patternHint ?: "",
-                            guidance?.instructionHint ?: ""
+                            guidance?.instructionHint ?: "",
+                            docContext
                         )
                     }
                 } else {
@@ -2866,7 +2877,12 @@ class JarvisAgentEngine(
             }
             TalkerDispatcher.TalkerDecision.TALK -> {
                 scope.launch {
-                    val answered = tryTalkerLocalReply(effectiveGoal)
+                    // M-I-2 (1.14.0): the Talker's on-device local
+                    // reply now sees recalled doc context too (the
+                    // cloud-loop fallback already had it via
+                    // launchLoopTurn). Blank = no recall, prompt
+                    // unchanged.
+                    val answered = tryTalkerLocalReply(effectiveGoal, docContext)
                     if (!answered) {
                         val running = talkerBus.pendingCommands().firstOrNull()
                         if (running != null) {

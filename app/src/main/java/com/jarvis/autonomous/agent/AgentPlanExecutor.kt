@@ -5,6 +5,8 @@ import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
 import com.jarvis.autonomous.data.ChatSummary
+import com.jarvis.autonomous.data.DocContextPrompt
+import com.jarvis.autonomous.data.GoogleClient
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.PlanState
@@ -111,11 +113,18 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
      *  1.9.0 (v2, DESIGN §5.4): [learnedHint] / [instructionHint]
      *  are guidance, never orders — they prepend ONE hint line to
      *  the planner prompt. The planner may still ask the user when
-     *  a value is genuinely missing. */
+     *  a value is genuinely missing.
+     *  M-I-2 (1.14.0): [docContext] is the I1 recall output
+     *  ([DocumentText.buildDocContext] — max 3 docs, snippets
+     *  ≤400 chars, labelled). It rides the planner prompt as
+     *  context only, via [DocContextPrompt.planGoalWithDocs];
+     *  blank means no recall and the prompt is byte-identical to
+     *  the pre-I2 version. */
     suspend fun startNewPlan(
         goal: String,
         learnedHint: String = "",
-        instructionHint: String = ""
+        instructionHint: String = "",
+        docContext: String = ""
     ) {
         val context = engine.planContext()
         // Q10: a new agent-mode task overwrites agent_plan.json —
@@ -155,15 +164,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         // 1.9.0 (v2, DESIGN §5.4): learned guidance reaches the
         // planner as ONE hint line in the prompt (hint — zaroori
         // nahi). The stored plan goal stays the user's own words.
-        val planGoal = buildString {
-            append(goal)
-            if (learnedHint.isNotBlank()) {
-                append("\nPehle seekha hua tareeka (hint — zaroori nahi): $learnedHint. Agar context badla ho to ignore karo.")
-            }
-            if (instructionHint.isNotBlank()) {
-                append("\nYaad rakha: $instructionHint")
-            }
-        }
+        // M-I-2 (1.14.0): recalled doc context rides the same way,
+        // via DocContextPrompt (blank = no recall, prompt unchanged).
+        val planGoal = DocContextPrompt.planGoalWithDocs(goal, learnedHint, instructionHint, docContext)
         when (val result = engine.planLlm().planNext(
             planGoal,
             engine.planAnsweredClarifications().toList(),
@@ -832,6 +835,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             "SUPABASE_TABLES" -> executeSupabaseTables(step, plan)
             "VERCEL_DEPLOY" -> executeVercelDeploy(step, plan)
             "HTTP_CHECK" -> executeHttpCheck(step)
+            // Track E #27: Gmail/Drive via the hub's direct Google
+            // OAuth (no tokens on the phone — hub calls Google).
+            "GMAIL_SEND" -> executeGmailSend(step)
+            "GMAIL_READ" -> executeGmailRead(step)
+            "DRIVE_READ" -> executeDriveRead(step)
             // 1.11.0-PRO (self-extension): the T-NO-HANDLER marker
             // names the trigger for the detector (§2.2) while keeping
             // the v1 "Unknown step kind:" wording intact.
@@ -1592,6 +1600,78 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }
     }
 
+    // ---- Google steps (Track E #27) ----
+    //
+    // Detail format (parseDetailValue = no spaces; parseDetailRest =
+    // rest-of-string up to ';'):
+    //   GMAIL_SEND: "to=a@b.com; subject=Hi there; body=hello world"
+    //     (body LAST — it may contain spaces; ';' ends it)
+    //   GMAIL_READ: "q=from:x subject:y; max=5"
+    //   DRIVE_READ: "file_id=<drive file id>"
+    // GMAIL_SEND is a mutating send: the existing gateStep runs
+    // before executeStep for every step, and PAY_WORDS already
+    // contains "send"/"bhej" — a step whose title/detail says send
+    // gets the gate's sensitive confirmation. No Google token lives
+    // on the phone; every call is hub-signed (GoogleClient).
+    // No Google account -> Blocked with the exact AI Brain path
+    // (same wording discipline as the GitHub PAT Blocked message).
+
+    private suspend fun executeGmailSend(step: PlanStep): StepOutcome {
+        val to = parseDetailValue(step.detail, "to")
+            ?: return StepOutcome.Failed("GMAIL_SEND me to= (email) nahi diya gaya.")
+        val subject = parseDetailRest(step.detail, "subject").orEmpty()
+        val body = parseDetailRest(step.detail, "body").orEmpty()
+        val context = engine.planContext()
+        return when (val r = GoogleClient.gmailSend(context, to, subject, body)) {
+            is GoogleClient.SendResult.Ok -> StepOutcome.Done("Gmail sent (id ${r.messageId}) to $to")
+            is GoogleClient.SendResult.Err -> {
+                if (r.message.contains("connect nahi hai")) StepOutcome.Blocked(r.message)
+                else StepOutcome.Failed(r.message.take(200))
+            }
+        }
+    }
+
+    private suspend fun executeGmailRead(step: PlanStep): StepOutcome {
+        val q = parseDetailRest(step.detail, "q")
+        val max = parseDetailValue(step.detail, "max")?.toIntOrNull()?.coerceIn(1, 10) ?: 5
+        val context = engine.planContext()
+        return when (val r = GoogleClient.gmailRead(context, q, max)) {
+            is GoogleClient.ReadResult.Ok -> {
+                if (r.messages.isEmpty()) {
+                    StepOutcome.Done("Gmail: koi message nahi mila" + if (!q.isNullOrBlank()) " (q=$q)" else "")
+                } else {
+                    val evidence = r.messages.joinToString("; ") { "'${it.subject}' (${it.from})" }.take(500)
+                    StepOutcome.Done("Gmail: ${r.messages.size} message — $evidence")
+                }
+            }
+            is GoogleClient.ReadResult.Err -> {
+                if (r.message.contains("connect nahi hai")) StepOutcome.Blocked(r.message)
+                else StepOutcome.Failed(r.message.take(200))
+            }
+        }
+    }
+
+    private suspend fun executeDriveRead(step: PlanStep): StepOutcome {
+        val fileId = parseDetailValue(step.detail, "file_id")
+            ?: return StepOutcome.Failed("DRIVE_READ me file_id nahi diya gaya.")
+        val context = engine.planContext()
+        return when (val r = GoogleClient.driveRead(context, fileId)) {
+            is GoogleClient.DriveResult.Ok -> {
+                val note = r.file.contentNote
+                if (note != null) {
+                    StepOutcome.Done("Drive: '${r.file.name}' (${r.file.mimeType}) — content nahi mila: $note")
+                } else {
+                    val preview = (r.file.text.orEmpty()).take(500)
+                    StepOutcome.Done("Drive: '${r.file.name}' (${r.file.mimeType}) — $preview")
+                }
+            }
+            is GoogleClient.DriveResult.Err -> {
+                if (r.message.contains("connect nahi hai")) StepOutcome.Blocked(r.message)
+                else StepOutcome.Failed(r.message.take(200))
+            }
+        }
+    }
+
     // ---- HTTP_CHECK ----
 
     private suspend fun executeHttpCheck(step: PlanStep): StepOutcome {
@@ -1636,6 +1716,20 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 when (val r = httpCheck(url, marker)) {
                     is StepOutcome.Done -> r
                     else -> null
+                }
+            }
+            // Track E #27: GMAIL_READ re-checks live (query returns
+            // >=1 message). GMAIL_SEND / DRIVE_READ are not
+            // re-verifiable without side effects — null, like the
+            // other mutating steps.
+            "GMAIL_READ" -> {
+                val context = engine.planContext()
+                val q = parseDetailRest(step.detail, "q")
+                val max = parseDetailValue(step.detail, "max")?.toIntOrNull()?.coerceIn(1, 10) ?: 5
+                when (val r = GoogleClient.gmailRead(context, q, max)) {
+                    is GoogleClient.ReadResult.Ok ->
+                        if (r.messages.isNotEmpty()) StepOutcome.Done("Gmail: ${r.messages.size} message mil gaye") else null
+                    is GoogleClient.ReadResult.Err -> null
                 }
             }
             else -> null

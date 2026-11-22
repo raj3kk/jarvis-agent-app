@@ -2802,6 +2802,14 @@ fun AiBrainSettingsScreen(
             }
         }
 
+        // Track E #27: Google — Gmail & Drive consent card (own file,
+        // like PairingCard) — directly under Connected accounts.
+        GoogleConnectCard()
+
+        // M-I-30 (1.14.0): Scheduled Jobs — Cron Manager card (own
+        // file, like PairingCard) — directly under GoogleConnectCard.
+        CronManagerCard()
+
         // 1.6.0 (Phase 2, 2b-1): Control-plane pairing — Ed25519
         // keypair + hub register. Poora card apni file me hai
         // (PairingCard.kt); yahan sirf ek line ka call hai.
