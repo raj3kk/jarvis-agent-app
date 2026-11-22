@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 42
-        versionName = "1.7.0-PRO"
+        versionCode = 43
+        versionName = "1.7.1"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -151,4 +151,11 @@ dependencies {
     // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
     // broke CI dependency resolution on 2026-11-02, so it is NOT used.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+
+    // 1.7.1 (I1): unit tests for on-device document memory
+    // (DocumentMemoryTest). JUnit4 for the pure search/chunk logic;
+    // Robolectric so the file-backed store can be tested with a real
+    // Context (filesDir) on the JVM — no emulator, no device.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.11.1")
 }

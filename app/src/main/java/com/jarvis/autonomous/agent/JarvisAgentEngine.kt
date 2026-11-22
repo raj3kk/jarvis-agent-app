@@ -10,6 +10,10 @@ import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.DocumentMemoryStore
+import com.jarvis.autonomous.data.DocumentSearch
+import com.jarvis.autonomous.data.DocumentText
+import com.jarvis.autonomous.data.FileDocumentStorage
 import com.jarvis.autonomous.data.LearnedRoutine
 import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.LearnedStep
@@ -68,6 +72,12 @@ class JarvisAgentEngine(
     private val llmClient = LlmClient(context, prefs)
     private val learnedRoutineStore = LearnedRoutineStore(context)
     private val memoryIndex = MemoryIndex(context)
+    // I1 (1.7.1): on-device document memory — file-backed, offline,
+    // never uploaded (see data/DocumentMemory.kt). Owned here like
+    // memoryIndex above; the UI holds its own instance over the same
+    // files (the store keeps no in-memory cache, so both see the
+    // same data).
+    private val documentMemory = DocumentMemoryStore(FileDocumentStorage(context))
     // 1.4.21 Agent Mode: planner + executor, owned by the engine
     // (same ownership shape as llmClient above). Lazy so the
     // executor receives a fully-constructed engine.
@@ -426,6 +436,60 @@ class JarvisAgentEngine(
     internal fun planIsYes(reply: String): Boolean =
         isYesReply(reply) || isAffirmativeReply(reply.lowercase())
     internal fun planMemoryIndex(): MemoryIndex = memoryIndex
+    internal fun planDocumentMemory(): DocumentMemoryStore = documentMemory
+
+    /**
+     * I1 (1.7.1): save a shown document into on-device memory.
+     * Explicit saves only — the engine never auto-saves a turn as a
+     * document. Returns the store result (ok/id/evicted ids). The
+     * text stays on the phone; this function performs no network call.
+     */
+    fun rememberDocument(title: String, text: String, source: String): DocumentMemoryStore.SaveResult {
+        val result = runCatching {
+            documentMemory.saveDocument(title, text, source)
+        }.getOrElse {
+            DocumentMemoryStore.SaveResult(ok = false, reason = "save_error")
+        }
+        if (result.ok) {
+            // Metadata only in the log — never doc text.
+            JarvisStateRepository.addLog(
+                "Document yaad rakha: '${result.title}' (${result.charCount} chars)"
+            )
+        }
+        return result
+    }
+
+    /**
+     * I1 (1.7.1): offline direct recall. When there is no network and
+     * a saved document strongly matches the goal, answer straight from
+     * the on-device snippet — no LLM call, no network, nothing leaves
+     * the phone. Returns true only when it answered (the caller must
+     * return). A weak/no match returns false and the normal flow runs.
+     */
+    private fun tryDocumentRecall(
+        goal: String,
+        hits: List<com.jarvis.autonomous.data.DocumentHit>
+    ): Boolean {
+        if (isOnline()) return false
+        val strong = hits.firstOrNull {
+            DocumentSearch.isStrongHit(it.score, it.titleMatched)
+        } ?: return false
+        activeTaskJob?.cancel()
+        clearTaskScopedState()
+        activeTaskJob = scope.launch {
+            JarvisStateRepository.addChatMessage("You", goal)
+            persistChat()
+            val answer = "Ye '${strong.title}' se mila — ${strong.snippet} " +
+                "(sirf phone se yaad, offline — internet nahi hai, isliye bahar se kuch nahi manga.)"
+            JarvisStateRepository.addChatMessage("Jarvis", answer)
+            persistChat()
+            JarvisStateRepository.setAgentState(
+                AgentRunState.IDLE, "Document se yaad — offline"
+            )
+            speak(answer, alreadyPostedToChat = true)
+        }
+        return true
+    }
     internal fun planPersistChat() = persistChat()
     internal fun planClearTaskState() = clearTaskScopedState()
     internal fun planLaunch(job: suspend () -> Unit) {
@@ -1209,6 +1273,19 @@ class JarvisAgentEngine(
             trimmed
         }
 
+        // I1 (1.7.1): on-device document recall — local search, no
+        // network. Runs before the agent-mode check: an offline
+        // strong match answers straight from the phone, with no LLM
+        // call and no planner. Online, recalled snippets join the
+        // memory-first context below (labelled, context only).
+        val docHits = runCatching { documentMemory.search(effectiveGoal) }
+            .getOrDefault(emptyList())
+        val recallHits = docHits.filter {
+            DocumentSearch.isRecallHit(it.score, it.titleMatched)
+        }
+        val docContext = DocumentText.buildDocContext(recallHits)
+        if (!isOnline() && tryDocumentRecall(effectiveGoal, docHits)) return
+
         // 1.4.21 Agent Mode: the planner runs when the goal names
         // an external destination (GitHub / Supabase / Vercel /
         // deploy) or the user says "agent mode". Everything else
@@ -1227,12 +1304,15 @@ class JarvisAgentEngine(
 
         // Memory-first consult before the LLM loop: past turns
         // (local MemoryIndex only) are offered to the first LLM
-        // step as context, never as a fabricated answer.
+        // step as context, never as a fabricated answer. I1: saved
+        // documents join the same context, labelled, snippet-only.
         val memorySummaries = memoryIndex.search(effectiveGoal)
             .mapNotNull { memoryIndex.getSummary(it) }
-        val memoryContext = memorySummaries.joinToString(" | ")
+        val turnContext = memorySummaries.joinToString(" | ")
+        val memoryContext = listOf(docContext, turnContext)
+            .filter { it.isNotBlank() }.joinToString("\n")
         if (memoryContext.isNotBlank()) {
-            JarvisStateRepository.addLog("Memory-first: ${memorySummaries.size} pehle ki baat-cheet mili.")
+            JarvisStateRepository.addLog("Memory-first: ${memorySummaries.size} pehle ki baat-cheet, ${recallHits.size} document mile.")
         }
 
         // Cancel any previous running task and start the new multi-step loop

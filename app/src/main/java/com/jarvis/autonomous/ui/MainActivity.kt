@@ -121,6 +121,8 @@ import com.jarvis.autonomous.data.CaptchaStatus
 import com.jarvis.autonomous.data.DocConfirmClient
 import com.jarvis.autonomous.data.DocConfirmState
 import com.jarvis.autonomous.data.DocConfirmStatus
+import com.jarvis.autonomous.data.DocumentMemoryStore
+import com.jarvis.autonomous.data.FileDocumentStorage
 import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.PlanState
@@ -835,6 +837,20 @@ fun CommandCenterScreen(
         var docJobIdInput by remember { mutableStateOf("") }
         var docFieldsInput by remember { mutableStateOf("name, dob, document_number") }
         var docLoading by remember { mutableStateOf(false) }
+        // I1 (1.7.1): on-device document memory — the store instance
+        // is shared by the ConfirmCard branch (auto-save on confirm)
+        // and the save form below. Same files the engine reads; the
+        // store keeps no in-memory cache, so both see the same data.
+        val docStore = remember {
+            DocumentMemoryStore(FileDocumentStorage(whiteboardContext))
+        }
+        var docSaveTitle by remember { mutableStateOf("") }
+        var docSaveText by remember { mutableStateOf("") }
+        var docSaveNote by remember { mutableStateOf("") }
+        var docListVersion by remember { mutableStateOf(0) }
+        val savedDocs = remember(docListVersion) {
+            runCatching { docStore.listDocuments() }.getOrDefault(emptyList())
+        }
         if (docConfirm != null) {
             val doc = docConfirm!!
             ConfirmCard(
@@ -858,6 +874,21 @@ fun CommandCenterScreen(
                                     "Jarvis",
                                     "Document confirm ho gaya — doc job #${doc.docJobId}."
                                 )
+                                // I1: confirmed fields are ALSO saved
+                                // on-device (source "doc-confirm") so a
+                                // later turn can recall them offline.
+                                // The fields were already extracted
+                                // server-side — this adds no new upload.
+                                val fieldsText = result.fields.entries
+                                    .joinToString("\n") { "${it.key}: ${it.value}" }
+                                withContext(Dispatchers.IO) {
+                                    docStore.saveDocument(
+                                        "Document #${doc.docJobId}",
+                                        fieldsText,
+                                        "doc-confirm"
+                                    )
+                                }
+                                docListVersion++
                             }
                             is DocConfirmClient.ConfirmResult.Missing -> {
                                 JarvisStateRepository.setDocConfirm(
@@ -944,6 +975,91 @@ fun CommandCenterScreen(
                             if (docLoading) "Extract ho raha hai…" else "Extract dikhao",
                             color = Color.White, fontWeight = FontWeight.Bold
                         )
+                    }
+                    // I1 (1.7.1): on-device document memory — paste
+                    // text once, Jarvis phone par yaad rakhta hai.
+                    // Server par kuch nahi bheja jata; offline bhi
+                    // recall hota hai; app uninstall par delete.
+                    Text(
+                        "Phone par yaad rakho (on-device)",
+                        fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF2E7D5B)
+                    )
+                    Text(
+                        "Document ka text yahan paste karo — sirf is phone par save hoga, server par nahi jayega. Baad me uske baare me puchho to Jarvis isi se yaad karke batayega (offline bhi).",
+                        fontSize = 12.sp, color = Color(0xFF3B2F2A)
+                    )
+                    OutlinedTextField(
+                        value = docSaveTitle,
+                        onValueChange = { docSaveTitle = it },
+                        label = { Text("Title (jaise: Aadhaar card, Bijli bill)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = docSaveText,
+                        onValueChange = { docSaveText = it },
+                        label = { Text("Document ka text paste karo") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 3
+                    )
+                    Button(
+                        onClick = {
+                            val title = docSaveTitle
+                            val text = docSaveText
+                            uiScope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    docStore.saveDocument(title, text, "pasted")
+                                }
+                                if (result.ok) {
+                                    docSaveTitle = ""
+                                    docSaveText = ""
+                                    docSaveNote = "Yaad rakh liya: '${result.title}' (${result.chunkCount} hisse). App band karke bhi rahega."
+                                    docListVersion++
+                                } else {
+                                    docSaveNote = "Save nahi hua — khaali text save nahi hota."
+                                }
+                            }
+                        },
+                        enabled = docSaveText.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                    ) {
+                        Text("Yaad rakho", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    if (docSaveNote.isNotBlank()) {
+                        Text(docSaveNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
+                    }
+                    if (savedDocs.isNotEmpty()) {
+                        Text(
+                            "Yaad rakhe documents (${savedDocs.size}/50)",
+                            fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF2E7D5B)
+                        )
+                        for (saved in savedDocs) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(saved.title, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(saved.createdAtMs))} · ${saved.charCount} chars · ${saved.source}",
+                                        fontSize = 11.sp, color = Color(0xFF8A7A70)
+                                    )
+                                }
+                                Text(
+                                    "Delete",
+                                    fontSize = 12.sp, color = Color(0xFFB85C38),
+                                    modifier = Modifier.clickable {
+                                        val id = saved.id
+                                        uiScope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                docStore.deleteDocument(id)
+                                            }
+                                            docListVersion++
+                                        }
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             }

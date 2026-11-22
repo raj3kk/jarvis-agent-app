@@ -32,7 +32,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (36 = 1.5.2-PRO) — BUMP THIS FLOOR ON
+      # last delivered vc (42 = 1.7.0-PRO) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,10 +41,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=41, previous delivered 1.6.2-PRO)"
+          echo "versionCode in tree: $VC (floor PREV_VC=42, previous delivered 1.7.0-PRO)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=41
+          PREV_VC=42
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
@@ -97,6 +97,12 @@ jobs:
           keyAlias=$ANDROID_KEY_ALIAS
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
+
+      - name: Run unit tests (I1 device-memory + all unit tests)
+        # 1.7.1 (I1): tests are a gate, not an afterthought — a test
+        # failure fails the build before any APK is assembled. Runs
+        # on the JVM (JUnit4 + Robolectric, no emulator/device).
+        run: ./gradlew testDebugUnitTest --stacktrace
 
       - name: Build Debug & Release APK
         # 2b-3 (B1 fix): no HF_TOKEN env any more — the gated Gemma
