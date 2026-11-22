@@ -13,9 +13,9 @@ data class FcmPushPayload(val title: String, val body: String, val kind: String)
             val body = data["body"]?.trim().orEmpty()
             if (body.isEmpty()) return null
             return FcmPushPayload(
-                title = data["title"]?.trim().takeIf { it.isNotEmpty() } ?: "Jarvis",
+                title = data["title"]?.trim()?.takeIf { it.isNotEmpty() } ?: "Jarvis",
                 body = body,
-                kind = data["kind"]?.trim().takeIf { it.isNotEmpty() } ?: "test"
+                kind = data["kind"]?.trim()?.takeIf { it.isNotEmpty() } ?: "test"
             )
         }
     }
