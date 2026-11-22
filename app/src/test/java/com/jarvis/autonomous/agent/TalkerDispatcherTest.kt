@@ -3,6 +3,7 @@ package com.jarvis.autonomous.agent
 import com.jarvis.autonomous.agent.TalkerDispatcher.TalkerDecision
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -98,5 +99,78 @@ class TalkerDispatcherTest {
         assertTrue(TalkerDispatcher.isStatusQuestion("kitna bacha hai"))
         assertFalse(TalkerDispatcher.isStatusQuestion("ek website banao"))
         assertFalse(TalkerDispatcher.isStatusQuestion("namaste"))
+    }
+
+    // ---- 1.9.0 (v2) — explain-once / memory turns ----
+
+    @Test
+    fun explainOnceExtractsInstructionAfterTrigger() {
+        assertEquals(
+            "aage se pehle preview check karo",
+            TalkerDispatcher.extractInstruction("yaad rakhna, aage se pehle preview check karo")
+        )
+        assertEquals(
+            "deploy se pehle build verify karo",
+            TalkerDispatcher.extractInstruction("aage se deploy se pehle build verify karo")
+        )
+        assertEquals(
+            "pehle mujhse poochhna",
+            TalkerDispatcher.extractInstruction("hamesha pehle mujhse poochhna")
+        )
+        assertTrue(TalkerDispatcher.isExplainOnceTurn("yaad rakhna, aage se pehle preview check karo"))
+        assertTrue(TalkerDispatcher.isExplainOnceTurn("note kar lo, message bhejne se pehle naam poochho"))
+    }
+
+    @Test
+    fun bareTriggerIsNotAnInstruction() {
+        assertNull(TalkerDispatcher.extractInstruction("yaad rakhna"))
+        assertFalse(TalkerDispatcher.isExplainOnceTurn("yaad rakhna"))
+        assertTrue(TalkerDispatcher.isBareExplainOnceTurn("yaad rakhna"))
+        assertFalse(TalkerDispatcher.isBareExplainOnceTurn("yaad rakhna, aage se preview check karo"))
+    }
+
+    @Test
+    fun hameshaNeedsKarnaOrPoochh() {
+        // "hamesha aisa hota hai" is chat, not a teaching turn.
+        assertNull(TalkerDispatcher.extractInstruction("hamesha aisa hota hai"))
+        assertFalse(TalkerDispatcher.isExplainOnceTurn("hamesha aisa hota hai"))
+        assertEquals(
+            "pehle preview check karna",
+            TalkerDispatcher.extractInstruction("hamesha pehle preview check karna")
+        )
+    }
+
+    @Test
+    fun overLongInstructionOffersDocumentPath() {
+        val long = "yaad rakhna " + "x".repeat(281)
+        assertNull(TalkerDispatcher.extractInstruction(long))
+        assertTrue(TalkerDispatcher.isLongExplainOnceTurn(long))
+        assertFalse(TalkerDispatcher.isLongExplainOnceTurn("yaad rakhna, preview check karo"))
+    }
+
+    @Test
+    fun listAndForgetTurns() {
+        assertTrue(TalkerDispatcher.isListMemoryTurn("kya yaad rakha hai?"))
+        assertTrue(TalkerDispatcher.isListMemoryTurn("kya kya yaad hai"))
+        // "kya yaad hai" anywhere in the turn is a list turn.
+        assertTrue(TalkerDispatcher.isListMemoryTurn("kya yaad hai tumhe"))
+        assertFalse(TalkerDispatcher.isListMemoryTurn("yaad hai kya tumhe"))
+        assertTrue(TalkerDispatcher.isForgetTurn("wo instruction bhool jao"))
+        assertTrue(TalkerDispatcher.isForgetTurn("ye mat yaad rakhna"))
+        assertFalse(TalkerDispatcher.isForgetTurn("yaad rakhna, preview check karo"))
+        assertTrue(TalkerDispatcher.isForgetPatternTurn("wo tareeka bhool jao"))
+        assertTrue(TalkerDispatcher.isForgetPatternTurn("seekha hua tareeka bhool jao"))
+        assertFalse(TalkerDispatcher.isForgetPatternTurn("wo instruction bhool jao"))
+    }
+
+    @Test
+    fun disableAndReenableTurns() {
+        assertTrue(TalkerDispatcher.isDisablePatternTurn("ye tareeka mat use karo"))
+        assertTrue(TalkerDispatcher.isDisablePatternTurn("dobara mat use karna"))
+        assertTrue(TalkerDispatcher.isPermanentDisableTurn("dobara mat use karna"))
+        assertFalse(TalkerDispatcher.isPermanentDisableTurn("ye tareeka mat use karo"))
+        assertFalse(TalkerDispatcher.isDisablePatternTurn("wo tareeka bhool jao"))
+        assertTrue(TalkerDispatcher.isReenablePatternTurn("seekha hua phir se use karo"))
+        assertFalse(TalkerDispatcher.isReenablePatternTurn("phir se banao"))
     }
 }

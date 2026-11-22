@@ -57,10 +57,21 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     // at the start of every verify call (never stale).
     private var lastSupabaseVerifyMismatch: String? = null
 
+    // 1.9.0 (v2): the plan that last reached finishPlan — the
+    // Talker verification gate reads it for fixMissingRefs
+    // (re-run only the failed steps) and for pattern extraction
+    // (learn only from VERIFIED DONE). Set in finishPlan only.
+    internal var lastFinishedPlan: AgentPlan? = null
+        private set
+
     // ---- Outcomes ----
 
     private sealed interface StepOutcome {
-        data class Done(val evidence: String) : StepOutcome
+        /** `refs` are the typed evidence refs (DESIGN §4.2) this
+         *  step proved — the Talker re-reads them before saying
+         *  "ho gaya". Empty when the step has no re-checkable
+         *  artifact. */
+        data class Done(val evidence: String, val refs: List<EvidenceRef> = emptyList()) : StepOutcome
         data class Failed(val reason: String) : StepOutcome
         /** Question already asked (missing info) or gate paused — park as BLOCKED. */
         data class Blocked(val reason: String) : StepOutcome
@@ -94,8 +105,17 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     /** Fresh agent-mode task from a user goal (called from the
      *  engine's handleUserCommand plan branch, already inside
-     *  activeTaskJob). */
-    suspend fun startNewPlan(goal: String) {
+     *  activeTaskJob).
+     *
+     *  1.9.0 (v2, DESIGN §5.4): [learnedHint] / [instructionHint]
+     *  are guidance, never orders — they prepend ONE hint line to
+     *  the planner prompt. The planner may still ask the user when
+     *  a value is genuinely missing. */
+    suspend fun startNewPlan(
+        goal: String,
+        learnedHint: String = "",
+        instructionHint: String = ""
+    ) {
         val context = engine.planContext()
         // Q10: a new agent-mode task overwrites agent_plan.json —
         // one chat line warning if replacing an unfinished plan,
@@ -131,8 +151,20 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }
         val recentChat = JarvisStateRepository.chatHistory.value.takeLast(6)
             .map { "${it.sender}: ${it.message}" }
+        // 1.9.0 (v2, DESIGN §5.4): learned guidance reaches the
+        // planner as ONE hint line in the prompt (hint — zaroori
+        // nahi). The stored plan goal stays the user's own words.
+        val planGoal = buildString {
+            append(goal)
+            if (learnedHint.isNotBlank()) {
+                append("\nPehle seekha hua tareeka (hint — zaroori nahi): $learnedHint. Agar context badla ho to ignore karo.")
+            }
+            if (instructionHint.isNotBlank()) {
+                append("\nYaad rakha: $instructionHint")
+            }
+        }
         when (val result = engine.planLlm().planNext(
-            goal,
+            planGoal,
             engine.planAnsweredClarifications().toList(),
             recentChat
         )) {
@@ -230,6 +262,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         var current = plan
         // Steps that already had one ask-driven re-run in this run.
         val retriedAfterAsk = mutableSetOf<String>()
+        // 1.9.0 (v2, DESIGN §4.2): typed evidence refs collected
+        // from DONE steps — finishPlan attaches them to the DONE
+        // claim so the Talker can re-read them.
+        val collectedRefs = ArrayList<EvidenceRef>()
+        // 1.9.0 (v2, DESIGN §3.2): per-step durations for the ETA
+        // (elapsedPerStep × remainingSteps, plans only).
+        val stepDurationsMs = ArrayList<Long>()
         try {
             JarvisStateRepository.setCurrentGoal(current.goal)
             publish(current)
@@ -336,8 +375,18 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     AgentRunState.EXECUTING_STEP,
                     "Plan ${idx + 1}/${current.steps.size}: ${step.title}…"
                 )
+                // 1.9.0 (v2, DESIGN §3.2): plan step START milestone
+                // (best-effort — a dropped line is invisible, a
+                // crashed plan is not). ETA from the average finished
+                // step duration; -1 while no step has finished yet.
+                val stepStartMs = System.currentTimeMillis()
+                emitPlanProgress(
+                    current, idx, phase = "START",
+                    etaSeconds = planEtaSeconds(stepDurationsMs, current.steps.size - idx)
+                )
                 when (val outcome = executeStep(current.steps[idx], current)) {
                     is StepOutcome.Done -> {
+                        stepDurationsMs.add(System.currentTimeMillis() - stepStartMs)
                         current = updateStep(current, step.id) {
                             it.copy(state = PlanState.DONE, evidence = outcome.evidence)
                         }
@@ -349,6 +398,12 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         engine.planPersistChat()
                         JarvisStateRepository.addLog(
                             "Plan step ${idx + 1} ${step.kind} DONE ${outcome.evidence.take(120)}"
+                        )
+                        collectedRefs.addAll(outcome.refs)
+                        // 1.9.0 (v2): step DONE milestone.
+                        emitPlanProgress(
+                            current, idx, phase = "DONE",
+                            etaSeconds = planEtaSeconds(stepDurationsMs, current.steps.size - idx - 1)
                         )
                         idx++
                     }
@@ -404,7 +459,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     }
                 }
             }
-            finishPlan(current, allDone = true)
+            finishPlan(current, allDone = true, refs = collectedRefs)
         } catch (ce: CancellationException) {
             // User stop / new task / service destroy: demote the
             // RUNNING step to PENDING so the plan stays resumable.
@@ -427,11 +482,64 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     // ---- Terminal paths ----
 
+    /** 1.9.0 (v2, DESIGN §3.2): plan step milestone emission.
+     *  Best-effort — never throws into the plan. */
+    private fun emitPlanProgress(
+        plan: AgentPlan,
+        idx: Int,
+        phase: String,
+        etaSeconds: Long
+    ) {
+        val commandId = engine.planActiveCommandId() ?: return
+        val step = plan.steps.getOrNull(idx) ?: return
+        val total = plan.steps.size
+        val fraction = when (phase) {
+            "DONE" -> (idx + 1).toDouble() / total.toDouble()
+            else -> idx.toDouble() / total.toDouble()
+        }
+        val nextLabel = if (idx + 1 < total) plan.steps[idx + 1].title else ""
+        runCatching {
+            engine.planReportProgress(
+                ExecutorProgress(
+                    commandId = commandId,
+                    stepIndex = idx + 1,
+                    stepTotal = total,
+                    stepLabel = step.title,
+                    detail = "${step.kind} ${plan.goal.take(60)}",
+                    progressFraction = fraction,
+                    etaSeconds = etaSeconds,
+                    isMilestone = true,
+                    phase = phase,
+                    nextLabel = nextLabel
+                )
+            )
+        }
+    }
+
+    /** ETA hint: average finished-step duration × remaining steps, in seconds (-1 when unknown). */
+    private fun planEtaSeconds(finishedDurationsMs: List<Long>, remainingSteps: Int): Long {
+        if (finishedDurationsMs.isEmpty() || remainingSteps <= 0) return -1L
+        val avgMs = finishedDurationsMs.sum() / finishedDurationsMs.size
+        return (avgMs * remainingSteps) / 1000L
+    }
+
     /** ONE summary speak (replaces "Aur kya karna hai?") + chat
      *  lines + memory index. A plan ends only here (or via
      *  abort/park): every step DONE, or terminally BLOCKED/FAILED
-     *  after asking. */
-    private suspend fun finishPlan(plan: AgentPlan, allDone: Boolean) {
+     *  after asking.
+     *
+     *  1.9.0 (v2, DESIGN §4.5): the speak MOVES behind the
+     *  verification gate for DONE. finishPlan posts the summary to
+     *  chat (the plan's own log), persists the plan, then reports
+     *  DONE with chatResult=true, speakResult=false and the typed
+     *  refs — and lets the engine verify and speak. FAILED keeps
+     *  speaking its own summary (it is not verified). */
+    private suspend fun finishPlan(
+        plan: AgentPlan,
+        allDone: Boolean,
+        refs: List<EvidenceRef> = emptyList()
+    ) {
+        lastFinishedPlan = plan
         val context = engine.planContext()
         val done = plan.steps.filter { it.state == PlanState.DONE }
         val failed = plan.steps.filter { it.state == PlanState.FAILED || it.state == PlanState.BLOCKED }
@@ -467,15 +575,28 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         )
         JarvisStateRepository.setCurrentGoal("")
         engine.planClearTaskState()
-        // 1.8.0: DONE/FAILED, unannounced — the summary is already
-        // fully in chat AND spoken below.
-        engine.planReportExecutorResult(
-            if (allDone) ExecutorResultStatus.DONE else ExecutorResultStatus.FAILED,
-            summary.take(300),
-            if (allDone) "plan complete" else "plan stopped: ${failed.joinToString(", ") { it.title }}",
-            speakResult = false, chatResult = false
-        )
-        engine.planSpeak(summary)
+        if (allDone) {
+            // 1.9.0 (v2): DONE is chat-posted, NOT spoken here —
+            // the verification gate speaks the verdict. Typed refs
+            // travel on the result for the Talker's re-read.
+            engine.planReportExecutorResult(
+                ExecutorResultStatus.DONE,
+                summary.take(300),
+                "plan complete",
+                speakResult = false, chatResult = true,
+                evidenceJson = EvidenceRefs.toJson(refs)
+            )
+        } else {
+            // FAILED is not verified — the summary is spoken here,
+            // exactly as v1 did.
+            engine.planReportExecutorResult(
+                ExecutorResultStatus.FAILED,
+                summary.take(300),
+                "plan stopped: ${failed.joinToString(", ") { it.title }}",
+                speakResult = false, chatResult = false
+            )
+            engine.planSpeak(summary)
+        }
     }
 
     /** Decline aborts the WHOLE plan (not just the step): the
@@ -816,8 +937,21 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         if (code != 200) return StepOutcome.Failed("Preview GET HTTP $code — preview nahi khula.")
         val files = ProjectStore.listProjects(context)
             .firstOrNull { it.name == projectName }?.files ?: emptyList()
+        // 1.9.0 (v2, DESIGN §4.2): typed refs — the Talker re-reads
+        // the file list + preview instead of trusting this string.
+        val refs = listOf(
+            EvidenceRef(
+                EvidenceKind.FILE_LIST, "project:$projectName", "files_present",
+                files.joinToString(",")
+            ),
+            EvidenceRef(
+                EvidenceKind.PREVIEW_HTTP, "preview:$projectName", "http_200",
+                ProjectStore.localhostUrl(projectName)
+            )
+        )
         return StepOutcome.Done(
-            "validation OK; files: ${files.joinToString(", ").take(200)}; preview ${ProjectStore.localhostUrl(projectName)}"
+            "validation OK; files: ${files.joinToString(", ").take(200)}; preview ${ProjectStore.localhostUrl(projectName)}",
+            refs = refs
         )
     }
 
@@ -869,8 +1003,17 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 val result = pushToGithub(token, repo, projectName, files, context)
                 // Full SHA in evidence (verify-before-re-run needs
                 // it for the tree GET); display sites truncate.
+                // 1.9.0 (v2): typed GITHUB_COMMIT ref for the Talker.
                 StepOutcome.Done(
-                    "commit ${result.sha}; repo https://github.com/${result.owner}/${result.repo}; branch ${result.defaultBranch}"
+                    "commit ${result.sha}; repo https://github.com/${result.owner}/${result.repo}; branch ${result.defaultBranch}",
+                    refs = listOf(
+                        EvidenceRef(
+                            EvidenceKind.GITHUB_COMMIT,
+                            "github:${result.owner}/${result.repo}",
+                            "commit_in_tree",
+                            result.sha
+                        )
+                    )
                 )
             } catch (e: IllegalStateException) {
                 StepOutcome.Failed("GitHub ${e.message?.take(200)}")
@@ -1100,7 +1243,19 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         "Supabase verify fail: $detail. BUILD dobara chalao ya schema.sql check karo."
                     )
                 }
-                StepOutcome.Done("tables: ${expected.keys.joinToString(", ")} (project $ref)")
+                // 1.9.0 (v2): typed SUPABASE_TABLES ref for the Talker.
+                val tablesValue = expected.entries.joinToString(";") { (table, cols) ->
+                    "$table:${cols.joinToString(",")}"
+                }
+                StepOutcome.Done(
+                    "tables: ${expected.keys.joinToString(", ")} (project $ref)",
+                    refs = listOf(
+                        EvidenceRef(
+                            EvidenceKind.SUPABASE_TABLES, "supabase:$ref",
+                            "columns_present", tablesValue
+                        )
+                    )
+                )
             } catch (e: IllegalStateException) {
                 StepOutcome.Failed("Supabase ${e.message?.take(200)}")
             } catch (e: IOException) {
@@ -1318,8 +1473,17 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                                     "Vercel deploy READY hai par live URL HTTP $liveCode de raha hai — deploy verify nahi hua."
                                 )
                             }
+                            // 1.9.0 (v2): typed VERCEL_DEPLOY ref for the Talker.
                             return@withContext StepOutcome.Done(
-                                "READY; url=https://$deploymentUrl; id=$deploymentId"
+                                "READY; url=https://$deploymentUrl; id=$deploymentId",
+                                refs = listOf(
+                                    EvidenceRef(
+                                        EvidenceKind.VERCEL_DEPLOY,
+                                        "vercel:$deploymentId",
+                                        "deployment_ready",
+                                        "https://$deploymentUrl"
+                                    )
+                                )
                             )
                         }
                         "ERROR", "CANCELED" -> {
@@ -1462,6 +1626,208 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 StepOutcome.Done("verified after kill: READY; url=$url; id=$deploymentId")
             } catch (e: Exception) {
                 null
+            }
+        }
+    }
+
+    // ---- 1.9.0 (v2) Talker verification: fix + typed re-reads ----
+
+    /**
+     * FIX_REQUEST handler (DESIGN §4.6): re-run ONLY the step(s)
+     * that own the failed refs, using the existing `executeStep`
+     * for that step kind, then re-run that step's `verify*` via the
+     * step's own Done outcome (which carries fresh refs). It does
+     * not re-run unrelated DONE steps and never re-asks an answered
+     * question (the `answeredClarifications` list still applies —
+     * executeStep reads it through the engine). A step whose fix
+     * outcome is Failed / Blocked / Aborted leaves its ref(s) in
+     * STILL_MISSING. Runs on the engine's fix job (bounded by
+     * min(5 min, remaining time) by the caller).
+     */
+    suspend fun fixMissingRefs(
+        missingRefs: List<String>,
+        commandId: String,
+        attempt: Int
+    ): ExecutorFixResult {
+        val plan = lastFinishedPlan
+            ?: return ExecutorFixResult(
+                commandId = commandId,
+                attempt = attempt,
+                status = FixResultStatus.STILL_MISSING,
+                missingRefs = missingRefs,
+                detail = "no finished plan to fix"
+            )
+        var current = plan
+        val stillMissing = ArrayList<String>()
+        val freshRefs = ArrayList<EvidenceRef>()
+        val fixedLabels = ArrayList<String>()
+        for (refId in missingRefs) {
+            val stepKind = when {
+                refId.startsWith("preview_http:") || refId.startsWith("file_list:") -> "BUILD"
+                refId.startsWith("github_commit:") -> "GITHUB_PUSH"
+                refId.startsWith("supabase_tables:") -> "SUPABASE_TABLES"
+                refId.startsWith("vercel_deploy:") -> "VERCEL_DEPLOY"
+                else -> null
+            }
+            if (stepKind == null) {
+                stillMissing.add(refId)
+                continue
+            }
+            val step = current.steps.firstOrNull { it.kind == stepKind }
+            if (step == null) {
+                stillMissing.add(refId)
+                continue
+            }
+            val outcome = runCatching { executeStep(step, current) }.getOrElse { e ->
+                StepOutcome.Failed(
+                    "fix error: ${(e.message ?: e.javaClass.simpleName).take(100)}"
+                )
+            }
+            when (outcome) {
+                is StepOutcome.Done -> {
+                    current = updateStep(current, step.id) {
+                        it.copy(state = PlanState.DONE, evidence = outcome.evidence)
+                    }
+                    saveAndPublish(current)
+                    freshRefs.addAll(outcome.refs)
+                    fixedLabels.add(step.title)
+                }
+                else -> stillMissing.add(refId)
+            }
+        }
+        lastFinishedPlan = current
+        return if (stillMissing.isEmpty()) {
+            ExecutorFixResult(
+                commandId = commandId,
+                attempt = attempt,
+                status = FixResultStatus.FIXED,
+                freshEvidenceJson = EvidenceRefs.toJson(
+                    freshRefs.distinctBy { it.kind to it.ref }
+                ),
+                detail = "fixed: ${fixedLabels.joinToString(", ")}".take(200)
+            )
+        } else {
+            ExecutorFixResult(
+                commandId = commandId,
+                attempt = attempt,
+                status = FixResultStatus.STILL_MISSING,
+                missingRefs = stillMissing,
+                detail = "still missing: ${stillMissing.size} ref(s)"
+            )
+        }
+    }
+
+    /** Files of the last finished plan's BUILD project (the expected
+     *  set for the GitHub tree re-read). Empty when unknown — the
+     *  typed check then proves only that the commit exists. */
+    internal fun planBuildProjectFiles(): List<String> {
+        val plan = lastFinishedPlan ?: return emptyList()
+        val project = resolveProjectName(
+            plan.steps.firstOrNull { it.kind == "BUILD" } ?: return emptyList(), plan
+        ) ?: return emptyList()
+        return ProjectStore.listProjects(engine.planContext())
+            .firstOrNull { it.name == project }?.files ?: emptyList()
+    }
+
+    /**
+     * Typed GitHub re-read (DESIGN §4.3): the same live tree GET
+     * `verifyGithubPush` performs, driven by typed ref fields
+     * instead of regex-parsed free text. The regex path stays for
+     * the kill-resume flow.
+     */
+    internal suspend fun verifyGithubCommitTyped(
+        owner: String,
+        repo: String,
+        sha: String,
+        expectedFiles: List<String>
+    ): TalkerVerificationPolicy.RefOutcome {
+        return withContext(Dispatchers.IO) {
+            try {
+                val token = AgentSecrets.get(engine.planContext(), AgentSecrets.KEY_GITHUB_PAT)
+                if (token.isBlank()) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                val (code, body) = httpGet(
+                    "https://api.github.com/repos/$owner/$repo/git/trees/$sha?recursive=1",
+                    mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json")
+                )
+                if (code == 404) return@withContext TalkerVerificationPolicy.RefOutcome.FAILED
+                if (code !in 200..299) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                if (expectedFiles.isEmpty()) return@withContext TalkerVerificationPolicy.RefOutcome.PASSED
+                val present = mutableSetOf<String>()
+                val treeArr = JSONObject(body).optJSONArray("tree")
+                if (treeArr != null) {
+                    for (i in 0 until treeArr.length()) {
+                        treeArr.optJSONObject(i)?.optString("path", "")
+                            ?.takeIf { it.isNotBlank() }?.let { present.add(it) }
+                    }
+                }
+                if (expectedFiles.all { it in present }) {
+                    TalkerVerificationPolicy.RefOutcome.PASSED
+                } else {
+                    TalkerVerificationPolicy.RefOutcome.FAILED
+                }
+            } catch (e: Exception) {
+                TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+            }
+        }
+    }
+
+    /**
+     * Typed Supabase re-read (DESIGN §4.3): `verifySupabaseTablesNow`
+     * against the typed expected columns. A null result WITH a
+     * recorded column mismatch is a positive failure; a null result
+     * WITHOUT one (network / auth) is UNCHECKABLE.
+     */
+    internal suspend fun verifySupabaseTablesTyped(
+        projectRef: String,
+        expected: Map<String, Set<String>>
+    ): TalkerVerificationPolicy.RefOutcome {
+        return withContext(Dispatchers.IO) {
+            try {
+                val token = AgentSecrets.get(engine.planContext(), AgentSecrets.KEY_SUPABASE_PAT)
+                if (token.isBlank()) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                val verified = verifySupabaseTablesNow(token, projectRef, expected)
+                if (verified != null) return@withContext TalkerVerificationPolicy.RefOutcome.PASSED
+                if (lastSupabaseVerifyMismatch != null) {
+                    TalkerVerificationPolicy.RefOutcome.FAILED
+                } else {
+                    TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                }
+            } catch (e: Exception) {
+                TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+            }
+        }
+    }
+
+    /** Typed Vercel re-read (DESIGN §4.3): deployment READY + live URL 200. */
+    internal suspend fun verifyVercelDeployTyped(
+        deploymentId: String,
+        url: String
+    ): TalkerVerificationPolicy.RefOutcome {
+        return withContext(Dispatchers.IO) {
+            try {
+                val token = AgentSecrets.get(engine.planContext(), AgentSecrets.KEY_VERCEL_TOKEN)
+                if (token.isBlank()) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                val (code, body) = httpGet(
+                    "https://api.vercel.com/v13/deployments/$deploymentId",
+                    mapOf("Authorization" to "Bearer $token")
+                )
+                if (code == 404) return@withContext TalkerVerificationPolicy.RefOutcome.FAILED
+                if (code !in 200..299) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                val state = JSONObject(body).optString("state", "")
+                if (state != "READY") {
+                    return@withContext if (state == "ERROR" || state == "CANCELED") {
+                        TalkerVerificationPolicy.RefOutcome.FAILED
+                    } else {
+                        TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                    }
+                }
+                when (httpGetStatus(url)) {
+                    200 -> TalkerVerificationPolicy.RefOutcome.PASSED
+                    -1 -> TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                    else -> TalkerVerificationPolicy.RefOutcome.FAILED
+                }
+            } catch (e: Exception) {
+                TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
             }
         }
     }

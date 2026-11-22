@@ -32,7 +32,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (43 = 1.7.1) — BUMP THIS FLOOR ON
+      # last delivered vc (44 = 1.8.0) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,14 +41,87 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=43, previous delivered 1.7.1)"
+          echo "versionCode in tree: $VC (floor PREV_VC=44, previous delivered 1.8.0)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=43
+          PREV_VC=44
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
           fi
+
+      # 1.9.0 (v2, DESIGN §5.7): the learned-pattern store is
+      # on-device only — maybeUploadLearnedPattern must never
+      # read it. Fail the build if the uploader's body references
+      # the new store (mirrors the unit test in
+      # LearnedPatternStoreTest.uploaderNeverReadsThePatternStore).
+      - name: Enforce pattern store stays on-device (§5.7)
+        run: |
+          python3 - <<'PY'
+          import sys
+          src = open("app/src/main/java/com/jarvis/autonomous/agent/JarvisAgentEngine.kt").read()
+          idx = src.find("fun maybeUploadLearnedPattern")
+          assert idx >= 0, "maybeUploadLearnedPattern not found"
+          brace = src.index("{", idx)
+          depth, end = 0, brace
+          for i in range(brace, len(src)):
+              if src[i] == "{": depth += 1
+              elif src[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i
+                      break
+          body = src[brace:end]
+          for banned in ("LearnedPatternStore", "PatternStorage", "FilePatternStorage", "LearnedInstruction"):
+              if banned in body:
+                  print(f"FAIL: maybeUploadLearnedPattern references {banned} — patterns must stay on-device")
+                  sys.exit(1)
+          print("§5.7 OK: uploader never reads the pattern store")
+          PY
+
+      # 1.9.0 (v2, DESIGN §4.4): only the VERIFIED line may claim
+      # completion ("Ho gaya bhai!"). Two lines deliberately contain
+      # the words without claiming it — the Q3 UNVERIFIED hedge
+      # ("Ho gaya lagta hai…") and the timeout line ("Time khatm
+      # ho gaya"). Fail the build if any other code line contains
+      # the words (mirrors the unit test in
+      # TalkerVerificationPolicyTest).
+      - name: Verify no completion claim outside the VERIFIED line
+        run: |
+          python3 - <<'PY'
+          import sys
+          path = "app/src/main/java/com/jarvis/autonomous/agent/TalkerVerificationPolicy.kt"
+          src = open(path).read()
+          idx = src.find("fun verifiedLine")
+          assert idx >= 0, "verifiedLine not found"
+          brace = src.index("{", idx)
+          depth, end = 0, brace
+          for i in range(brace, len(src)):
+              if src[i] == "{": depth += 1
+              elif src[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i
+                      break
+          rest = src[:brace] + src[end:]
+          bad = []
+          for line in rest.splitlines():
+              t = line.strip()
+              # Comments state the rule; only code lines are checked.
+              if t.startswith("*") or t.startswith("/**") or t.startswith("*/") or t.startswith("//"):
+                  continue
+              low = t.lower()
+              if "ho gaya" not in low:
+                  continue
+              if "ho gaya lagta hai" in low or "time khatm ho gaya" in low:
+                  continue
+              bad.append(t)
+          if bad:
+              print("FAIL: non-verified code line claims completion:")
+              for l in bad: print("  " + l)
+              sys.exit(1)
+          print("OK: only the VERIFIED line claims completion")
+          PY
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4

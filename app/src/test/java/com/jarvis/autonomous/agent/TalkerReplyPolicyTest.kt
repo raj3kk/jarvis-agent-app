@@ -139,4 +139,72 @@ class TalkerReplyPolicyTest {
         assertEquals(300L, TalkerReplyPolicy.TALKER_ACK_TARGET_MS)
         assertEquals(5_000L, TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS)
     }
+
+    // ---- 1.9.0 (v2) — status from structured progress ----
+
+    private fun planProgress(etaSeconds: Long = 90L, emittedAtMs: Long = 0L) = ExecutorProgress(
+        commandId = "c1", stepIndex = 2, stepTotal = 5, stepLabel = "GitHub push",
+        progressFraction = 0.4, etaSeconds = etaSeconds, emittedAtMs = emittedAtMs
+    )
+
+    private fun loopProgress(emittedAtMs: Long = 0L) = ExecutorProgress(
+        commandId = "c1", stepIndex = 3, stepTotal = 0, stepLabel = "WhatsApp bhejna",
+        progressFraction = -1.0, etaSeconds = -1L, emittedAtMs = emittedAtMs
+    )
+
+    @Test
+    fun statusLineWithProgressNamesPlanStepAndEta() {
+        val line = TalkerReplyPolicy.statusLine(
+            command(), planProgress(), 120_000L, stalled = false, nowMs = 60_000L
+        )
+        assertTrue(line.contains("Step 2/5: GitHub push"))
+        assertTrue(line.contains("lagbhag 1 minute aur"))
+        assertTrue(line.contains("2 minute se chal raha hai"))
+    }
+
+    @Test
+    fun statusLineWithLoopProgressNeverCarriesEtaOrNextStep() {
+        val line = TalkerReplyPolicy.statusLine(
+            command(), loopProgress(), 120_000L, stalled = false, nowMs = 60_000L
+        )
+        assertTrue(line.contains("WhatsApp bhejna"))
+        assertFalse(line.contains("lagbhag"))
+        assertFalse(line.contains("Step "))
+        val progress = TalkerReplyPolicy.progressLine(loopProgress(), "Kuch aur")
+        assertFalse("loops never invent a next step", progress.contains("aage:"))
+        assertEquals("⏳ $progress", TalkerReplyPolicy.progressChatLine(loopProgress(), "Kuch aur"))
+    }
+
+    @Test
+    fun statusLineWithStaleProgressDegradesToElapsedOnly() {
+        val stale = planProgress(emittedAtMs = 0L)
+        val line = TalkerReplyPolicy.statusLine(
+            command(), stale, 600_000L, stalled = true, nowMs = 600_000L
+        )
+        assertFalse("stale step label must not be quoted", line.contains("GitHub push"))
+        assertTrue(line.contains("10 minute se chal raha hai"))
+        assertTrue(line.contains("Pichle 5 minute se koi naya step nahi dikh raha"))
+    }
+
+    @Test
+    fun statusLineWithNoProgressDegradesToElapsedOnly() {
+        val line = TalkerReplyPolicy.statusLine(command(), null, 60_000L, stalled = false, nowMs = 60_000L)
+        assertTrue(line.contains("1 minute se chal raha hai"))
+        assertFalse(line.contains("Step "))
+    }
+
+    @Test
+    fun progressLineVerbsAndNextStep() {
+        val start = planProgress().copy(phase = "START")
+        assertTrue(TalkerReplyPolicy.progressLine(start, "Supabase tables").contains("shuru hua"))
+        assertTrue(TalkerReplyPolicy.progressLine(start, "Supabase tables").contains("aage: Supabase tables"))
+        val done = planProgress().copy(phase = "DONE", stepIndex = 5)
+        val doneLine = TalkerReplyPolicy.progressLine(done, "")
+        // A step "ho gaya" is fine — only a terminal DONE may claim
+        // the whole task; the last step names no next step.
+        assertTrue(doneLine.contains("ho gaya"))
+        assertTrue(doneLine.contains("bas, khatm hone wala hai"))
+        val mid = planProgress().copy(phase = "")
+        assertTrue(TalkerReplyPolicy.progressLine(mid, "Supabase tables").contains("chal raha hai"))
+    }
 }

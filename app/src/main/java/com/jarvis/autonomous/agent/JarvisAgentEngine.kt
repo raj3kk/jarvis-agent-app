@@ -8,18 +8,26 @@ import android.net.NetworkCapabilities
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.ChatSummary
+import com.jarvis.autonomous.data.FilePatternStorage
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.DocumentSearch
 import com.jarvis.autonomous.data.DocumentText
 import com.jarvis.autonomous.data.FileDocumentStorage
+import com.jarvis.autonomous.data.LearnedInstructionMeta
+import com.jarvis.autonomous.data.LearnedPattern
+import com.jarvis.autonomous.data.LearnedPatternMeta
+import com.jarvis.autonomous.data.LearnedPatternStep
+import com.jarvis.autonomous.data.LearnedPatternStore
 import com.jarvis.autonomous.data.LearnedRoutine
 import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.MemoryIndex
+import com.jarvis.autonomous.data.MemoryKeywords
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
+import com.jarvis.autonomous.data.RoutineNormalization
 import com.jarvis.autonomous.data.SaveResult
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
@@ -108,13 +116,91 @@ class JarvisAgentEngine(
     private val unannouncedResultIds = mutableSetOf<String>()
     private var executorTurnAlreadyPosted: Boolean = false
 
+    // 1.9.0 (v2) Talker/Executor — progress, verification, learning.
+    // learnedPatternStore is the NEW on-device pattern/instruction
+    // store (DESIGN §5.1): same I1 filesDir/device-memory/ root, new
+    // record kind. It is NEVER read by maybeUploadLearnedPattern
+    // (CI grep enforces the boundary — see §5.7).
+    private val learnedPatternStore = LearnedPatternStore(FilePatternStorage(context))
+    // Progress speak/chat throttle state (single job at a time, so
+    // one set of counters suffices — DESIGN §3.3).
+    private var lastSpokenProgressAtMs: Long = 0L
+    private var lastSpokenProgressLabel: String? = null
+    private var lastSpokenProgressLabelAtMs: Long = 0L
+    private var lastPostedProgressAtMs: Long = 0L
+    private var lastPostedProgressLabel: String? = null
+    private var lastPostedProgressFraction: Double = -1.0
+    // Verification gate state (DESIGN §4.5): a second DONE for a
+    // command already being verified is dropped — the first verdict
+    // owns the speak. verificationStates carries the command +
+    // original result across async fix rounds.
+    private val verificationInFlight = mutableSetOf<String>()
+    private val verificationStates = mutableMapOf<String, VerificationState>()
+    private val fixAttempts = mutableMapOf<String, Int>()
+    private var lastDeliveredCommand: ExecutorCommand? = null
+    private var lastExecutorWorkKind: ExecutorWorkKind? = null
+    private var lastVerifiedLoopRoutine: LearnedRoutine? = null
+    // Applied-learning bookkeeping (DESIGN §5.4–§5.5): which pattern
+    // rode on which command, so a VERIFIED DONE can reinforce it and
+    // a mid-flight "ye tareeka mat use karo" can penalise it instead.
+    private val appliedPatternByCommand = mutableMapOf<String, String>()
+    private var lastAppliedPatternId: String? = null
+    private var lastAppliedInstructionIds: List<String> = emptyList()
+    private val penalisedPatternIds = mutableSetOf<String>()
+    private val stalledDiagnosticLogged = mutableSetOf<String>()
+    // Loop milestone state (DESIGN §3.2): action-kind changes, every
+    // 3rd verified step, or a > 60 s step. Reset per loop run.
+    private var loopLastActionKind: String = ""
+    private var loopVerifiedSteps: Int = 0
+    // Pending "kaun sa bhool jaun?" number selection (DESIGN §5.8).
+    private var pendingForgetSelection: List<Pair<String, String>>? = null
+
+    /** Verification context held across async fix rounds. */
+    private data class VerificationState(
+        val command: ExecutorCommand,
+        val result: ExecutorResult,
+        val fixFailure: String = "",
+        val fixStepLabel: String = ""
+    )
+
+    /** Guidance found for one EXECUTE turn (DESIGN §5.3–§5.4). */
+    private data class Guidance(
+        val patternId: String?,
+        val patternTitle: String?,
+        val patternHint: String,
+        val instructionHint: String,
+        val instructionIds: List<String>,
+        val noteLines: List<String>,
+        val params: Map<String, String>
+    )
+
     init {
         // The bus listener is the Talker's result voice: every
         // delivered ExecutorResult becomes one chat line + (unless
         // the Executor already spoke this outcome) one spoken line.
         // The listener itself never blocks — it only launches.
         talkerBus.addListener { result ->
-            scope.launch { deliverExecutorResult(result) }
+            scope.launch {
+                if (result.status == ExecutorResultStatus.DONE) {
+                    // v2: DONE claims go through the verification
+                    // gate — the Talker re-reads the artifact before
+                    // anyone says "ho gaya" (DESIGN §4.5).
+                    deliverVerifiedExecutorResult(result)
+                } else {
+                    deliverExecutorResult(result)
+                }
+            }
+        }
+        // v2: progress milestones (throttled speak/chat) and the
+        // fix pair. Listeners never block — they only launch.
+        talkerBus.addProgressListener { progress ->
+            scope.launch { deliverProgress(progress) }
+        }
+        talkerBus.addFixRequestListener { request ->
+            scope.launch { handleFixRequest(request) }
+        }
+        talkerBus.addFixListener { fixResult ->
+            scope.launch { handleFixResult(fixResult) }
         }
     }
     // 1.4.14 (D1): announce dedupe — in-memory only, dies with
@@ -419,6 +505,10 @@ class JarvisAgentEngine(
             // cleared here.
             reportExecutorOutcome(ExecutorResultStatus.CANCELLED, "", "")
         }
+        // 1.9.0 (v2): a cancelled job must never be verified or
+        // fixed later — drop any verification state for it, so a
+        // late DONE cannot speak after the stop line.
+        lastDeliveredCommand?.id?.let { clearVerificationState(it) }
         activeTaskJob?.cancel()
         activeTaskJob = null
         clearTaskScopedState()
@@ -464,6 +554,912 @@ class JarvisAgentEngine(
         }
     }
 
+    // ---- 1.9.0 (v2) Talker/Executor: progress feed (Gap 1) ----
+
+    /**
+     * Progress milestone listener: one throttled spoken line and/or
+     * one throttled chat line per milestone (DESIGN §3.3–§3.4).
+     * Progress never touches the watchdog or the safety net, and a
+     * spoken progress line is never also posted as a second chat
+     * line with different wording — the chat line is the same text
+     * plus the `⏳` marker. After speaking, the state returns to
+     * EXECUTING_STEP only while the command is still running, so a
+     * terminal result that landed mid-speak is never revived.
+     */
+    private suspend fun deliverProgress(progress: ExecutorProgress) {
+        val cmd = talkerBus.pendingCommand(progress.commandId)
+            ?: lastDeliveredCommand?.takeIf { it.id == progress.commandId }
+            ?: return
+        val now = System.currentTimeMillis()
+        val state = JarvisStateRepository.agentState.value
+        val gateQuestionOutstanding = state == AgentRunState.WAITING_USER_REPLY
+        val isExecutingStep = state == AgentRunState.EXECUTING_STEP
+        val nextLabel = progress.nextLabel.takeIf { it.isNotBlank() }
+        val line = TalkerReplyPolicy.progressLine(progress, nextLabel)
+        val chatAllowed = TalkerProgressPolicy.shouldPostToChat(
+            progress, now, lastPostedProgressAtMs, lastPostedProgressLabel, lastPostedProgressFraction
+        )
+        if (chatAllowed) {
+            lastPostedProgressAtMs = now
+            lastPostedProgressLabel = progress.stepLabel
+            lastPostedProgressFraction = progress.progressFraction
+            JarvisStateRepository.addChatMessage(
+                "Jarvis", TalkerReplyPolicy.progressChatLine(progress, nextLabel)
+            )
+            persistChat()
+        }
+        val speakAllowed = TalkerProgressPolicy.shouldSpeak(
+            progress, now, lastSpokenProgressAtMs, lastSpokenProgressLabel,
+            lastSpokenProgressLabelAtMs, gateQuestionOutstanding, isExecutingStep, true
+        )
+        if (speakAllowed) {
+            lastSpokenProgressAtMs = now
+            lastSpokenProgressLabel = progress.stepLabel
+            lastSpokenProgressLabelAtMs = now
+            JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+            speak(line, alreadyPostedToChat = chatAllowed)
+            if (talkerBus.isPending(cmd.id) || activeExecutorCommand?.id == cmd.id) {
+                JarvisStateRepository.setAgentState(
+                    AgentRunState.EXECUTING_STEP, "Executor still running — Talker waiting for result"
+                )
+            }
+        }
+    }
+
+    // ---- 1.9.0 (v2) Talker/Executor: verification loop (Gap 2) ----
+
+    /** One ref's re-read, plus the verdict over all refs. */
+    private data class VerificationReport(
+        val verdict: TalkerVerificationPolicy.VerificationVerdict,
+        val results: List<TalkerVerificationPolicy.RefCheckResult>
+    )
+
+    /**
+     * The verification gate (DESIGN §4.5): every DONE result is held
+     * here — never spoken directly — while the Talker re-reads each
+     * claimed artifact. Non-DONE results never enter this function
+     * (the bus listener routes only DONE here). A DONE the Executor
+     * already fully announced (unannounced ids — the NONE chat-end
+     * DONE) passes through untouched. A second DONE for a command
+     * already being verified is dropped; the first verdict owns the
+     * speak. Verification time counts against the command's 15-min
+     * budget (Q4): fix attempts are bounded by the remaining time.
+     */
+    private suspend fun deliverVerifiedExecutorResult(result: ExecutorResult) {
+        if (unannouncedResultIds.remove(result.commandId)) {
+            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+            return
+        }
+        if (result.commandId in verificationInFlight) {
+            JarvisStateRepository.addLog(
+                "Verification already in flight for ${result.commandId} — second DONE dropped."
+            )
+            return
+        }
+        val cmd = lastDeliveredCommand?.takeIf { it.id == result.commandId }
+            ?: talkerBus.pendingCommand(result.commandId)
+            ?: run {
+                // No command context (e.g. a replayed / legacy DONE):
+                // fall back to the v1 delivery path rather than
+                // dropping the outcome silently.
+                deliverExecutorResult(result)
+                return
+            }
+        verificationInFlight.add(result.commandId)
+        verificationStates[result.commandId] = VerificationState(cmd, result)
+        // Slow-verification chat line (chat only, never spoken —
+        // speaking it would be a premature completion claim).
+        val slowJob = scope.launch {
+            delay(TalkerExecutorProgress.VERIFICATION_SLOW_CHAT_MS)
+            if (result.commandId in verificationInFlight) {
+                JarvisStateRepository.addChatMessage(
+                    "Jarvis", "Ho gaya lagta hai — check kar raha hoon, ek second…"
+                )
+                persistChat()
+            }
+        }
+        val report = verifyRefs(cmd, EvidenceRefs.parse(result.evidenceJson))
+        slowJob.cancel()
+        deliverVerdict(result.commandId, report, fixed = false)
+    }
+
+    /**
+     * Re-read every ref (fresh reads, never the Executor's text,
+     * never the `lastBuildValidation` cache). One bounded re-check
+     * for UNCHECKABLE refs after 5 s; the whole verification is
+     * bounded by 60 s — on timeout, unchecked refs are UNCHECKABLE.
+     */
+    private suspend fun verifyRefs(
+        cmd: ExecutorCommand,
+        refs: List<EvidenceRef>
+    ): VerificationReport {
+        if (refs.isEmpty()) {
+            return VerificationReport(
+                TalkerVerificationPolicy.VerificationVerdict.UNVERIFIED, emptyList()
+            )
+        }
+        val results = ArrayList<TalkerVerificationPolicy.RefCheckResult>(refs.size)
+        val checked = withTimeoutOrNull(TalkerExecutorProgress.VERIFICATION_TIMEOUT_MS) {
+            for (ref in refs) {
+                var check = checkEvidenceRef(cmd, ref)
+                if (check.outcome == TalkerVerificationPolicy.RefOutcome.UNCHECKABLE) {
+                    delay(TalkerExecutorProgress.VERIFICATION_RETRY_DELAY_MS)
+                    check = checkEvidenceRef(cmd, ref)
+                }
+                results.add(check)
+            }
+            true
+        }
+        if (checked == null) {
+            // Timed out mid-verification: the refs never reached are
+            // UNCHECKABLE, never a pass and never a fail.
+            val done = results.map { it.refId }.toSet()
+            for (ref in refs) {
+                if (ref.refId() !in done) {
+                    results.add(
+                        TalkerVerificationPolicy.RefCheckResult(
+                            ref.refId(),
+                            TalkerVerificationPolicy.RefOutcome.UNCHECKABLE,
+                            "verification timeout"
+                        )
+                    )
+                }
+            }
+        }
+        return VerificationReport(TalkerVerificationPolicy.decide(results), results)
+    }
+
+    /** Re-read one evidence ref with the existing re-read function for its kind. */
+    private suspend fun checkEvidenceRef(
+        cmd: ExecutorCommand,
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        return when (ref.kind) {
+            EvidenceKind.FILE_LIST -> checkFileListRef(ref)
+            EvidenceKind.PREVIEW_HTTP -> checkPreviewHttpRef(ref)
+            EvidenceKind.GITHUB_COMMIT -> checkGithubCommitRef(ref)
+            EvidenceKind.SUPABASE_TABLES -> checkSupabaseTablesRef(ref)
+            EvidenceKind.VERCEL_DEPLOY -> checkVercelDeployRef(ref)
+            EvidenceKind.SCREEN_STATE, EvidenceKind.MESSAGE_SENT -> checkScreenRef(ref)
+        }
+    }
+
+    private suspend fun checkFileListRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val project = ref.ref.removePrefix("project:")
+        val files = ref.value.split(",").map { it.trim() }.filter { it.isNotBlank() }
+        return withContext(Dispatchers.IO) {
+            val projects = runCatching { ProjectStore.listProjects(context) }.getOrDefault(emptyList())
+            val found = projects.firstOrNull { it.name == project }
+                ?: return@withContext TalkerVerificationPolicy.RefCheckResult(
+                    refId, TalkerVerificationPolicy.RefOutcome.FAILED, "project nahi mila"
+                )
+            val validation = runCatching { ProjectStore.validateProject(context, project) }.getOrNull()
+            if (validation != null && !validation.ok) {
+                val missing = (validation.missingFiles + validation.emptyFiles + validation.invalidRefs)
+                    .joinToString(", ").take(100)
+                return@withContext TalkerVerificationPolicy.RefCheckResult(
+                    refId, TalkerVerificationPolicy.RefOutcome.FAILED,
+                    "validation fail: $missing"
+                )
+            }
+            for (file in files) {
+                val content = runCatching { ProjectStore.readFile(context, project, file) }.getOrDefault("")
+                if (content.isBlank()) {
+                    return@withContext TalkerVerificationPolicy.RefCheckResult(
+                        refId, TalkerVerificationPolicy.RefOutcome.FAILED, "file nahi mili: $file"
+                    )
+                }
+            }
+            // A project with no files at all is not a built project.
+            if (found.files.isEmpty()) {
+                return@withContext TalkerVerificationPolicy.RefCheckResult(
+                    refId, TalkerVerificationPolicy.RefOutcome.FAILED, "project me koi file nahi"
+                )
+            }
+            TalkerVerificationPolicy.RefCheckResult(refId, TalkerVerificationPolicy.RefOutcome.PASSED)
+        }
+    }
+
+    private suspend fun checkPreviewHttpRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val url = ref.value.trim()
+        if (url.isBlank()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "preview URL nahi diya"
+            )
+        }
+        val (_, ready) = ProjectPreviewServer.ensureRunningReady(context)
+        if (!ready) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "preview server start nahi hua"
+            )
+        }
+        return when (val code = previewGetStatus(url)) {
+            200 -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.PASSED
+            )
+            -1 -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "preview GET fail hua"
+            )
+            else -> TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "preview HTTP $code"
+            )
+        }
+    }
+
+    private suspend fun checkGithubCommitRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val ownerRepo = ref.ref.removePrefix("github:")
+        val owner = ownerRepo.substringBefore("/")
+        val repo = ownerRepo.substringAfter("/", "")
+        val sha = ref.value.trim()
+        if (owner.isBlank() || repo.isBlank() || sha.isBlank()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "commit ref adhoora hai"
+            )
+        }
+        val expectedFiles = planExecutor.planBuildProjectFiles()
+        return planExecutor.verifyGithubCommitTyped(owner, repo, sha, expectedFiles)
+            .let { outcome ->
+                TalkerVerificationPolicy.RefCheckResult(
+                    refId, outcome,
+                    when (outcome) {
+                        TalkerVerificationPolicy.RefOutcome.FAILED -> "GitHub par commit nahi mila"
+                        TalkerVerificationPolicy.RefOutcome.UNCHECKABLE -> "GitHub re-read nahi ho paya"
+                        else -> ""
+                    }
+                )
+            }
+    }
+
+    private suspend fun checkSupabaseTablesRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val projectRef = ref.ref.removePrefix("supabase:")
+        val expected = parseTableColumns(ref.value)
+        if (projectRef.isBlank() || expected.isEmpty()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "table ref adhoora hai"
+            )
+        }
+        return planExecutor.verifySupabaseTablesTyped(projectRef, expected)
+            .let { outcome ->
+                TalkerVerificationPolicy.RefCheckResult(
+                    refId, outcome,
+                    when (outcome) {
+                        TalkerVerificationPolicy.RefOutcome.FAILED -> "Supabase tables nahi mile"
+                        TalkerVerificationPolicy.RefOutcome.UNCHECKABLE -> "Supabase re-read nahi ho paya"
+                        else -> ""
+                    }
+                )
+            }
+    }
+
+    /** "table:col1,col2;table2:col3" → table → columns. */
+    private fun parseTableColumns(value: String): Map<String, Set<String>> {
+        val out = linkedMapOf<String, Set<String>>()
+        for (part in value.split(";")) {
+            val table = part.substringBefore(":").trim()
+            val cols = part.substringAfter(":", "").split(",")
+                .map { it.trim() }.filter { it.isNotBlank() }.toSet()
+            if (table.isNotBlank() && cols.isNotEmpty()) out[table] = cols
+        }
+        return out
+    }
+
+    private suspend fun checkVercelDeployRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val deploymentId = ref.ref.removePrefix("vercel:")
+        val url = ref.value.trim()
+        if (deploymentId.isBlank() || url.isBlank()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "deploy ref adhoora hai"
+            )
+        }
+        return planExecutor.verifyVercelDeployTyped(deploymentId, url)
+            .let { outcome ->
+                TalkerVerificationPolicy.RefCheckResult(
+                    refId, outcome,
+                    when (outcome) {
+                        TalkerVerificationPolicy.RefOutcome.FAILED -> "Vercel deploy nahi mila"
+                        TalkerVerificationPolicy.RefOutcome.UNCHECKABLE -> "Vercel re-read nahi ho paya"
+                        else -> ""
+                    }
+                )
+            }
+    }
+
+    /**
+     * SCREEN_STATE / MESSAGE_SENT: a FRESH accessibility snapshot,
+     * probed with the same rule as verifyPerKindEvidence. A snapshot
+     * that cannot be captured makes the ref UNCHECKABLE, never a
+     * pass and never a fail.
+     */
+    private fun checkScreenRef(
+        ref: EvidenceRef
+    ): TalkerVerificationPolicy.RefCheckResult {
+        val refId = ref.refId()
+        val probe = ref.value.take(40)
+        val snapshot = JarvisAccessibilityService.instance?.captureScreenSnapshot()
+        if (snapshot == null || snapshot.elements.isEmpty()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "snapshot nahi mila"
+            )
+        }
+        if (probe.isBlank()) {
+            return TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "probe khaali hai"
+            )
+        }
+        if (ref.kind == EvidenceKind.MESSAGE_SENT) {
+            val draftStillThere = snapshot.elements.any { el ->
+                el.isEditable && (el.text.contains(probe) || el.contentDesc.contains(probe))
+            }
+            if (draftStillThere) {
+                return TalkerVerificationPolicy.RefCheckResult(
+                    refId, TalkerVerificationPolicy.RefOutcome.FAILED, "draft abhi bhi input me hai"
+                )
+            }
+            val sentVisible = snapshot.elements.any { el ->
+                !el.isEditable && (el.text.contains(probe) || el.contentDesc.contains(probe))
+            }
+            return if (sentVisible) {
+                TalkerVerificationPolicy.RefCheckResult(refId, TalkerVerificationPolicy.RefOutcome.PASSED)
+            } else {
+                TalkerVerificationPolicy.RefCheckResult(
+                    refId, TalkerVerificationPolicy.RefOutcome.UNCHECKABLE, "sent bubble nahi dikha"
+                )
+            }
+        }
+        val probeVisible = snapshot.elements.any { el ->
+            el.text.contains(probe) || el.contentDesc.contains(probe)
+        }
+        return if (probeVisible) {
+            TalkerVerificationPolicy.RefCheckResult(refId, TalkerVerificationPolicy.RefOutcome.PASSED)
+        } else {
+            TalkerVerificationPolicy.RefCheckResult(
+                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "screen par probe nahi mila"
+            )
+        }
+    }
+
+    /** Speak + chat the verdict, or start the bounded fix flow on MISMATCH. */
+    private suspend fun deliverVerdict(
+        commandId: String,
+        report: VerificationReport,
+        fixed: Boolean
+    ) {
+        val state = verificationStates[commandId] ?: return
+        when (report.verdict) {
+            TalkerVerificationPolicy.VerificationVerdict.VERIFIED -> {
+                speechSuppressedResultIds.remove(commandId)
+                val line = TalkerVerificationPolicy.verifiedLine(state.result.summary, state.result.isLate)
+                JarvisStateRepository.addChatMessage("Jarvis", line)
+                persistChat()
+                JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+                speak(line, alreadyPostedToChat = true)
+                JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+                // Learn only from VERIFIED outcomes (DESIGN §5.5) —
+                // never from unverified claims or failures.
+                learnFromVerified(state, fixed)
+                speak("Aur kya karna hai?")
+                clearVerificationState(commandId)
+            }
+            TalkerVerificationPolicy.VerificationVerdict.UNVERIFIED -> {
+                speechSuppressedResultIds.remove(commandId)
+                val artifact = TalkerVerificationPolicy.artifactPhraseFor(report.results)
+                val line = TalkerVerificationPolicy.unverifiedLine(artifact)
+                JarvisStateRepository.addChatMessage("Jarvis", line)
+                JarvisStateRepository.addChatMessage(
+                    "Jarvis", TalkerVerificationPolicy.unverifiedDetail(
+                        report.results.filter { it.outcome == TalkerVerificationPolicy.RefOutcome.UNCHECKABLE }
+                    )
+                )
+                persistChat()
+                JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+                speak(line, alreadyPostedToChat = true)
+                JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+                speak("Aur kya karna hai?")
+                clearVerificationState(commandId)
+            }
+            TalkerVerificationPolicy.VerificationVerdict.MISMATCH -> {
+                onMismatch(
+                    state,
+                    report.results.filter { it.outcome == TalkerVerificationPolicy.RefOutcome.FAILED }
+                )
+            }
+        }
+    }
+
+    /**
+     * MISMATCH → bounded fix (DESIGN §4.6): max 2 attempts, each
+     * bounded by 5 min AND by the command's remaining time. UNVERIFIED
+     * never triggers a fix (there is nothing concrete to fix).
+     * Fix attempts are not task retries — a FAILED *task* gets no
+     * FIX_REQUEST; only this MISMATCH branch constructs one.
+     */
+    private suspend fun onMismatch(
+        state: VerificationState,
+        failed: List<TalkerVerificationPolicy.RefCheckResult>
+    ) {
+        val kinds = TalkerVerificationPolicy.failedKinds(failed)
+        val attempt = (fixAttempts[state.command.id] ?: 0) + 1
+        if (attempt > TalkerExecutorProgress.FIX_MAX_ATTEMPTS) {
+            speakFixExhausted(state, kinds, failed)
+            return
+        }
+        val remainingMs = state.command.timeoutMs -
+            (System.currentTimeMillis() - state.command.issuedAtMs)
+        if (remainingMs <= 0) {
+            val line = TalkerVerificationPolicy.fixTimeoutLine(kinds)
+            JarvisStateRepository.addChatMessage("Jarvis", line)
+            JarvisStateRepository.addChatMessage(
+                "Jarvis", TalkerVerificationPolicy.mismatchDetail(failed)
+            )
+            persistChat()
+            JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+            speak(line, alreadyPostedToChat = true)
+            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+            JarvisStateRepository.addDiagnostic(
+                "talker", "VERIFY_TIMEOUT",
+                "Fix window exceeded for ${state.command.id}: ${kinds.joinToString(",")}"
+            )
+            clearVerificationState(state.command.id)
+            return
+        }
+        fixAttempts[state.command.id] = attempt
+        // Remember the failure reason — if the fix works, it becomes
+        // the pattern's `failure` (DESIGN §5.5: a fixed failure is
+        // the most valuable pattern there is).
+        verificationStates[state.command.id] = state.copy(
+            fixFailure = TalkerVerificationPolicy.mismatchDetail(failed).take(200)
+        )
+        val line = if (attempt == 1) {
+            TalkerVerificationPolicy.fixStartLine(kinds)
+        } else {
+            TalkerVerificationPolicy.fixRetryLine(kinds)
+        }
+        JarvisStateRepository.addChatMessage("Jarvis", line)
+        JarvisStateRepository.addChatMessage(
+            "Jarvis", TalkerVerificationPolicy.mismatchDetail(failed)
+        )
+        persistChat()
+        JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+        speak(line, alreadyPostedToChat = true)
+        JarvisStateRepository.setAgentState(
+            AgentRunState.EXECUTING_STEP, "Executor fixing — Talker waiting for fix result"
+        )
+        val request = ExecutorFixRequest(
+            commandId = state.command.id,
+            attempt = attempt,
+            missingRefs = failed.map { it.refId },
+            reason = TalkerVerificationPolicy.mismatchDetail(failed).take(200)
+        )
+        if (!talkerBus.requestFix(request)) {
+            // Executor is gone (cancelled / superseded since the
+            // verdict) — end honestly instead of waiting forever.
+            JarvisStateRepository.addLog("FIX_REQUEST dropped for ${state.command.id} — executor gone.")
+            speakFixExhausted(state, kinds, failed)
+        }
+    }
+
+    /** Attempts exhausted: honest "still missing X", never "ho gaya". */
+    private suspend fun speakFixExhausted(
+        state: VerificationState,
+        kinds: List<EvidenceKind>,
+        failed: List<TalkerVerificationPolicy.RefCheckResult>
+    ) {
+        val line = TalkerVerificationPolicy.fixExhaustedLine(kinds)
+        JarvisStateRepository.addChatMessage("Jarvis", line)
+        JarvisStateRepository.addChatMessage(
+            "Jarvis", TalkerVerificationPolicy.mismatchDetail(failed)
+        )
+        persistChat()
+        JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+        speak(line, alreadyPostedToChat = true)
+        JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+        JarvisStateRepository.addDiagnostic(
+            "talker", "VERIFY_FAILED",
+            "Fix exhausted for ${state.command.id}: ${kinds.joinToString(",")}"
+        )
+        clearVerificationState(state.command.id)
+    }
+
+    // ---- Fix execution (Talker asks, Executor re-runs only the failed refs) ----
+
+    /**
+     * FIX_REQUEST handler: runs the minimal fix for the command's
+     * work kind, bounded by min(5 min, remaining time). The fix runs
+     * as a fresh scope job — the original Executor job already
+     * ended when it reported DONE. A fix that cannot run (or times
+     * out) answers STILL_MISSING at once; the Executor never
+     * improvises a new plan here.
+     */
+    private suspend fun handleFixRequest(request: ExecutorFixRequest) {
+        val state = verificationStates[request.commandId] ?: run {
+            JarvisStateRepository.addLog("FIX_REQUEST dropped for ${request.commandId} — no verification in flight.")
+            return
+        }
+        if (request.commandId !in verificationInFlight) return
+        val remainingMs = state.command.timeoutMs -
+            (System.currentTimeMillis() - state.command.issuedAtMs)
+        if (remainingMs <= 0) {
+            talkerBus.completeFix(
+                ExecutorFixResult(
+                    commandId = request.commandId,
+                    attempt = request.attempt,
+                    status = FixResultStatus.STILL_MISSING,
+                    missingRefs = request.missingRefs,
+                    detail = "fix window exceeded"
+                )
+            )
+            return
+        }
+        val budgetMs = minOf(TalkerExecutorProgress.FIX_TIMEOUT_MS, remainingMs)
+        val result = withTimeoutOrNull(budgetMs) {
+            when (lastExecutorWorkKind) {
+                ExecutorWorkKind.PLAN -> planExecutor.fixMissingRefs(
+                    request.missingRefs, request.commandId, request.attempt
+                )
+                ExecutorWorkKind.LOOP -> fixLoopResult(request, state)
+                else -> ExecutorFixResult(
+                    commandId = request.commandId,
+                    attempt = request.attempt,
+                    status = FixResultStatus.STILL_MISSING,
+                    missingRefs = request.missingRefs,
+                    detail = "unknown work kind"
+                )
+            }
+        } ?: ExecutorFixResult(
+            commandId = request.commandId,
+            attempt = request.attempt,
+            status = FixResultStatus.STILL_MISSING,
+            missingRefs = request.missingRefs,
+            detail = "fix timed out"
+        )
+        talkerBus.completeFix(result)
+    }
+
+    /** FIX_RESULT handler: FIXED re-triggers verification; STILL_MISSING tries the next attempt. */
+    private suspend fun handleFixResult(fix: ExecutorFixResult) {
+        val state = verificationStates[fix.commandId] ?: return
+        if (fix.commandId !in verificationInFlight) return
+        when (fix.status) {
+            FixResultStatus.FIXED -> {
+                // Remember the step that fixed it — the pattern's
+                // `fix` (DESIGN §5.5). The `failure` was stored when
+                // the FIX_REQUEST went out (see onMismatch).
+                val prior = verificationStates[fix.commandId]
+                if (prior != null) {
+                    verificationStates[fix.commandId] = prior.copy(
+                        fixStepLabel = fix.detail.take(200)
+                    )
+                }
+                val freshRefs = EvidenceRefs.parse(fix.freshEvidenceJson)
+                val report = verifyRefs(state.command, freshRefs)
+                deliverVerdict(fix.commandId, report, fixed = true)
+            }
+            FixResultStatus.STILL_MISSING -> {
+                val failed = fix.missingRefs.map { refId ->
+                    TalkerVerificationPolicy.RefCheckResult(
+                        refId, TalkerVerificationPolicy.RefOutcome.FAILED,
+                        "fix ke baad bhi nahi mila"
+                    )
+                }
+                onMismatch(state, failed)
+            }
+        }
+    }
+
+    /**
+     * Loop fix (DESIGN §4.6): minimal repair only. For a preview /
+     * file ref, re-run build evidence and, if it fails, one preview-
+     * server restart + fresh GET (the fix attempt IS the repair, not
+     * an extra one). For a message/screen ref, re-observe once. If
+     * the minimal repair cannot run, STILL_MISSING at once — do not
+     * improvise a new plan.
+     */
+    private suspend fun fixLoopResult(
+        request: ExecutorFixRequest,
+        state: VerificationState
+    ): ExecutorFixResult {
+        val failedRefs = EvidenceRefs.parse(state.result.evidenceJson)
+            .filter { it.refId() in request.missingRefs }
+        val stillMissing = ArrayList<String>()
+        val fixedRefs = ArrayList<EvidenceRef>()
+        for (ref in failedRefs) {
+            when (ref.kind) {
+                EvidenceKind.FILE_LIST, EvidenceKind.PREVIEW_HTTP -> {
+                    val evidence = verifyBuildEvidence()
+                    if (evidence == StepEvidence.VERIFIED) {
+                        fixedRefs.addAll(loopBuildRefs())
+                    } else {
+                        val (_, ready) = ProjectPreviewServer.ensureRunningReady(context)
+                        val project = lastBuildProject
+                        val code = if (ready && project.isNotBlank()) {
+                            previewGetStatus(ProjectStore.localhostUrl(project))
+                        } else {
+                            -1
+                        }
+                        if (code == 200 && verifyBuildEvidence() == StepEvidence.VERIFIED) {
+                            fixedRefs.addAll(loopBuildRefs())
+                        } else {
+                            stillMissing.add(ref.refId())
+                        }
+                    }
+                }
+                EvidenceKind.MESSAGE_SENT, EvidenceKind.SCREEN_STATE -> {
+                    val check = checkScreenRef(ref)
+                    if (check.outcome == TalkerVerificationPolicy.RefOutcome.PASSED) {
+                        fixedRefs.add(ref)
+                    } else {
+                        stillMissing.add(ref.refId())
+                    }
+                }
+                else -> stillMissing.add(ref.refId())
+            }
+        }
+        // Refs the Executor never sent cannot be fixed by re-checking.
+        for (refId in request.missingRefs) {
+            if (failedRefs.none { it.refId() == refId } && refId !in stillMissing) {
+                stillMissing.add(refId)
+            }
+        }
+        return if (stillMissing.isEmpty()) {
+            ExecutorFixResult(
+                commandId = request.commandId,
+                attempt = request.attempt,
+                status = FixResultStatus.FIXED,
+                freshEvidenceJson = EvidenceRefs.toJson(fixedRefs.distinctBy { it.refId() }),
+                detail = "loop fix: ${fixedRefs.joinToString(", ") { it.kind.wire }}".take(200)
+            )
+        } else {
+            ExecutorFixResult(
+                commandId = request.commandId,
+                attempt = request.attempt,
+                status = FixResultStatus.STILL_MISSING,
+                missingRefs = stillMissing,
+                detail = "loop fix: ${stillMissing.size} ref(s) still missing"
+            )
+        }
+    }
+
+    /** FILE_LIST + PREVIEW_HTTP refs for the last built project (loop path). */
+    private fun loopBuildRefs(): List<EvidenceRef> {
+        val project = lastBuildProject.ifBlank { return emptyList() }
+        val files = ProjectStore.listProjects(context)
+            .firstOrNull { it.name == project }?.files ?: emptyList()
+        return listOf(
+            EvidenceRef(
+                EvidenceKind.FILE_LIST, "project:$project", "files_present",
+                files.joinToString(",")
+            ),
+            EvidenceRef(
+                EvidenceKind.PREVIEW_HTTP, "preview:$project", "http_200",
+                ProjectStore.localhostUrl(project)
+            )
+        )
+    }
+
+    /** Typed refs for a loop DONE, by the final action (DESIGN §4.2). */
+    private fun loopDoneRefs(decision: AgentDecision): List<EvidenceRef> {
+        return when (decision.action) {
+            "CREATE_PROJECT", "WRITE_PROJECT_FILE" -> loopBuildRefs()
+            "WHATSAPP_SEND" -> listOf(
+                EvidenceRef(
+                    EvidenceKind.MESSAGE_SENT, "message:whatsapp", "sent_visible",
+                    decision.text.trim().take(40)
+                )
+            )
+            "OPEN_APP" -> listOf(
+                EvidenceRef(
+                    EvidenceKind.SCREEN_STATE, "screen:open_app", "probe_present",
+                    decision.appName.trim().take(40)
+                )
+            )
+            "TYPE_TEXT" -> listOf(
+                EvidenceRef(
+                    EvidenceKind.SCREEN_STATE, "screen:type_text", "probe_present",
+                    decision.text.trim().take(40)
+                )
+            )
+            else -> emptyList()
+        }
+    }
+
+    // ---- 1.9.0 (v2) Talker/Executor: self-mastery (Gap 3) ----
+
+    /**
+     * Index-only pattern/instruction lookup for one EXECUTE turn
+     * (DESIGN §5.3). Runs synchronously on the Talker path — the
+     * same shape as the I1 document search that already runs here —
+     * and never parses pattern files (indexes only). The ack-budget
+     * guard is measured by the caller (diagnostic
+     * `talker/PATTERN_LOOKUP_MS` when > 100 ms).
+     */
+    private fun lookupGuidance(goal: String, workKind: ExecutorWorkKind): Guidance {
+        val keywords = MemoryKeywords.extract(goal)
+        val patternMeta = runCatching {
+            learnedPatternStore.findBestPattern(keywords, workKind.wire, goal)
+        }.getOrNull()
+        val pattern = patternMeta?.let { meta ->
+            runCatching { learnedPatternStore.getPattern(meta.id) }.getOrNull()
+        }
+        val instructions = runCatching {
+            learnedPatternStore.findInstructions(keywords, workKind.wire, goal)
+        }.getOrDefault(emptyList())
+        val patternHint = pattern?.let { p ->
+            "${p.title}. Steps: ${p.steps.joinToString(", ") { it.label }}"
+        } ?: ""
+        val instructionHint = instructions.joinToString("; ") { it.text }
+        val noteLines = ArrayList<String>()
+        if (pattern != null) {
+            noteLines.add("Seekha hua tareeka use kar raha hoon — ${pattern.title}.")
+        }
+        if (instructions.isNotEmpty()) {
+            noteLines.add(
+                "Yaad rakha hua: ${instructions.joinToString("; ") { it.text.take(80) }}."
+            )
+        }
+        val params = mutableMapOf<String, String>()
+        if (patternHint.isNotBlank()) {
+            params["learned_pattern"] = patternHint.take(LearnedPatternPolicy.MAX_GUIDANCE_CHARS)
+        }
+        if (instructionHint.isNotBlank()) {
+            params["user_instruction"] = instructionHint.take(LearnedPatternPolicy.MAX_GUIDANCE_CHARS)
+        }
+        return Guidance(
+            patternId = pattern?.id,
+            patternTitle = pattern?.title,
+            patternHint = patternHint,
+            instructionHint = instructionHint,
+            instructionIds = instructions.map { it.id },
+            noteLines = noteLines,
+            params = params
+        )
+    }
+
+    /**
+     * Learn from a VERIFIED DONE (DESIGN §5.5): plan steps or the
+     * loop's recorded safe steps become a pattern; a fixed failure
+     * carries its failure + fix. Never called for UNVERIFIED,
+     * FAILED, BLOCKED, DECLINED or CANCELLED. Also reinforces an
+     * applied pattern (+0.1 confidence) — unless the user penalised
+     * it mid-flight, in which case it is neither reinforced nor
+     * re-minted from this task.
+     */
+    private suspend fun learnFromVerified(state: VerificationState, fixed: Boolean) {
+        val cmd = state.command
+        val appliedId = appliedPatternByCommand[cmd.id]
+        if (appliedId != null && appliedId !in penalisedPatternIds) {
+            withContext(Dispatchers.IO) {
+                runCatching { learnedPatternStore.recordReuse(appliedId, success = true) }
+            }
+        }
+        if (appliedId != null && appliedId in penalisedPatternIds) return
+        val (steps, signature, title) = when (cmd.workKind) {
+            ExecutorWorkKind.PLAN -> {
+                val plan = planExecutor.lastFinishedPlan ?: return
+                val doneSteps = plan.steps.filter { it.state == com.jarvis.autonomous.data.PlanState.DONE }
+                if (doneSteps.isEmpty()) return
+                Triple(
+                    doneSteps.map { LearnedPatternStep(it.title.take(80), it.kind) },
+                    RoutineNormalization.normalize(plan.goal).take(120),
+                    plan.goal.take(80)
+                )
+            }
+            ExecutorWorkKind.LOOP -> {
+                val routine = lastVerifiedLoopRoutine ?: return
+                if (routine.steps.isEmpty()) return
+                Triple(
+                    routine.steps.map { LearnedPatternStep(it.action, it.action) },
+                    RoutineNormalization.normalize(cmd.goal).take(120),
+                    cmd.goal.take(80)
+                )
+            }
+            ExecutorWorkKind.ROUTINE -> return
+        }
+        val keywords = MemoryKeywords.extract(signature)
+            .take(LearnedPatternPolicy.MAX_KEYWORDS)
+        val pattern = LearnedPattern(
+            id = "",
+            triggerSignature = signature,
+            triggerKeywords = keywords,
+            workKind = cmd.workKind.wire,
+            title = title.ifBlank { "Seekha hua kaam" },
+            steps = steps,
+            failure = if (fixed) state.fixFailure.take(200) else "",
+            fix = if (fixed) state.fixStepLabel.take(200) else "",
+            sourceCommandId = cmd.id,
+            verified = true,
+            confidence = LearnedPatternPolicy.START_CONFIDENCE
+        )
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val savedId = learnedPatternStore.saveOrUpdatePattern(pattern)
+                if (savedId == null) {
+                    JarvisStateRepository.addLog("Pattern learn skip hua — extraction filter ne roka.")
+                }
+            }
+        }
+    }
+
+    // ---- 1.9.0 (v2) Talker/Executor: loop progress milestones (Gap 1) ----
+
+    /** User-meaningful noun label for a loop action (never an LLM thought). */
+    private fun loopActionLabel(d: AgentDecision): String = when (d.action) {
+        "OPEN_APP" -> "${d.appName.ifBlank { "App" }} kholna"
+        "WHATSAPP_SEND" -> "WhatsApp bhejna"
+        "CREATE_PROJECT", "WRITE_PROJECT_FILE" -> "Website banana"
+        "TYPE_TEXT" -> "Text likhna"
+        "YOUTUBE_PLAY" -> "YouTube chalana"
+        "YOUTUBE_SEARCH" -> "YouTube par dhoondhna"
+        "SCROLL" -> "Scroll karna"
+        "NAVIGATE" -> "Navigate karna"
+        "MEDIA_CONTROL" -> "Media control karna"
+        "FLASHLIGHT" -> "Torch ${if (d.enableFlag) "on" else "off"} karna"
+        "VOLUME" -> "Volume set karna"
+        "WAIT" -> "Intezaar karna"
+        "OPEN_BROWSER" -> "Browser kholna"
+        "SAVE_MEMORY" -> "Yaad rakhna"
+        else -> d.action.lowercase().replace("_", " ")
+    }.take(80)
+
+    /**
+     * Loop milestone emission (DESIGN §3.2): only when (a) the action
+     * kind changes vs the previous step, or (b) every 3rd verified
+     * step, or (c) a step takes > 60 s — and only when the step's
+     * own evidence check returns VERIFIED. No emit for
+     * AMBIGUOUS/FAILED steps. `stepTotal = 0`, fraction/ETA unknown.
+     */
+    private suspend fun maybeEmitLoopProgress(
+        decision: AgentDecision,
+        step: Int,
+        stepResult: ActionResult?,
+        preSnapshot: ScreenSnapshot?,
+        preMusicActive: Boolean?,
+        stepStartMs: Long
+    ) {
+        val cmdId = activeExecutorCommand?.id ?: return
+        val kindChanged = decision.action != loopLastActionKind
+        val longStep = System.currentTimeMillis() - stepStartMs > 60_000L
+        val thirdStep = (loopVerifiedSteps + 1) % 3 == 0
+        loopLastActionKind = decision.action
+        if (!kindChanged && !longStep && !thirdStep) return
+        val evidence = verifyStepEvidence(
+            decision, stepResult, JarvisAccessibilityService.instance,
+            preSnapshot = preSnapshot, preMusicActive = preMusicActive
+        )
+        if (evidence != StepEvidence.VERIFIED) return
+        loopVerifiedSteps++
+        runCatching {
+            talkerBus.reportProgress(
+                ExecutorProgress(
+                    commandId = cmdId,
+                    stepIndex = step,
+                    stepTotal = 0,
+                    stepLabel = loopActionLabel(decision),
+                    detail = decision.action,
+                    progressFraction = -1.0,
+                    etaSeconds = -1L,
+                    isMilestone = true,
+                    phase = "DONE"
+                )
+            )
+        }
+    }
+
     /**
      * Report a terminal (or TIMEOUT) outcome for the active Executor
      * command. No-op when no command is active, so non-Executor paths
@@ -482,7 +1478,11 @@ class JarvisAgentEngine(
         summary: String,
         evidence: String = "",
         speakResult: Boolean = true,
-        chatResult: Boolean = true
+        chatResult: Boolean = true,
+        // 1.9.0 (v2): typed evidence refs for DONE claims — the
+        // Talker verification gate re-reads them (DESIGN §4.2).
+        // Only DONE carries it; other statuses pass "".
+        evidenceJson: String = ""
     ) {
         val cmd = activeExecutorCommand ?: return
         if (status == ExecutorResultStatus.TIMEOUT) {
@@ -501,6 +1501,7 @@ class JarvisAgentEngine(
                 status = status,
                 summary = summary.take(TalkerExecutorProtocol.MAX_SUMMARY_CHARS),
                 evidence = evidence.take(500),
+                evidenceJson = evidenceJson,
                 finishedAtMs = now,
                 durationMs = now - cmd.issuedAtMs
             )
@@ -513,8 +1514,18 @@ class JarvisAgentEngine(
         summary: String,
         evidence: String = "",
         speakResult: Boolean = true,
-        chatResult: Boolean = true
-    ) = reportExecutorOutcome(status, summary, evidence, speakResult, chatResult)
+        chatResult: Boolean = true,
+        evidenceJson: String = ""
+    ) = reportExecutorOutcome(status, summary, evidence, speakResult, chatResult, evidenceJson)
+
+    /** Engine accessors for AgentPlanExecutor progress emission (v2 §3.2). */
+    internal fun planActiveCommandId(): String? = activeExecutorCommand?.id
+
+    internal fun planReportProgress(progress: ExecutorProgress) {
+        val cmdId = activeExecutorCommand?.id ?: return
+        if (progress.commandId != cmdId) return
+        runCatching { talkerBus.reportProgress(progress) }
+    }
 
     /** Post the user's turn once: the Talker posts it with the ack, so
      *  the Executor path must skip its own post (consumed exactly once). */
@@ -537,6 +1548,9 @@ class JarvisAgentEngine(
      */
     private fun supersedeRunningCommand(newGoal: String) {
         if (activeExecutorCommand == null) return
+        // 1.9.0 (v2): the superseded job's verification state dies
+        // with it — a late DONE for the old work must never speak.
+        activeExecutorCommand?.id?.let { clearVerificationState(it) }
         executorWatchdogJob?.cancel()
         executorWatchdogJob = null
         activeTaskJob?.cancel()
@@ -546,6 +1560,14 @@ class JarvisAgentEngine(
             TalkerReplyPolicy.supersededLine(newGoal),
             "superseded by new command"
         )
+    }
+
+    /** Drop verification + fix state for one command id (cancel / supersede / final verdict). */
+    private fun clearVerificationState(commandId: String) {
+        verificationInFlight.remove(commandId)
+        verificationStates.remove(commandId)
+        fixAttempts.remove(commandId)
+        appliedPatternByCommand.remove(commandId)
     }
 
     /**
@@ -588,7 +1610,16 @@ class JarvisAgentEngine(
                     reportExecutorOutcome(
                         ExecutorResultStatus.FAILED,
                         "Kaam khatm hua par result nahi mila — dobara bolo to phir se koshish karunga.",
-                        "no terminal result delivered"
+                        // 1.9.0 (v2, DESIGN §3.7): progress is attached
+                        // to the FAILED evidence so the Talker can say
+                        // what was last seen — but progress NEVER
+                        // satisfies the safety net by itself.
+                        "no terminal result delivered" +
+                            (talkerBus.lastProgress(cmd.id)?.let { progress ->
+                                "; last progress: Step ${progress.stepIndex}" +
+                                    (if (progress.stepTotal > 0) "/${progress.stepTotal}" else "") +
+                                    " ${progress.stepLabel}"
+                            } ?: "")
                     )
                 cause != null ->
                     reportExecutorOutcome(
@@ -1549,6 +2580,12 @@ class JarvisAgentEngine(
             lower.contains(routine.triggerPhrase.lowercase())
         }
         if (matchedRoutine == null) {
+            // 1.9.0 (v2, DESIGN §5.9): explain-once / forget / list
+            // turns are meta-turns about memory, not work — they
+            // return before any dispatch (and before learned replay,
+            // so a memory turn can never double-execute as work).
+            // Macros above still win over everything.
+            if (handleMemoryTurn(trimmed, lower)) return
             // Memory-first (1.4.0): a learned routine replays
             // before any no-AI routine or LLM planning. On ANY
             // mismatch the replay aborts into the LLM loop inside
@@ -1595,12 +2632,33 @@ class JarvisAgentEngine(
         when (talkerDecision) {
             TalkerDispatcher.TalkerDecision.STATUS_QUERY -> {
                 val cmd = talkerBus.pendingCommands().firstOrNull()
-                val step = JarvisStateRepository.currentStepInfo.value
-                    .takeIf { it.isNotBlank() }
-                val line = TalkerReplyPolicy.statusLine(
-                    cmd, step,
-                    if (cmd != null) turnReceivedMs - cmd.issuedAtMs else 0L
-                )
+                // 1.9.0 (v2, DESIGN §3.5): status answers read the
+                // freshest structured progress first — never the
+                // stale currentStepInfo string. Only when no
+                // progress exists yet (job just started) does the
+                // answer fall back to the step text.
+                val progress = cmd?.let { talkerBus.lastProgress(it.id) }
+                val nowMs = turnReceivedMs
+                val stalled = cmd != null && progress != null &&
+                    TalkerProgressPolicy.isStalled(progress.emittedAtMs, nowMs)
+                if (stalled && cmd != null && stalledDiagnosticLogged.add(cmd.id)) {
+                    JarvisStateRepository.addDiagnostic(
+                        "talker", "STALLED",
+                        "No progress for ${cmd.id} in 5 min — job still running."
+                    )
+                }
+                val line = if (progress != null && cmd != null) {
+                    TalkerReplyPolicy.statusLine(
+                        cmd, progress, nowMs - cmd.issuedAtMs, stalled, nowMs
+                    )
+                } else {
+                    val step = JarvisStateRepository.currentStepInfo.value
+                        .takeIf { it.isNotBlank() }
+                    TalkerReplyPolicy.statusLine(
+                        cmd, step,
+                        if (cmd != null) nowMs - cmd.issuedAtMs else 0L
+                    )
+                }
                 JarvisStateRepository.addChatMessage("Jarvis", line)
                 persistChat()
                 scope.launch { speak(line, alreadyPostedToChat = true) }
@@ -1623,10 +2681,25 @@ class JarvisAgentEngine(
                 } else {
                     ExecutorWorkKind.LOOP
                 }
+                // 1.9.0 (v2, DESIGN §5.3): index-only pattern /
+                // instruction lookup BEFORE submit — guidance rides
+                // in params (a hint, never an order). The lookup is
+                // measured: past 100 ms the ack is never delayed for
+                // it (the diagnostic records the breach instead).
+                val lookupStartMs = System.currentTimeMillis()
+                val guidance = runCatching { lookupGuidance(effectiveGoal, workKind) }.getOrNull()
+                val lookupMs = System.currentTimeMillis() - lookupStartMs
+                if (lookupMs > 100) {
+                    JarvisStateRepository.addDiagnostic(
+                        "talker", "PATTERN_LOOKUP_MS",
+                        "Pattern lookup took ${lookupMs}ms (> 100ms budget) — ack was not delayed."
+                    )
+                }
                 val cmd = ExecutorCommand(
                     kind = ExecutorCommandKind.EXECUTE_TASK,
                     workKind = workKind,
-                    goal = effectiveGoal
+                    goal = effectiveGoal,
+                    params = guidance?.params ?: emptyMap()
                 )
                 // Validate + submit BEFORE posting the ack: a
                 // rejected command must never be acknowledged.
@@ -1644,23 +2717,59 @@ class JarvisAgentEngine(
                     TalkerExecutorBus.SubmitResult.ACCEPTED -> Unit
                 }
                 supersedeRunningCommand(cmd.goal)
+                lastDeliveredCommand = cmd
+                lastExecutorWorkKind = workKind
+                guidance?.patternId?.let { patternId ->
+                    appliedPatternByCommand[cmd.id] = patternId
+                    lastAppliedPatternId = patternId
+                }
+                lastAppliedInstructionIds = guidance?.instructionIds ?: emptyList()
+                for (instructionId in lastAppliedInstructionIds) {
+                    runCatching { learnedPatternStore.recordInstructionUse(instructionId) }
+                }
                 val ack = TalkerReplyPolicy.ackFor(cmd)
                 JarvisStateRepository.addChatMessage("You", effectiveGoal)
                 JarvisStateRepository.addChatMessage("Jarvis", ack)
                 persistChat()
                 executorTurnAlreadyPosted = true
                 scope.launch { speak(ack, alreadyPostedToChat = true) }
+                // 1.9.0 (v2, DESIGN §5.4): no silent application —
+                // a chat-only note right after the ack (never spoken:
+                // the ack is already the spoken line for this turn).
+                guidance?.noteLines?.forEach { note ->
+                    JarvisStateRepository.addChatMessage("Jarvis", note)
+                }
+                if (!guidance?.noteLines.isNullOrEmpty()) persistChat()
                 JarvisStateRepository.addDiagnostic(
                     "talker", "ACK_MS",
                     "Talker ack posted ${System.currentTimeMillis() - turnReceivedMs}ms after turn received."
                 )
                 if (workKind == ExecutorWorkKind.PLAN) {
-                    launchExecutorCommand(cmd) { planExecutor.startNewPlan(effectiveGoal) }
+                    launchExecutorCommand(cmd) {
+                        planExecutor.startNewPlan(
+                            effectiveGoal,
+                            guidance?.patternHint ?: "",
+                            guidance?.instructionHint ?: ""
+                        )
+                    }
                 } else {
                     val memoryContext = buildMemoryContext(
                         effectiveGoal, docContext, recallHits.size
                     )
-                    launchExecutorCommand(cmd) { runAutonomousLoop(effectiveGoal, memoryContext) }
+                    // 1.9.0 (v2, DESIGN §5.4): loop guidance rides in
+                    // memoryContext as labelled context (same shape
+                    // as I1 doc snippets), never as a command.
+                    val loopContextParts = ArrayList<String>()
+                    if (memoryContext.isNotBlank()) loopContextParts.add(memoryContext)
+                    if (!guidance?.patternHint.isNullOrBlank()) {
+                        loopContextParts.add("(Seekha hua tareeka: ${guidance.patternHint})")
+                    }
+                    if (!guidance?.instructionHint.isNullOrBlank()) {
+                        loopContextParts.add("(Yaad rakha: ${guidance.instructionHint})")
+                    }
+                    launchExecutorCommand(cmd) {
+                        runAutonomousLoop(effectiveGoal, loopContextParts.joinToString("\n"))
+                    }
                 }
                 return
             }
@@ -1684,6 +2793,303 @@ class JarvisAgentEngine(
                 }
                 return
             }
+        }
+    }
+
+    /**
+     * 1.9.0 (v2, DESIGN §5.8): explain-once / forget / list turns.
+     * Returns true when the turn was a memory meta-turn and is fully
+     * handled (the caller must return). Voice + chat only — no new
+     * screen. A stored instruction is never a VoiceRoutine and never
+     * rewrites the user's goal (macro-collision guard); it is a
+     * standing preference applied as a hint.
+     */
+    private fun handleMemoryTurn(trimmed: String, lower: String): Boolean {
+        // A pending "kaun sa bhool jaun?" number answer.
+        val pending = pendingForgetSelection
+        if (pending != null) {
+            pendingForgetSelection = null
+            val number = trimmed.trim().toIntOrNull()
+            if (number != null && number in 1..pending.size) {
+                val (kind, id) = pending[number - 1]
+                val deleted = if (kind == "pattern") {
+                    learnedPatternStore.deletePattern(id)
+                } else {
+                    learnedPatternStore.deleteInstruction(id)
+                }
+                scope.launch {
+                    val line = if (deleted) {
+                        "Bhool gaya — ab yaad nahi rakhunga."
+                    } else {
+                        "Wo abhi list me nahi mila — dobara bolo."
+                    }
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                }
+                return true
+            }
+            // Not a number: the pending selection is dropped and the
+            // turn falls through to the normal checks below.
+        }
+
+        if (TalkerDispatcher.isListMemoryTurn(lower)) {
+            scope.launch {
+                val patterns = runCatching { learnedPatternStore.listPatterns() }.getOrDefault(emptyList())
+                val instructions = runCatching { learnedPatternStore.listInstructions() }.getOrDefault(emptyList())
+                val lines = StringBuilder("Yaad rakha hua:")
+                var n = 0
+                for (instruction in instructions.filter { it.enabled }.take(10)) {
+                    n++
+                    lines.append("\n$n. ${instruction.text.take(120)}")
+                }
+                for (pattern in patterns.filter { it.enabled }.take(10 - n.coerceAtMost(10))) {
+                    n++
+                    lines.append("\n$n. Tareeka: ${pattern.title.take(120)}")
+                }
+                if (n == 0) lines.append(" abhi kuch nahi — kuch yaad rakhne ko bolo to yaad rakh lunga.")
+                JarvisStateRepository.addChatMessage("Jarvis", lines.toString())
+                persistChat()
+                // Listing 10 items by voice is noise — spoken line
+                // is only the pointer to chat.
+                speak("Chat me list bhej di hai.", alreadyPostedToChat = true)
+            }
+            return true
+        }
+
+        if (TalkerDispatcher.isReenablePatternTurn(lower)) {
+            scope.launch {
+                val target = findPatternByTurn(lower, enabledOnly = false)
+                    ?.takeIf { !it.enabled }
+                if (target == null) {
+                    val line = "Koi band kiya hua tareeka nahi mila — kaun sa phir se use karun?"
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                } else {
+                    learnedPatternStore.setPatternEnabled(target.id, true)
+                    val line = "Theek hai — '${target.title.take(60)}' phir se use karunga."
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                }
+            }
+            return true
+        }
+
+        if (TalkerDispatcher.isDisablePatternTurn(lower)) {
+            scope.launch {
+                val targetId = lastAppliedPatternId
+                    ?: findPatternByTurn(lower, enabledOnly = true)?.id
+                if (targetId == null) {
+                    val line = "Abhi koi tareeka apply nahi hua — kaun sa band karun?"
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                } else {
+                    // Failure-after-apply: confidence −0.2 (and
+                    // auto-disable after 2 consecutive failures).
+                    learnedPatternStore.recordFailureAfterApply(targetId)
+                    penalisedPatternIds.add(targetId)
+                    if (TalkerDispatcher.isPermanentDisableTurn(lower)) {
+                        learnedPatternStore.setPatternEnabled(targetId, false)
+                    }
+                    val line = if (TalkerDispatcher.isPermanentDisableTurn(lower)) {
+                        "Theek hai, ye tareeka dobara use nahi karunga."
+                    } else {
+                        "Theek hai, ye tareeka abhi ke liye band kar diya."
+                    }
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                }
+            }
+            return true
+        }
+
+        if (TalkerDispatcher.isForgetTurn(lower)) {
+            scope.launch {
+                if (TalkerDispatcher.isForgetPatternTurn(lower)) {
+                    val target = findPatternByTurn(lower, enabledOnly = true)
+                    if (target == null) {
+                        val candidates = runCatching { learnedPatternStore.listPatterns() }
+                            .getOrDefault(emptyList()).filter { it.enabled }.take(5)
+                        if (candidates.isEmpty()) {
+                            val line = "Koi seekha hua tareeka yaad nahi hai — bhoolne ko kuch nahi."
+                            JarvisStateRepository.addChatMessage("Jarvis", line)
+                            persistChat()
+                            speak(line, alreadyPostedToChat = true)
+                        } else {
+                            val lines = StringBuilder("Kaun sa tareeka bhool jaun? Number bolo:")
+                            candidates.forEachIndexed { i, meta ->
+                                lines.append("\n${i + 1}. ${meta.title.take(100)}")
+                            }
+                            pendingForgetSelection = candidates.map { "pattern" to it.id }
+                            JarvisStateRepository.addChatMessage("Jarvis", lines.toString())
+                            persistChat()
+                            speak("Kaun sa bhool jaun? Number bolo.", alreadyPostedToChat = true)
+                        }
+                    } else {
+                        learnedPatternStore.deletePattern(target.id)
+                        val line = "Bhool gaya — '${target.title.take(60)}' ab yaad nahi rakhunga."
+                        JarvisStateRepository.addChatMessage("Jarvis", line)
+                        persistChat()
+                        speak(line, alreadyPostedToChat = true)
+                    }
+                } else {
+                    val target = findInstructionByTurn(lower)
+                    if (target == null) {
+                        val candidates = runCatching { learnedPatternStore.listInstructions() }
+                            .getOrDefault(emptyList()).filter { it.enabled }.take(5)
+                        if (candidates.isEmpty()) {
+                            val line = "Koi yaad rakhi hui baat nahi hai — bhoolne ko kuch nahi."
+                            JarvisStateRepository.addChatMessage("Jarvis", line)
+                            persistChat()
+                            speak(line, alreadyPostedToChat = true)
+                        } else {
+                            val lines = StringBuilder("Kaun sa bhool jaun? Number bolo:")
+                            candidates.forEachIndexed { i, meta ->
+                                lines.append("\n${i + 1}. ${meta.text.take(100)}")
+                            }
+                            pendingForgetSelection = candidates.map { "instruction" to it.id }
+                            JarvisStateRepository.addChatMessage("Jarvis", lines.toString())
+                            persistChat()
+                            speak("Kaun sa bhool jaun? Number bolo.", alreadyPostedToChat = true)
+                        }
+                    } else {
+                        learnedPatternStore.deleteInstruction(target.id)
+                        val line = "Bhool gaya — '${target.text.take(60)}' ab yaad nahi rakhunga."
+                        JarvisStateRepository.addChatMessage("Jarvis", line)
+                        persistChat()
+                        speak(line, alreadyPostedToChat = true)
+                    }
+                }
+            }
+            return true
+        }
+
+        if (TalkerDispatcher.isBareExplainOnceTurn(lower)) {
+            scope.launch {
+                val line = "Kya yaad rakhun? Ek line me bolo."
+                JarvisStateRepository.addChatMessage("Jarvis", line)
+                persistChat()
+                speak(line, alreadyPostedToChat = true)
+            }
+            return true
+        }
+
+        if (TalkerDispatcher.isLongExplainOnceTurn(lower)) {
+            scope.launch {
+                val line = "Ye lambi baat hai — document ki tarah save kar dun?"
+                JarvisStateRepository.addChatMessage("Jarvis", line)
+                persistChat()
+                speak(line, alreadyPostedToChat = true)
+            }
+            return true
+        }
+
+        val instructionText = TalkerDispatcher.extractInstruction(lower)
+        if (instructionText != null) {
+            scope.launch {
+                // Macro-collision guard (DESIGN §5.8): an instruction
+                // is never stored as a VoiceRoutine and never rewrites
+                // the goal. If the text already IS a macro trigger,
+                // the macro wins.
+                val collidesWithMacro = prefs.getRoutines().any { routine ->
+                    routine.triggerPhrase.lowercase() == instructionText.lowercase()
+                }
+                if (collidesWithMacro) {
+                    val line = "Ye pehle se ek routine hai — usi se hoga."
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                    return@launch
+                }
+                val scopeKeywords = MemoryKeywords.extract("$instructionText $trimmed")
+                    .take(LearnedPatternPolicy.MAX_KEYWORDS)
+                val appliesTo = instructionAppliesTo(lower)
+                val saved = runCatching {
+                    learnedPatternStore.saveInstruction(instructionText, scopeKeywords, appliesTo)
+                }.getOrNull()
+                if (saved == null) {
+                    val line = "Yaad nahi rakh paya — dobara bolo."
+                    JarvisStateRepository.addChatMessage("Jarvis", line)
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                } else {
+                    val spoken = instructionText.take(80)
+                    val line = "Yaad rakha — aage se $spoken."
+                    JarvisStateRepository.addChatMessage(
+                        "Jarvis",
+                        "$line\nScope: ${scopeKeywords.take(5).joinToString(", ")}."
+                    )
+                    persistChat()
+                    speak(line, alreadyPostedToChat = true)
+                }
+            }
+            return true
+        }
+
+        return false
+    }
+
+    /** Best-matching enabled (or any, when [enabledOnly] is false)
+     *  pattern for a forget/disable turn, by keyword overlap (score ≥ 3). */
+    private fun findPatternByTurn(lower: String, enabledOnly: Boolean): LearnedPatternMeta? {
+        val keywords = MemoryKeywords.extract(lower)
+        val patterns = runCatching { learnedPatternStore.listPatterns() }.getOrDefault(emptyList())
+        var best: LearnedPatternMeta? = null
+        var bestScore = -1
+        for (meta in patterns) {
+            if (enabledOnly && !meta.enabled) continue
+            val score = LearnedPatternPolicy.matchScore(
+                queryKeywords = keywords,
+                patternKeywords = meta.triggerKeywords,
+                workKindMatches = false,
+                phraseContainsSignature = lower.contains(meta.triggerSignature.lowercase())
+            )
+            if (score >= LearnedPatternPolicy.MATCH_MIN_SCORE && score > bestScore) {
+                bestScore = score
+                best = meta
+            }
+        }
+        return best
+    }
+
+    /** Best-matching enabled instruction for a forget turn (score ≥ 3). */
+    private fun findInstructionByTurn(lower: String): LearnedInstructionMeta? {
+        val keywords = MemoryKeywords.extract(lower)
+        val instructions = runCatching { learnedPatternStore.listInstructions() }
+            .getOrDefault(emptyList())
+        var best: LearnedInstructionMeta? = null
+        var bestScore = -1
+        for (meta in instructions) {
+            if (!meta.enabled) continue
+            val score = LearnedPatternPolicy.matchScore(
+                queryKeywords = keywords,
+                patternKeywords = meta.scopeKeywords,
+                workKindMatches = false,
+                phraseContainsSignature = lower.contains(meta.text.lowercase())
+            )
+            if (score >= LearnedPatternPolicy.MATCH_MIN_SCORE && score > bestScore) {
+                bestScore = score
+                best = meta
+            }
+        }
+        return best
+    }
+
+    /** Work kind(s) an instruction applies to, from the turn's own
+     *  words (DESIGN §5.8). Default: both kinds. */
+    private fun instructionAppliesTo(lower: String): List<String> {
+        val planWords = listOf("website", "github", "supabase", "vercel", "deploy", "agent mode", "project")
+        val loopWords = listOf("whatsapp", "bhej", "message", "youtube", "torch", "volume")
+        val isPlan = planWords.any { lower.contains(it) }
+        val isLoop = loopWords.any { lower.contains(it) }
+        return when {
+            isPlan && !isLoop -> listOf("PLAN")
+            isLoop && !isPlan -> listOf("LOOP")
+            else -> listOf("PLAN", "LOOP")
         }
     }
 
@@ -2094,6 +3500,10 @@ class JarvisAgentEngine(
         clearTaskScopedState()
         lastExecutedAction = ""
         lastBuildWritten = false
+        // 1.9.0 (v2): loop milestone state is per-run, never carried
+        // across tasks (DESIGN §3.2).
+        loopLastActionKind = ""
+        loopVerifiedSteps = 0
         // Offline gate (1.4.0): cloud planning needs network.
         // Local (on-device) chat still works offline; no-AI local
         // routines already returned before this loop. Speak a
@@ -2457,6 +3867,14 @@ class JarvisAgentEngine(
                     // so executeDecisionAction just ran above.
                     recordLoopStep(decision, stepResult.ok)
                     lastExecutedAction = decision.action
+                    // 1.9.0 (v2, DESIGN §3.2): loop milestone — only
+                    // on a kind change, every 3rd verified step, or
+                    // a > 60 s step, and only when this step's own
+                    // evidence verifies. llmStartMs is the step's
+                    // start (the LLM call opens the step).
+                    maybeEmitLoopProgress(
+                        decision, step, stepResult, snapshot, preMusicActive, llmStartMs
+                    )
                 }
 
                 // Builder §5c: a failed build validation is NEVER a
@@ -2564,13 +3982,31 @@ class JarvisAgentEngine(
                     }
                     when (verifyStepEvidence(decision, stepResult, accService, preSnapshot = snapshot, preMusicActive = preMusicActive)) {
                         StepEvidence.VERIFIED -> {
-                            // The held completion reply (C2) may be
-                            // spoken now — the evidence backs it.
-                            // Builder §6: validated build summary,
-                            // spoken AND in chat — unless the LLM's own
-                            // reply already is that summary (same files
-                            // + preview line), in which case speaking
-                            // it twice would just be noise.
+                            // 1.9.0 (v2, DESIGN §4.5): the speak MOVES
+                            // behind the verification gate. The loop
+                            // no longer speaks its own DONE summary —
+                            // the Talker re-reads the artifact first
+                            // (deliverVerifiedExecutorResult) and only
+                            // then says "ho gaya" (or the honest
+                            // unverified / still-missing line). The
+                            // model's deferred reply is still posted
+                            // to chat (it is the step's own words for
+                            // the record), but never spoken here; the
+                            // second-claim guard still notes the
+                            // unverified second claim in chat.
+                            // The built summary drops the "Ho gaya
+                            // bhai!" prefix — the gate's verified line
+                            // adds it, and a double prefix would read
+                            // as two completion claims.
+                            var doneSummary = ""
+                            // Plain (non-Executor) loop turns — TALK
+                            // fallback, replay fallback — have no
+                            // Talker command, so there is no gate to
+                            // route through: they keep the v1 behaviour
+                            // (speak the loop's own verified summary).
+                            // Only Executor turns go through the gate.
+                            var plainSpeakLine: String? = null
+                            var plainChatLine: String? = null
                             if (decision.action in listOf("CREATE_PROJECT", "WRITE_PROJECT_FILE") &&
                                 lastBuildValidation?.ok == true && lastBuildWritten
                             ) {
@@ -2584,19 +4020,20 @@ class JarvisAgentEngine(
                                         JarvisStateRepository.addChatMessage("Jarvis", it)
                                         persistChat()
                                     }
-                                    val summary = "Ho gaya bhai! Project '$projectName' ban gaya — " +
+                                    doneSummary = "Project '$projectName' ban gaya — " +
                                         "files: ${builtFiles.joinToString(", ")}. " +
                                         "Preview: ${ProjectStore.localhostUrl(projectName)} — " +
                                         "Projects tab me Preview dabao, ya Browser me kholo (full-screen, wahi preview)."
-                                    JarvisStateRepository.addChatMessage("Jarvis", summary)
-                                    speak(summary, alreadyPostedToChat = true)
+                                    plainSpeakLine = "Ho gaya bhai! $doneSummary"
+                                    plainChatLine = plainSpeakLine
                                 } else {
                                     deferredCompletionReply?.let { raw ->
                                         JarvisStateRepository.addChatMessage("Jarvis", raw)
                                         persistChat()
                                         // 1.5.2-PRO (second-claim
-                                        // guard): chat me FULL reply,
-                                        // speak sirf pehla claim.
+                                        // guard): the second claim goes
+                                        // to chat with a note that it
+                                        // was not verified in this step.
                                         val (guarded, secondClaim) = guardSecondClaim(raw)
                                         secondClaim?.let { claim ->
                                             JarvisStateRepository.addChatMessage(
@@ -2605,22 +4042,14 @@ class JarvisAgentEngine(
                                             )
                                             persistChat()
                                         }
-                                        speak(guarded, alreadyPostedToChat = true)
+                                        doneSummary = raw
+                                        plainSpeakLine = guarded
                                     }
                                 }
                             } else {
-                                // 1.5.2-PRO (second-claim guard,
-                                // closes 1.4.25 Step 1g): the deferred
-                                // reply is the model's words for THIS
-                                // step only. It is spoken here because
-                                // this step's own evidence passed —
-                                // but only up to the FIRST completion
-                                // claim. A multi-claim reply ("X bhej
-                                // diya aur Y bhi kar diya") speaks its
-                                // first claim; the second claim goes to
-                                // chat with a note that it was not
-                                // verified in this step. Chat always
-                                // keeps the FULL reply.
+                                // 1.5.2-PRO (second-claim guard):
+                                // chat keeps the FULL reply; the
+                                // second claim is noted, never spoken.
                                 deferredCompletionReply?.let { raw ->
                                     JarvisStateRepository.addChatMessage("Jarvis", raw)
                                     persistChat()
@@ -2632,15 +4061,22 @@ class JarvisAgentEngine(
                                         )
                                         persistChat()
                                     }
-                                    speak(guarded, alreadyPostedToChat = true)
+                                    doneSummary = raw
+                                    plainSpeakLine = guarded
                                 }
                             }
+                            if (doneSummary.isBlank()) doneSummary = decision.reply
                             // Verified completion: persist the learned
                             // routine + index this turn for memory-first
-                            // lookup, then the post-task prompt. The mic
-                            // loop (service-owned) is NEVER stopped here —
-                            // it keeps listening for the answer.
+                            // lookup. The mic loop (service-owned) is
+                            // NEVER stopped here — it keeps listening
+                            // for the answer. The routine is kept for
+                            // the gate's pattern extraction
+                            // (lastVerifiedLoopRoutine); the v2 pattern
+                            // itself is only learned after the Talker
+                            // verdict (learnFromVerified).
                             val finishedRoutine = learnedRoutineStore.finishRoutine(initialGoal, verified = true)
+                            lastVerifiedLoopRoutine = finishedRoutine
                             if (finishedRoutine != null) {
                                 maybeUploadLearnedPattern(finishedRoutine)
                             }
@@ -2656,15 +4092,31 @@ class JarvisAgentEngine(
                             )
                             JarvisStateRepository.setCurrentGoal("")
                             clearTaskScopedState()
-                            // 1.8.0: DONE, unannounced — the verified
-                            // summary is already fully in chat AND
-                            // spoken above.
-                            reportExecutorOutcome(
-                                ExecutorResultStatus.DONE,
-                                lastReply.take(300),
-                                "verified exit", speakResult = false, chatResult = false
-                            )
-                            speak("Aur kya karna hai?")
+                            // 1.9.0 (v2): DONE, chat-posted but NOT
+                            // spoken — the verification gate speaks
+                            // the verdict (or the fix / honest line).
+                            // Typed refs let the Talker re-read the
+                            // artifact instead of trusting the claim.
+                            // Plain loop turns (no active Executor
+                            // command) keep the v1 speak instead.
+                            if (activeExecutorCommand != null) {
+                                reportExecutorOutcome(
+                                    ExecutorResultStatus.DONE,
+                                    doneSummary.take(300),
+                                    "verified exit",
+                                    speakResult = false, chatResult = true,
+                                    evidenceJson = EvidenceRefs.toJson(loopDoneRefs(decision))
+                                )
+                            } else {
+                                plainChatLine?.let {
+                                    JarvisStateRepository.addChatMessage("Jarvis", it)
+                                    persistChat()
+                                }
+                                plainSpeakLine?.let {
+                                    speak(it, alreadyPostedToChat = plainChatLine != null)
+                                }
+                                speak("Aur kya karna hai?")
+                            }
                             return
                         }
                         StepEvidence.FAILED -> {

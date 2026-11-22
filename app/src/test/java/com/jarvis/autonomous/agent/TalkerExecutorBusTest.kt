@@ -134,4 +134,127 @@ class TalkerExecutorBusTest {
         bus.submit(command("3"))
         assertEquals(listOf("1", "2", "3"), bus.pendingCommands().map { it.id })
     }
+
+    // ---- 1.9.0 (v2) — progress + fix pairing ----
+
+    private fun progress(id: String, label: String, index: Int = 1) = ExecutorProgress(
+        commandId = id, stepIndex = index, stepTotal = 3, stepLabel = label
+    )
+
+    @Test
+    fun progressForUnknownIdIsDropped() {
+        val bus = TalkerExecutorBus()
+        assertFalse(bus.reportProgress(progress("ghost", "Step")))
+        assertNull(bus.lastProgress("ghost"))
+    }
+
+    @Test
+    fun progressKeepsFreshestOnlyAndDoesNotTouchPendingOrHistory() {
+        val bus = TalkerExecutorBus()
+        bus.submit(command("1"))
+        assertTrue(bus.reportProgress(progress("1", "Step A")))
+        assertTrue(bus.reportProgress(progress("1", "Step B", index = 2)))
+        assertEquals("Step B", bus.lastProgress("1")!!.stepLabel)
+        assertEquals(1, bus.pendingCount())
+        assertTrue(bus.completedHistory().isEmpty())
+        // Progress after terminal completion still lands (the id is
+        // in completed history) but never re-opens the job.
+        assertTrue(bus.complete(result("1", ExecutorResultStatus.DONE)))
+        assertNull(bus.lastProgress("1"))
+        assertTrue(bus.reportProgress(progress("1", "Step C", index = 3)))
+        assertEquals("Step C", bus.lastProgress("1")!!.stepLabel)
+        assertFalse(bus.isPending("1"))
+    }
+
+    @Test
+    fun progressListenerIsNotified() {
+        val bus = TalkerExecutorBus()
+        bus.submit(command("1"))
+        val seen = ArrayList<String>()
+        bus.addProgressListener { seen.add(it.stepLabel) }
+        bus.reportProgress(progress("1", "Step A"))
+        bus.reportProgress(progress("ghost", "Step X"))
+        assertEquals(listOf("Step A"), seen)
+    }
+
+    @Test
+    fun lateProgressAfterCancelIsDropped() {
+        val bus = TalkerExecutorBus()
+        bus.submit(command("1"))
+        assertTrue(bus.reportProgress(progress("1", "Step A")))
+        bus.cancel("1")
+        assertNull(bus.lastProgress("1"))
+        assertFalse(bus.reportProgress(progress("1", "Step B", index = 2)))
+    }
+
+    @Test
+    fun fixRequestRequiresKnownCommandAndValidAttempt() {
+        val bus = TalkerExecutorBus()
+        val req = ExecutorFixRequest(
+            commandId = "ghost", attempt = 1, missingRefs = listOf("preview_http:preview:x")
+        )
+        assertFalse(bus.requestFix(req))
+        bus.submit(command("1"))
+        assertTrue(
+            bus.requestFix(
+                ExecutorFixRequest(
+                    commandId = "1", attempt = 1, missingRefs = listOf("preview_http:preview:x")
+                )
+            )
+        )
+        assertTrue(bus.hasOutstandingFix("1"))
+        // Attempt 3 of max 2 is invalid and never marks outstanding.
+        assertFalse(
+            bus.requestFix(
+                ExecutorFixRequest(
+                    commandId = "1", attempt = 3, maxAttempts = 2,
+                    missingRefs = listOf("preview_http:preview:x")
+                )
+            )
+        )
+    }
+
+    @Test
+    fun fixResultWithoutOutstandingRequestIsDropped() {
+        val bus = TalkerExecutorBus()
+        bus.submit(command("1"))
+        val fix = ExecutorFixResult(
+            commandId = "1", attempt = 1, status = FixResultStatus.FIXED,
+            freshEvidenceJson = "{}"
+        )
+        assertFalse(bus.completeFix(fix))
+        // After a request, the result is delivered once and the
+        // outstanding mark is consumed — a second result is dropped.
+        assertTrue(
+            bus.requestFix(
+                ExecutorFixRequest(
+                    commandId = "1", attempt = 1, missingRefs = listOf("preview_http:preview:x")
+                )
+            )
+        )
+        assertTrue(bus.completeFix(fix))
+        assertFalse(bus.hasOutstandingFix("1"))
+        assertFalse(bus.completeFix(fix))
+    }
+
+    @Test
+    fun fixListenersAreNotifiedOnlyOnPairedResult() {
+        val bus = TalkerExecutorBus()
+        bus.submit(command("1"))
+        val seen = ArrayList<FixResultStatus>()
+        bus.addFixListener { seen.add(it.status) }
+        bus.completeFix(
+            ExecutorFixResult(commandId = "1", attempt = 1, status = FixResultStatus.FIXED)
+        )
+        assertTrue(seen.isEmpty())
+        bus.requestFix(
+            ExecutorFixRequest(
+                commandId = "1", attempt = 1, missingRefs = listOf("preview_http:preview:x")
+            )
+        )
+        bus.completeFix(
+            ExecutorFixResult(commandId = "1", attempt = 1, status = FixResultStatus.STILL_MISSING)
+        )
+        assertEquals(listOf(FixResultStatus.STILL_MISSING), seen)
+    }
 }

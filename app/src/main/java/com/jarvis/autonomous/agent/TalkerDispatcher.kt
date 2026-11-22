@@ -130,4 +130,122 @@ object TalkerDispatcher {
         val lower = text.lowercase().trim()
         return STATUS_PATTERNS.any { lower.contains(it) }
     }
+
+    // ---- 1.9.0 (v2) explain-once / forget / list turns ----
+    // Pure phrase helpers so the engine call site stays one line and
+    // the phrases are unit-tested (DESIGN §5.8). Detection runs in
+    // the engine BEFORE Talker classification, after macros — a
+    // meta-turn about memory is not work, and must never dispatch.
+
+    /** Trigger phrases that teach a standing instruction. The turn
+     *  must also carry instruction text AFTER the trigger; a bare
+     *  "yaad rakhna" is not an instruction (see [extractInstruction]). */
+    private val EXPLAIN_TRIGGERS = listOf(
+        "yaad rakhna", "yaad rakh", "note kar lo", "aage se", "hamesha"
+    )
+
+    /** True when the turn looks like an explain-once teaching turn. */
+    fun isExplainOnceTurn(text: String): Boolean =
+        extractInstruction(text) != null
+
+    /**
+     * The instruction text after the trigger phrase, or null when
+     * there is none (bare trigger) or it is over-long (> 280 chars —
+     * the Talker offers the document path instead of truncating).
+     * Transliterated matching is the caller's job: pass the same
+     * lowercased transliterated form the stop check uses.
+     */
+    fun extractInstruction(text: String): String? {
+        val rest = triggerRemainder(text) ?: return null
+        if (rest.isEmpty()) return null
+        if (rest.length > 280) return null
+        // "hamesha" alone is not a trigger ("hamesha aisa hota
+        // hai" is chat) — DESIGN §5.8 wants "hamesha … karna"
+        // shape. The V8 case ("hamesha pehle … poochhna") is
+        // covered by the poochh- verb as well.
+        if (triggerOf(text) == "hamesha") {
+            val restLower = rest.lowercase()
+            if (!restLower.contains("karna") && !restLower.contains("poochh") &&
+                !restLower.contains("poochna")
+            ) {
+                return null
+            }
+        }
+        return rest
+    }
+
+    /** True when a trigger phrase is present but nothing follows it
+     *  ("yaad rakhna" alone) — the Talker asks what to remember. */
+    fun isBareExplainOnceTurn(text: String): Boolean {
+        val rest = triggerRemainder(text) ?: return false
+        return rest.isEmpty()
+    }
+
+    /** True when a trigger phrase is present but the instruction is
+     *  over-long (> 280 chars) — the Talker offers the document path. */
+    fun isLongExplainOnceTurn(text: String): Boolean {
+        val rest = triggerRemainder(text) ?: return false
+        return rest.length > 280
+    }
+
+    /** Which trigger phrase matched first (longest-first order), or null. */
+    private fun triggerOf(text: String): String? {
+        val lower = text.lowercase().trim()
+        for (trigger in EXPLAIN_TRIGGERS) {
+            if (lower.contains(trigger)) return trigger
+        }
+        return null
+    }
+
+    /** Raw text after the first matching trigger phrase (trimmed of
+     *  leading punctuation), or null when no trigger is present. */
+    private fun triggerRemainder(text: String): String? {
+        val lower = text.lowercase().trim()
+        for (trigger in EXPLAIN_TRIGGERS) {
+            val idx = lower.indexOf(trigger)
+            if (idx < 0) continue
+            return text.substring(idx + trigger.length)
+                .trim()
+                .trimStart(',', ':', '—', '-')
+                .trim()
+        }
+        return null
+    }
+
+    /** "kya yaad rakha hai?" / "kya kya yaad hai?" — list remembered items. */
+    fun isListMemoryTurn(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return lower.contains("kya yaad rakha") || lower.contains("kya kya yaad hai") ||
+            lower.contains("kya yaad hai")
+    }
+
+    /** "bhool jao …" / "ye mat yaad rakhna" — delete a stored instruction or pattern. */
+    fun isForgetTurn(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return lower.contains("bhool jao") || lower.contains("bhool ja") ||
+            lower.contains("mat yaad rakhna")
+    }
+
+    /** True when the forget turn targets a learned PATTERN, not an instruction. */
+    fun isForgetPatternTurn(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return lower.contains("tareeka") || lower.contains("seekha hua")
+    }
+
+    /** "ye tareeka mat use karo" — disable the applied pattern for this command. */
+    fun isDisablePatternTurn(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return (lower.contains("tareeka") && lower.contains("mat use karo")) ||
+            lower.contains("dobara mat use karna")
+    }
+
+    /** True when the disable is permanent ("dobara mat use karna"). */
+    fun isPermanentDisableTurn(text: String): Boolean =
+        text.lowercase().contains("dobara mat use karna")
+
+    /** "seekha hua phir se use karo" — re-enable a disabled pattern. */
+    fun isReenablePatternTurn(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return lower.contains("phir se use karo")
+    }
 }

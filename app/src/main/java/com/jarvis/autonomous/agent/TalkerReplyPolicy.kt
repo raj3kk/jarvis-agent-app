@@ -84,6 +84,77 @@ object TalkerReplyPolicy {
     }
 
     /**
+     * 1.9.0 (v2): status answer from the freshest structured
+     * progress (DESIGN §3.5). Stale progress (older than
+     * [TalkerProgressPolicy.PROGRESS_STALE_MS]) is never quoted as
+     * current: the answer degrades to elapsed-only plus the stalled
+     * line when the job looks stalled. ETA is spoken only when
+     * `etaSeconds > 0` — loops never carry one.
+     */
+    fun statusLine(
+        command: ExecutorCommand?,
+        progress: ExecutorProgress?,
+        elapsedMs: Long,
+        stalled: Boolean,
+        nowMs: Long = System.currentTimeMillis()
+    ): String {
+        if (command == null) return "Abhi koi kaam chal nahi raha — kuch karwana ho to bolo."
+        val minutes = elapsedMs / 60_000L
+        val elapsed = when {
+            minutes <= 0 -> "abhi-abhi shuru hua hai"
+            minutes == 1L -> "1 minute se chal raha hai"
+            else -> "$minutes minute se chal raha hai"
+        }
+        val goal = command.goal.trim().take(80).ifBlank { "kaam" }
+        val stalledSuffix = if (stalled) " ${TalkerProgressPolicy.stalledLine()}" else ""
+        if (progress == null || TalkerProgressPolicy.isStale(progress, nowMs)) {
+            return "Abhi ban raha hai — $goal, $elapsed.$stalledSuffix"
+        }
+        val label = progress.stepLabel.trim().take(80)
+        val eta = TalkerProgressPolicy.etaClause(progress.etaSeconds)
+        return if (progress.stepTotal > 0) {
+            "Abhi chal raha hai — $goal, $elapsed. Step ${progress.stepIndex}/${progress.stepTotal}: $label.$eta$stalledSuffix"
+        } else {
+            "Abhi chal raha hai — $goal, $elapsed. Abhi $label chal raha hai.$stalledSuffix"
+        }
+    }
+
+    /**
+     * 1.9.0 (v2): one progress line, spoken and chat share the same
+     * text (the chat rendering adds only the `⏳` marker — see
+     * [progressChatLine]). Plans name the next step; loops never
+     * invent one (DESIGN §3.3). `phase` START = "shuru hua",
+     * DONE = "ho gaya" for that step (a step "ho gaya" is fine —
+     * only a terminal DONE may claim the whole task is done).
+     */
+    fun progressLine(progress: ExecutorProgress, nextLabel: String?): String {
+        val label = progress.stepLabel.trim().take(80)
+        val stepPart = if (progress.stepTotal > 0) {
+            "Step ${progress.stepIndex}/${progress.stepTotal}: $label"
+        } else {
+            label
+        }
+        val verb = when (progress.phase) {
+            "DONE" -> "ho gaya"
+            "START" -> "shuru hua"
+            else -> "chal raha hai"
+        }
+        val next = if (progress.stepTotal > 0 && !nextLabel.isNullOrBlank()) {
+            " — aage: ${nextLabel.trim().take(80)}"
+        } else if (progress.stepTotal > 0 && progress.stepIndex >= progress.stepTotal) {
+            // Last plan step: no next step to name.
+            " — bas, khatm hone wala hai"
+        } else {
+            ""
+        }
+        return "$stepPart $verb$next"
+    }
+
+    /** Chat rendering of a progress line: same text, `⏳` marker only. */
+    fun progressChatLine(progress: ExecutorProgress, nextLabel: String?): String =
+        "⏳ ${progressLine(progress, nextLabel)}"
+
+    /**
      * The Talker's spoken + chat line for a delivered [ExecutorResult].
      * One claim per line; DONE is the only status that may say "ho gaya".
      */

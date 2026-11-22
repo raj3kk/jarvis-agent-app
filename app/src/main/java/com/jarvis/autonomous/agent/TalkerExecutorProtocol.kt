@@ -17,9 +17,16 @@ import java.util.UUID
  *
  * Serialization is hand-rolled (minimal JSON escaper + small object
  * parser), deliberately NOT org.json: org.json is an Android-framework
- * class whose methods throw "not mocked" in JVM unit tests. Only flat
- * string/number/boolean fields plus one level of string map are
- * supported; anything else fails closed ([fromJson] returns null).
+ * class whose methods throw "not mocked" in JVM unit tests. Flat
+ * string/number/boolean fields, one level of string map, and arrays
+ * of flat values / flat objects are supported; anything else fails
+ * closed ([fromJson] returns null).
+ *
+ * Release 1.9.0-PRO (vc 45) adds, additively inside te/1 (no version
+ * bump — see expansion/talker-executor-v2/DESIGN.md §2.1): the
+ * optional [ExecutorResult.evidenceJson] field carrying typed
+ * evidence refs, and array support in the parser for the progress /
+ * fix message kinds in [TalkerExecutorProgress].
  */
 object TalkerExecutorProtocol {
 
@@ -65,11 +72,19 @@ object TalkerExecutorProtocol {
         }
     }
 
+    /** Array of flat strings as JSON (v2: FIX_REQUEST missingRefs, …). */
+    internal fun stringListToJson(list: List<String>): String {
+        if (list.isEmpty()) return "[]"
+        return list.joinToString(",", "[", "]") { "\"${escapeJson(it)}\"" }
+    }
+
     /**
      * Minimal JSON object parser. Returns a map of key -> raw value where
-     * a value is String, Long, Boolean, or Map<String, String> (nested
-     * object, string values only). Returns null on ANY malformed input.
-     * Unknown keys are preserved (forward-compat: v2 may add fields).
+     * a value is String, Long, Boolean, Map<String, Any?> (nested
+     * object, string values only), or List<Any?> (array of flat values
+     * or flat objects — v2 extension for evidence-ref / string lists).
+     * Returns null on ANY malformed input. Unknown keys are preserved
+     * (forward-compat: v2 may add fields).
      */
     internal fun parseJsonObject(json: String): Map<String, Any?>? {
         return try {
@@ -123,11 +138,37 @@ object TalkerExecutorProtocol {
             return when (val ch = text[pos]) {
                 '"' -> parseString()
                 '{' -> parseObject()
+                '[' -> parseArray()
                 't' -> { expect("true"); true }
                 'f' -> { expect("false"); false }
                 'n' -> { expect("null"); null }
                 '-', in '0'..'9' -> parseNumber()
                 else -> throw IllegalArgumentException("unexpected char $ch")
+            }
+        }
+
+        /** Array of flat values / flat objects (v2). Nested arrays are rejected. */
+        private fun parseArray(): List<Any?> {
+            require(pos < text.length && text[pos] == '[') { "expected [" }
+            pos++
+            val out = ArrayList<Any?>()
+            skipWs()
+            if (pos < text.length && text[pos] == ']') {
+                pos++
+                return out
+            }
+            while (true) {
+                skipWs()
+                // Nested arrays are not supported — fail closed.
+                require(pos < text.length && text[pos] != '[') { "nested array unsupported" }
+                out.add(parseValue())
+                skipWs()
+                require(pos < text.length) { "unterminated array" }
+                when (text[pos]) {
+                    ',' -> { pos++; continue }
+                    ']' -> { pos++; return out }
+                    else -> throw IllegalArgumentException("expected , or ]")
+                }
             }
         }
 
@@ -194,6 +235,35 @@ object TalkerExecutorProtocol {
         for ((k, v) in nested) {
             if (v !is String) return null
             out[k] = v
+        }
+        return out
+    }
+
+    /** Array of flat strings, or null when the value is absent / not one. */
+    @Suppress("UNCHECKED_CAST")
+    internal fun asStringList(map: Map<String, Any?>, key: String): List<String>? {
+        val list = map[key] as? List<Any?> ?: return null
+        val out = ArrayList<String>(list.size)
+        for (v in list) {
+            if (v !is String) return null
+            out.add(v)
+        }
+        return out
+    }
+
+    /** Array of flat objects (each a string-valued map), or null when absent / not one. */
+    @Suppress("UNCHECKED_CAST")
+    internal fun asObjectList(map: Map<String, Any?>, key: String): List<Map<String, String>>? {
+        val list = map[key] as? List<Any?> ?: return null
+        val out = ArrayList<Map<String, String>>(list.size)
+        for (v in list) {
+            val obj = v as? Map<String, Any?> ?: return null
+            val flat = linkedMapOf<String, String>()
+            for ((k, value) in obj) {
+                if (value !is String) return null
+                flat[k] = value
+            }
+            out.add(flat)
         }
         return out
     }
@@ -336,6 +406,15 @@ data class ExecutorResult(
     val summary: String,
     /** Machine detail for chat/log (step evidence, HTTP code, file list). */
     val evidence: String = "",
+    /**
+     * 1.9.0 (v2, additive): machine-checkable evidence as a JSON
+     * string — `{"refs":[{kind, ref, check, value}, …]}` (see
+     * [EvidenceRefs]). Empty = no typed claim; a DONE with no refs
+     * verifies as UNVERIFIED, never as MISMATCH. Only DONE carries
+     * it; a non-DONE result with a non-empty value is treated as
+     * empty by the verifier.
+     */
+    val evidenceJson: String = "",
     val finishedAtMs: Long = System.currentTimeMillis(),
     val durationMs: Long = 0L,
     /** True when this result arrives AFTER a TIMEOUT was already delivered. */
@@ -360,6 +439,7 @@ data class ExecutorResult(
             append("\"status\":\"${status.wire}\",")
             append("\"summary\":\"${escapeJson(summary)}\",")
             append("\"evidence\":\"${escapeJson(evidence)}\",")
+            append("\"evidenceJson\":\"${escapeJson(evidenceJson)}\",")
             append("\"finishedAtMs\":$finishedAtMs,")
             append("\"durationMs\":$durationMs,")
             append("\"isLate\":$isLate")
@@ -378,12 +458,14 @@ data class ExecutorResult(
             ) ?: return null
             val summary = TalkerExecutorProtocol.asString(map, "summary") ?: return null
             val evidence = TalkerExecutorProtocol.asString(map, "evidence") ?: ""
+            val evidenceJson = TalkerExecutorProtocol.asString(map, "evidenceJson") ?: ""
             val finishedAtMs = TalkerExecutorProtocol.asLong(map, "finishedAtMs") ?: return null
             val durationMs = TalkerExecutorProtocol.asLong(map, "durationMs") ?: 0L
             val isLate = TalkerExecutorProtocol.asBoolean(map, "isLate") ?: false
             return ExecutorResult(
                 version = version, commandId = commandId, status = status,
                 summary = summary, evidence = evidence,
+                evidenceJson = evidenceJson,
                 finishedAtMs = finishedAtMs, durationMs = durationMs, isLate = isLate
             )
         }
