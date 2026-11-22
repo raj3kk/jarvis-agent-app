@@ -21,8 +21,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.resume
-import kotlinx.coroutines.resumeWithException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -443,50 +441,58 @@ class GeckoSpikeActivity : ComponentActivity() {
     // ------------------------------------------------------------------
 
     /**
-     * Await a GeckoResult. NOTE: GeckoResult.accept takes
-     * Consumer<T> / Consumer<Throwable> (single method `accept`),
-     * NOT OnValueListener/OnExceptionListener (those are for then()).
+     * Await a GeckoResult via a CompletableDeferred bridge (no
+     * suspendCancellableCoroutine — its overload shape varies across
+     * kotlinx-coroutines versions, and the resume/resumeWithException
+     * top-level fns moved packages in Kotlin 2.4).
+     * NOTE: GeckoResult.accept takes Consumer<T> /
+     * Consumer<Throwable> (single method `accept`), NOT
+     * OnValueListener/OnExceptionListener (those are for then()).
      * Verified against mozilla-central GeckoResult.java.
      */
-    private suspend fun <T> GeckoResult<T>.awaitValue(): T? =
-        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-            accept(
-                object : GeckoResult.Consumer<T> {
-                    override fun accept(t: T?) {
-                        if (cont.isActive) cont.resume(t)
-                    }
-                },
-                object : GeckoResult.Consumer<Throwable> {
-                    override fun accept(t: Throwable?) {
-                        if (cont.isActive) {
-                            cont.resumeWithException(
-                                t ?: Exception("unknown GeckoResult error"),
-                            )
-                        }
-                    }
-                },
-            )
-        }
+    private suspend fun <T> GeckoResult<T>.awaitValue(): T? {
+        val deferred = CompletableDeferred<T?>()
+        accept(
+            object : GeckoResult.Consumer<T> {
+                override fun accept(t: T?) {
+                    deferred.complete(t)
+                }
+            },
+            object : GeckoResult.Consumer<Throwable> {
+                override fun accept(t: Throwable?) {
+                    deferred.completeExceptionally(
+                        t ?: Exception("unknown GeckoResult error"),
+                    )
+                }
+            },
+        )
+        return deferred.await()
+    }
 
     // ------------------------------------------------------------------
     // Runtime + extension setup
     // ------------------------------------------------------------------
 
+    // MessageDelegate signatures (160.x, verified against
+    // mozilla-central WebExtension.java — the pins doc's older
+    // (source, message, session) form is OUTDATED):
+    //   onMessage(String nativeApp, Object message, MessageSender sender)
+    //   onConnect(Port port)   — session comes from port.sender.session
+    //   (null when the sender is a background script).
+    // MessageSender carries session (@Nullable), url, environmentType
+    // (ENV_TYPE_CONTENT_SCRIPT vs ENV_TYPE_EXTENSION), isTopLevel().
     private val bridgeDelegate = object : WebExtension.MessageDelegate {
         override fun onMessage(
-            source: WebExtension,
+            nativeApp: String,
             message: Any,
-            session: GeckoSession?,
+            sender: WebExtension.MessageSender,
         ): GeckoResult<Any>? {
-            (message as? JSONObject)?.let { handleBridgeMessage(it, session) }
+            (message as? JSONObject)?.let { handleBridgeMessage(it, sender.session) }
             return null
         }
 
-        override fun onConnect(
-            source: WebExtension,
-            port: WebExtension.Port,
-            session: GeckoSession?,
-        ) {
+        override fun onConnect(port: WebExtension.Port) {
+            val session = port.sender.session
             log("Bridge port connected (session=${session != null})")
             val owner = allSessions.firstOrNull { it.session == session }
             if (owner != null) {
@@ -497,11 +503,13 @@ class GeckoSpikeActivity : ComponentActivity() {
             }
             port.setDelegate(object : WebExtension.PortDelegate {
                 override fun onPortMessage(message: Any, port: WebExtension.Port) {
-                    (message as? JSONObject)?.let { handleBridgeMessage(it, session) }
+                    (message as? JSONObject)?.let {
+                        handleBridgeMessage(it, port.sender.session)
+                    }
                 }
 
                 override fun onDisconnect(port: WebExtension.Port) {
-                    log("Bridge port disconnected (session=${session != null})")
+                    log("Bridge port disconnected (session=${port.sender.session != null})")
                     if (owner != null && owner.port == port) owner.port = null
                 }
             })
