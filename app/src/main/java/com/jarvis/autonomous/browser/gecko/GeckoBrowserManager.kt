@@ -24,6 +24,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
@@ -260,6 +261,17 @@ object GeckoBrowserManager {
         }
     }
 
+    private fun JSONArray.toPlainList(): List<Any?> {
+        return (0 until length()).map { i ->
+            when (val item = opt(i)) {
+                is JSONObject -> item.toFieldMap()
+                is JSONArray -> item.toPlainList()
+                JSONObject.NULL -> null
+                else -> item
+            }
+        }
+    }
+
     private fun JSONObject.toFieldMap(): Map<String, Any?> {
         val map = mutableMapOf<String, Any?>()
         val keys = keys()
@@ -267,12 +279,7 @@ object GeckoBrowserManager {
             val key = keys.next()
             map[key] = when (val v = opt(key)) {
                 is JSONObject -> v.toFieldMap()
-                is JSONArray -> (0 until v.length()).map { item ->
-                    when (item) {
-                        is JSONObject -> item.toFieldMap()
-                        else -> item
-                    }
-                }
+                is JSONArray -> v.toPlainList()
                 JSONObject.NULL -> null
                 else -> v
             }
@@ -460,15 +467,15 @@ object GeckoBrowserManager {
                 override fun onLoadRequest(
                     session: GeckoSession,
                     request: GeckoSession.NavigationDelegate.LoadRequest
-                ): GeckoResult<GeckoSession.NavigationDelegate.AllowOrDeny>? {
+                ): GeckoResult<AllowOrDeny>? {
                     val uri = request.uri
                     // Same rule as the WebView engine: only http/https
                     // stay in-app; every other scheme is blocked.
                     return if (GeckoBridgeUtils.isLoadableScheme(uri)) {
-                        GeckoResult.fromValue(GeckoSession.NavigationDelegate.AllowOrDeny.ALLOW)
+                        GeckoResult.fromValue(AllowOrDeny.ALLOW)
                     } else {
                         tab.error.value = "Blocked link (sirf http/https khulte hain): $uri"
-                        GeckoResult.fromValue(GeckoSession.NavigationDelegate.AllowOrDeny.DENY)
+                        GeckoResult.fromValue(AllowOrDeny.DENY)
                     }
                 }
 
@@ -750,7 +757,10 @@ object GeckoBrowserManager {
      */
     suspend fun captureScreenshot(view: GeckoView): File? {
         val ctx = appContext ?: return null
-        val bitmap: Bitmap? = try {
+        // No explicit nullable type here: the Elvis narrows the try
+        // result to a non-null Bitmap, and an explicit `Bitmap?`
+        // annotation would defeat that smart-cast (CI 45044198448).
+        val bitmap = try {
             withTimeout(EXT_TIMEOUT_MS) { view.capturePixels().awaitValue() }
         } catch (e: Exception) {
             log("capturePixels FAILED: $e")
@@ -778,7 +788,8 @@ object GeckoBrowserManager {
      */
     suspend fun captureFullPage(view: GeckoView): File? {
         val ctx = appContext ?: return null
-        val bitmap: Bitmap? = try {
+        // Same Elvis narrowing as captureScreenshot (no `: Bitmap?`).
+        val bitmap = try {
             withTimeout(EXT_TIMEOUT_MS) { view.captureFullPage().awaitValue() }
         } catch (e: Exception) {
             log("captureFullPage FAILED (best-effort): $e")
