@@ -443,22 +443,26 @@ class GeckoSpikeActivity : ComponentActivity() {
     // ------------------------------------------------------------------
 
     /**
-     * Await a GeckoResult without SAM-inference risk (explicit listener
-     * objects; GeckoResult.accept takes Void-returning listeners).
+     * Await a GeckoResult. NOTE: GeckoResult.accept takes
+     * Consumer<T> / Consumer<Throwable> (single method `accept`),
+     * NOT OnValueListener/OnExceptionListener (those are for then()).
+     * Verified against mozilla-central GeckoResult.java.
      */
     private suspend fun <T> GeckoResult<T>.awaitValue(): T? =
         kotlinx.coroutines.suspendCancellableCoroutine { cont ->
             accept(
-                object : GeckoResult.OnValueListener<T, Void?> {
-                    override fun apply(value: T): Void? {
-                        if (cont.isActive) cont.resume(value)
-                        return null
+                object : GeckoResult.Consumer<T> {
+                    override fun accept(t: T?) {
+                        if (cont.isActive) cont.resume(t)
                     }
                 },
-                object : GeckoResult.OnExceptionListener<Void?> {
-                    override fun apply(exception: Throwable): Void? {
-                        if (cont.isActive) cont.resumeWithException(exception)
-                        return null
+                object : GeckoResult.Consumer<Throwable> {
+                    override fun accept(t: Throwable?) {
+                        if (cont.isActive) {
+                            cont.resumeWithException(
+                                t ?: Exception("unknown GeckoResult error"),
+                            )
+                        }
                     }
                 },
             )
