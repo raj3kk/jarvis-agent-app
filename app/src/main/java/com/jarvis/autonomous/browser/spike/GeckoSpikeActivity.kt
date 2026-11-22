@@ -15,6 +15,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CompletableDeferred
@@ -91,6 +92,7 @@ class GeckoSpikeActivity : ComponentActivity() {
     // ------------------------------------------------------------------
 
     private lateinit var logView: TextView
+    private lateinit var logScroll: ScrollView
     private lateinit var tinyView: GeckoView
     private lateinit var bigView: GeckoView
 
@@ -304,14 +306,25 @@ class GeckoSpikeActivity : ComponentActivity() {
         }
         val exportBtn = Button(this).apply {
             text = "EXPORT results JSON"
-            setOnClickListener { writeResults(); log("Results written (see paths in log).") }
+            setOnClickListener {
+                writeResults()
+                log("Results written (see paths in log).")
+                val extPath = getExternalFilesDir(null)?.let {
+                    File(it, "gecko-spike-results.json").absolutePath
+                } ?: "filesDir/gecko-spike-results.json"
+                Toast.makeText(
+                    this@GeckoSpikeActivity,
+                    "Results JSON saved: $extPath",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
         }
         tinyView = GeckoView(this).apply {
             layoutParams = ViewGroup.LayoutParams(1, 1)
         }
         bigView = GeckoView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(400),
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(150),
             )
         }
         logView = TextView(this).apply {
@@ -319,10 +332,13 @@ class GeckoSpikeActivity : ComponentActivity() {
             typeface = android.graphics.Typeface.MONOSPACE
             setTextIsSelectable(true)
         }
-        val scroll = ScrollView(this).apply {
+        // Log ABOVE the browser view, taking all remaining space: the
+        // 400dp browser box used to push the log completely off-screen.
+        logScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
             )
             addView(logView)
         }
@@ -332,8 +348,8 @@ class GeckoSpikeActivity : ComponentActivity() {
         root.addView(s2cBtn)
         root.addView(exportBtn)
         root.addView(tinyView)
+        root.addView(logScroll)
         root.addView(bigView)
-        root.addView(scroll)
         setContentView(root)
 
         recordRss("T0-baseline")
@@ -379,10 +395,17 @@ class GeckoSpikeActivity : ComponentActivity() {
     private fun log(line: String) {
         val stamped = "[${TIME_FMT.format(Date())}] $line"
         Log.i(TAG, line)
-        if (Looper.myLooper() == Looper.getMainLooper()) {
+        val appendAndScroll = {
             logView.append(stamped + "\n")
+            // Keep the newest lines visible as they appear.
+            if (::logScroll.isInitialized) {
+                logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            appendAndScroll()
         } else {
-            logView.post { logView.append(stamped + "\n") }
+            logView.post { appendAndScroll() }
         }
     }
 
@@ -687,6 +710,7 @@ class GeckoSpikeActivity : ComponentActivity() {
             return
         }
         running = true
+        log("RUN ALL started — starting Gecko engine (this can take a while)...")
         lifecycleScope.launch {
             try {
                 closeAllSessions()
@@ -695,13 +719,21 @@ class GeckoSpikeActivity : ComponentActivity() {
                     record("S-2a", "FAIL", "GeckoRuntime/extension setup failed — cannot run phone tests")
                     return@launch
                 }
+                log("Starting S-2a (headless session)...")
                 testS2a()
+                log("Starting S-2b (1x1 view session)...")
                 testS2b()
+                log("Starting S-3 (content extraction)...")
                 testS3()
+                log("Starting S-4 (captcha detection)...")
                 testS4()
+                log("Starting S-5 (cookies)...")
                 testS5()
+                log("Starting S-6 (downloads)...")
                 testS6()
+                log("Starting S-7 (screenshots)...")
                 testS7()
+                log("Starting S-8 (RAM)...")
                 testS8()
                 log("RUN ALL finished. See results above + gecko-spike-results.json.")
             } catch (e: Exception) {
@@ -1006,6 +1038,7 @@ class GeckoSpikeActivity : ComponentActivity() {
         s2cStarted = true
         s2cDone = false
         wentBackgroundAt = 0L
+        log("S-2c starting — loading page, then background the app when told...")
         lifecycleScope.launch {
             if (!ensureRuntime()) {
                 record("S-2c", "FAIL", "GeckoRuntime/extension setup failed")
