@@ -39,6 +39,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -84,6 +85,38 @@ class JarvisAgentEngine(
     // executor receives a fully-constructed engine.
     private val planExecutor: AgentPlanExecutor by lazy { AgentPlanExecutor(this) }
     private var activeTaskJob: Job? = null
+    // 1.8.0 Talker/Executor (DESIGN.md: expansion/talker-executor):
+    // the bus is the ONLY handoff between the Talker (fast replies)
+    // and the Executor (loop + plans). activeExecutorCommand is the
+    // command currently bound to activeTaskJob, or null when no
+    // Executor work runs — every reporting call no-ops on null, so
+    // non-Executor paths (learned replay, quick-path fallback) can
+    // never produce a phantom result. executorTimedOut remembers a
+    // TIMEOUT delivery so the job-completion safety net does not
+    // overwrite it with a FAILED net when the job later finishes.
+    // speechSuppressedResultIds / unannouncedResultIds hold command
+    // ids whose outcome the Executor ALREADY spoke (chat-only) or
+    // already fully announced in chat AND speech (bus record only) —
+    // the listener then never says the same outcome twice.
+    // executorTurnAlreadyPosted dedupes the "You" chat line: the Talker posts it with the ack, so the
+    // Executor path must skip its own post (consumed once).
+    private val talkerBus = TalkerExecutorBus()
+    private var activeExecutorCommand: ExecutorCommand? = null
+    private var executorWatchdogJob: Job? = null
+    private var executorTimedOut: Boolean = false
+    private val speechSuppressedResultIds = mutableSetOf<String>()
+    private val unannouncedResultIds = mutableSetOf<String>()
+    private var executorTurnAlreadyPosted: Boolean = false
+
+    init {
+        // The bus listener is the Talker's result voice: every
+        // delivered ExecutorResult becomes one chat line + (unless
+        // the Executor already spoke this outcome) one spoken line.
+        // The listener itself never blocks — it only launches.
+        talkerBus.addListener { result ->
+            scope.launch { deliverExecutorResult(result) }
+        }
+    }
     // 1.4.14 (D1): announce dedupe — in-memory only, dies with
     // process death, never persisted. Key = trimmed sender +
     // trimmed text of the notification; value = elapsedRealtime
@@ -371,13 +404,262 @@ class JarvisAgentEngine(
 
     fun isTaskRunning(): Boolean = activeTaskJob?.isActive == true
 
-    fun cancelActiveTask(reason: String = "Task stopped by user.") {
+    /**
+     * 1.8.0: returns true when an Executor command was running and has
+     * now been reported CANCELLED (the Talker speaks it via the bus
+     * listener) — callers must NOT speak a second stop line then.
+     * Returns false when nothing Executor-side was running.
+     */
+    fun cancelActiveTask(reason: String = "Task stopped by user."): Boolean {
+        val hadExecutorCommand = activeExecutorCommand != null
+        if (hadExecutorCommand) {
+            // Report BEFORE cancelling the job: the job's
+            // invokeOnCompletion guard (see launchExecutorCommand)
+            // skips a second CANCELLED once the active command is
+            // cleared here.
+            reportExecutorOutcome(ExecutorResultStatus.CANCELLED, "", "")
+        }
         activeTaskJob?.cancel()
         activeTaskJob = null
         clearTaskScopedState()
+        // 1.8.0: a job cancelled before its first "You" post must not
+        // leave executorTurnAlreadyPosted set — the next turn's "You"
+        // line would be wrongly skipped.
+        executorTurnAlreadyPosted = false
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, reason)
         JarvisStateRepository.setCurrentGoal("")
         JarvisStateRepository.addLog(reason)
+        return hadExecutorCommand
+    }
+
+    // ---- 1.8.0 Talker/Executor (DESIGN.md: expansion/talker-executor) ----
+
+    /** The Talker's result voice: one chat line + one spoken line per
+     *  delivered result — unless the Executor already announced this
+     *  outcome itself. CHAT_ONLY results post to chat but are not
+     *  spoken twice; NONE results are recorded on the bus only (the
+     *  outcome is already fully in chat AND spoken by the Executor). */
+    private suspend fun deliverExecutorResult(result: ExecutorResult) {
+        if (unannouncedResultIds.remove(result.commandId)) {
+            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+            return
+        }
+        val line = TalkerReplyPolicy.resultLine(result)
+        JarvisStateRepository.addChatMessage("Jarvis", line)
+        persistChat()
+        val suppressSpeech = speechSuppressedResultIds.remove(result.commandId)
+        if (!suppressSpeech) {
+            JarvisStateRepository.setAgentState(AgentRunState.SPEAKING, "Speaking: $line")
+            speak(line, alreadyPostedToChat = true)
+        }
+        // TIMEOUT is advisory — the Executor is STILL running, so the
+        // state must not drop to IDLE (the UI would claim "Ready"
+        // while work runs). Terminal results end the work: IDLE.
+        if (result.status == ExecutorResultStatus.TIMEOUT) {
+            JarvisStateRepository.setAgentState(
+                AgentRunState.EXECUTING_STEP, "Executor still running — Talker waiting for result"
+            )
+        } else {
+            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+        }
+    }
+
+    /**
+     * Report a terminal (or TIMEOUT) outcome for the active Executor
+     * command. No-op when no command is active, so non-Executor paths
+     * can call it freely. TIMEOUT is advisory: the command leaves the
+     * bus (a late DONE/FAILED still arrives as isLate), but the active
+     * command stays bound so the late result can still be reported.
+     * `speakResult=false` marks the outcome as already spoken by the
+     * Executor itself (error lines, offline warnings, …) — the bus
+     * listener then posts chat only, never a second speak.
+     * `chatResult=false` marks the outcome as already fully in chat
+     * AND spoken (verified exit, plan summary, …) — the listener
+     * records it on the bus only, with no second chat line either.
+     */
+    private fun reportExecutorOutcome(
+        status: ExecutorResultStatus,
+        summary: String,
+        evidence: String = "",
+        speakResult: Boolean = true,
+        chatResult: Boolean = true
+    ) {
+        val cmd = activeExecutorCommand ?: return
+        if (status == ExecutorResultStatus.TIMEOUT) {
+            executorTimedOut = true
+        } else {
+            executorWatchdogJob?.cancel()
+            executorWatchdogJob = null
+            activeExecutorCommand = null
+        }
+        if (!chatResult) unannouncedResultIds.add(cmd.id)
+        else if (!speakResult) speechSuppressedResultIds.add(cmd.id)
+        val now = System.currentTimeMillis()
+        talkerBus.complete(
+            ExecutorResult(
+                commandId = cmd.id,
+                status = status,
+                summary = summary.take(TalkerExecutorProtocol.MAX_SUMMARY_CHARS),
+                evidence = evidence.take(500),
+                finishedAtMs = now,
+                durationMs = now - cmd.issuedAtMs
+            )
+        )
+    }
+
+    /** Engine accessor for AgentPlanExecutor terminal sites. */
+    internal fun planReportExecutorResult(
+        status: ExecutorResultStatus,
+        summary: String,
+        evidence: String = "",
+        speakResult: Boolean = true,
+        chatResult: Boolean = true
+    ) = reportExecutorOutcome(status, summary, evidence, speakResult, chatResult)
+
+    /** Post the user's turn once: the Talker posts it with the ack, so
+     *  the Executor path must skip its own post (consumed exactly once). */
+    private fun postYouLineOnce(goal: String) {
+        if (executorTurnAlreadyPosted) {
+            executorTurnAlreadyPosted = false
+        } else {
+            JarvisStateRepository.addChatMessage("You", goal)
+        }
+    }
+
+    /** Engine accessor for AgentPlanExecutor.startNewPlan. */
+    internal fun planPostYouLineOnce(goal: String) = postYouLineOnce(goal)
+
+    /**
+     * Cancel the running Executor command because a NEW command
+     * supersedes it (single-job rule). The old job is cancelled and
+     * its CANCELLED result names the new work, so the Talker tells
+     * the user in one line. No-op when nothing runs.
+     */
+    private fun supersedeRunningCommand(newGoal: String) {
+        if (activeExecutorCommand == null) return
+        executorWatchdogJob?.cancel()
+        executorWatchdogJob = null
+        activeTaskJob?.cancel()
+        activeTaskJob = null
+        reportExecutorOutcome(
+            ExecutorResultStatus.CANCELLED,
+            TalkerReplyPolicy.supersededLine(newGoal),
+            "superseded by new command"
+        )
+    }
+
+    /**
+     * Run an already-submitted Executor command as the engine's
+     * activeTaskJob: arm the timeout watchdog, launch [block], and
+     * attach the job-completion safety net. The net reports FAILED
+     * when a job ends with no terminal result delivered and no
+     * TIMEOUT fired — a missed terminal site surfaces instead of
+     * vanishing. A late result may still arrive from the Executor's
+     * own terminal sites after a TIMEOUT (delivered as isLate).
+     */
+    private fun launchExecutorCommand(cmd: ExecutorCommand, block: suspend () -> Unit) {
+        // A plain (non-Executor) loop turn may still be running — the
+        // Talker never lets two jobs share one screen. (An Executor
+        // job was already cancelled by supersedeRunningCommand above,
+        // which nulled activeTaskJob, so this is a no-op then.)
+        activeTaskJob?.cancel()
+        activeTaskJob = null
+        clearTaskScopedState()
+        activeExecutorCommand = cmd
+        executorTimedOut = false
+        executorWatchdogJob = scope.launch {
+            delay(cmd.timeoutMs)
+            if (talkerBus.isPending(cmd.id)) {
+                reportExecutorOutcome(
+                    ExecutorResultStatus.TIMEOUT,
+                    "Time zyada lag raha hai — ${cmd.goal.take(80)}",
+                    "timeoutMs=${cmd.timeoutMs}"
+                )
+            }
+        }
+        val job = scope.launch { block() }
+        activeTaskJob = job
+        job.invokeOnCompletion { cause ->
+            if (activeExecutorCommand?.id != cmd.id) return@invokeOnCompletion
+            when {
+                cause is CancellationException ->
+                    reportExecutorOutcome(ExecutorResultStatus.CANCELLED, "", "")
+                cause == null && !executorTimedOut ->
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.FAILED,
+                        "Kaam khatm hua par result nahi mila — dobara bolo to phir se koshish karunga.",
+                        "no terminal result delivered"
+                    )
+                cause != null ->
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.FAILED,
+                        "Kaam me error aa gaya — dobara bolo to phir se koshish karunga.",
+                        (cause.message ?: cause.javaClass.simpleName).take(200)
+                    )
+                // cause == null && executorTimedOut: a late result may
+                // still arrive from the Executor's own terminal sites.
+                else -> Unit
+            }
+        }
+    }
+
+    /** Memory-first context for a goal (local MemoryIndex turns +
+     *  I1 saved-document snippets, labelled, snippet-only) — the
+     *  same context the pre-1.8.0 tail built inline. */
+    private fun buildMemoryContext(goal: String, docContext: String, recallHitCount: Int): String {
+        val memorySummaries = memoryIndex.search(goal)
+            .mapNotNull { memoryIndex.getSummary(it) }
+        val turnContext = memorySummaries.joinToString(" | ")
+        val memoryContext = listOf(docContext, turnContext)
+            .filter { it.isNotBlank() }.joinToString("\n")
+        if (memoryContext.isNotBlank()) {
+            JarvisStateRepository.addLog("Memory-first: ${memorySummaries.size} pehle ki baat-cheet, $recallHitCount document mile.")
+        }
+        return memoryContext
+    }
+
+    /** Launch the autonomous loop as a plain (non-Executor) turn —
+     *  the pre-1.8.0 path for chat turns that miss the local reply. */
+    private fun launchLoopTurn(goal: String, docContext: String, recallHitCount: Int) {
+        val memoryContext = buildMemoryContext(goal, docContext, recallHitCount)
+        activeTaskJob?.cancel()
+        activeTaskJob = scope.launch {
+            runAutonomousLoop(goal, memoryContext)
+        }
+    }
+
+    /**
+     * Talker fast reply for a pure-chat turn: on-device Gemma first,
+     * bounded by [TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS].
+     * Returns true when a reply was posted + spoken. False when the
+     * model is not downloaded, the attempt timed out / errored, or the
+     * reply came back blank — the caller falls through to today's
+     * cloud loop (or the busy line while an Executor runs).
+     */
+    private suspend fun tryTalkerLocalReply(text: String): Boolean {
+        if (!LocalLlmManager.isDownloaded(context)) return false
+        val recent = JarvisStateRepository.chatHistory.value.takeLast(6).mapNotNull { entry ->
+            val sender = entry.sender
+            val message = entry.message
+            if (message.isBlank()) null
+            else if (sender == "You") "You" to message else "Jarvis" to message
+        }
+        val reply = withTimeoutOrNull(TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS) {
+            runCatching {
+                LocalLlmManager.chat(
+                    context = context,
+                    systemPrompt = prefs.personaPrompt,
+                    userText = text,
+                    recentChat = recent
+                )
+            }.getOrNull()
+        }?.trim().orEmpty()
+        if (reply.isBlank()) return false
+        JarvisStateRepository.addChatMessage("You", text)
+        JarvisStateRepository.addChatMessage("Jarvis", reply)
+        persistChat()
+        speak(reply, alreadyPostedToChat = true)
+        return true
     }
 
     // ---- 1.4.21 Agent Mode (planner trigger, resume, executor access) ----
@@ -385,7 +667,11 @@ class JarvisAgentEngine(
     /** Frozen trigger (§3h): goal names GitHub / Supabase / Vercel /
      *  deploy, or the user says "agent mode" (Latin or
      *  transliterated Devanagari — the same transliteration the
-     *  stop-command check uses). */
+     *  stop-command check uses).
+     *  1.8.0: no longer called from handleUserCommand — the Talker
+     *  dispatcher ([TalkerDispatcher]) owns routing now and mirrors
+     *  this list (pinned by TalkerDispatcherTest). Kept as the
+     *  documented frozen trigger; do not change one without the other. */
     private fun isAgentModeCommand(goal: String): Boolean {
         val lower = TurnDetector.transliterateDevanagariKeywords(goal.lowercase())
         return lower.contains("github") || lower.contains("supabase") ||
@@ -1190,8 +1476,13 @@ class JarvisAgentEngine(
             // seeds nothing, and with a remainder it seeds the
             // remainder, never "stop".
             onStopSpeaking?.invoke()
-            cancelActiveTask("Stopped on voice command.")
-            scope.launch { speak("Theek hai bhai, ruk gaya.") }
+            val hadExecutorCommand = cancelActiveTask("Stopped on voice command.")
+            // 1.8.0: when an Executor command was running, its
+            // CANCELLED result speaks this same line via the bus
+            // listener — speaking it here too would double it.
+            if (!hadExecutorCommand) {
+                scope.launch { speak("Theek hai bhai, ruk gaya.") }
+            }
             return
         }
 
@@ -1287,39 +1578,112 @@ class JarvisAgentEngine(
         val docContext = DocumentText.buildDocContext(recallHits)
         if (!isOnline() && tryDocumentRecall(effectiveGoal, docHits)) return
 
-        // 1.4.21 Agent Mode: the planner runs when the goal names
-        // an external destination (GitHub / Supabase / Vercel /
-        // deploy) or the user says "agent mode". Everything else
-        // keeps the existing runAutonomousLoop path untouched — a
-        // plain "website banao" stays on the 1.4.20 builder loop.
-        // Custom routines (above) and no-AI routines win first, so
-        // "github kholo" still opens the app, not a plan.
-        if (isAgentModeCommand(effectiveGoal)) {
-            clearTaskScopedState()
-            activeTaskJob?.cancel()
-            activeTaskJob = scope.launch {
-                planExecutor.startNewPlan(effectiveGoal)
+        // 1.8.0 Talker/Executor: the Talker classifies every turn
+        // BEFORE any LLM call, network, or phone action. The ack is
+        // templated (no LLM) and is posted + spoken before the
+        // Executor starts, so the user never waits in silence.
+        // Routines / learned replays already returned above — this
+        // block only sees turns that need the loop, a plan, or chat.
+        val turnReceivedMs = System.currentTimeMillis()
+        val talkerDecision = TalkerDispatcher.classify(
+            effectiveGoal, talkerBus.pendingCount() > 0,
+            // Devanagari turns transliterate to Latin keywords first
+            // (same transliteration the stop check uses) so "गीथब"
+            // still routes to EXECUTE_PLAN.
+            TurnDetector.transliterateDevanagariKeywords(effectiveGoal.lowercase())
+        )
+        when (talkerDecision) {
+            TalkerDispatcher.TalkerDecision.STATUS_QUERY -> {
+                val cmd = talkerBus.pendingCommands().firstOrNull()
+                val step = JarvisStateRepository.currentStepInfo.value
+                    .takeIf { it.isNotBlank() }
+                val line = TalkerReplyPolicy.statusLine(
+                    cmd, step,
+                    if (cmd != null) turnReceivedMs - cmd.issuedAtMs else 0L
+                )
+                JarvisStateRepository.addChatMessage("Jarvis", line)
+                persistChat()
+                scope.launch { speak(line, alreadyPostedToChat = true) }
+                return
             }
-            return
-        }
-
-        // Memory-first consult before the LLM loop: past turns
-        // (local MemoryIndex only) are offered to the first LLM
-        // step as context, never as a fabricated answer. I1: saved
-        // documents join the same context, labelled, snippet-only.
-        val memorySummaries = memoryIndex.search(effectiveGoal)
-            .mapNotNull { memoryIndex.getSummary(it) }
-        val turnContext = memorySummaries.joinToString(" | ")
-        val memoryContext = listOf(docContext, turnContext)
-            .filter { it.isNotBlank() }.joinToString("\n")
-        if (memoryContext.isNotBlank()) {
-            JarvisStateRepository.addLog("Memory-first: ${memorySummaries.size} pehle ki baat-cheet, ${recallHits.size} document mile.")
-        }
-
-        // Cancel any previous running task and start the new multi-step loop
-        activeTaskJob?.cancel()
-        activeTaskJob = scope.launch {
-            runAutonomousLoop(effectiveGoal, memoryContext)
+            TalkerDispatcher.TalkerDecision.CANCEL_TASK -> {
+                // "cancel karo" / "ruk ja" phrasings the exact-match
+                // stop branch above does not catch.
+                onStopSpeaking?.invoke()
+                val hadExecutorCommand = cancelActiveTask("Stopped on voice command.")
+                if (!hadExecutorCommand) {
+                    scope.launch { speak("Theek hai bhai, ruk gaya.") }
+                }
+                return
+            }
+            TalkerDispatcher.TalkerDecision.EXECUTE_PLAN,
+            TalkerDispatcher.TalkerDecision.EXECUTE_LOOP -> {
+                val workKind = if (talkerDecision == TalkerDispatcher.TalkerDecision.EXECUTE_PLAN) {
+                    ExecutorWorkKind.PLAN
+                } else {
+                    ExecutorWorkKind.LOOP
+                }
+                val cmd = ExecutorCommand(
+                    kind = ExecutorCommandKind.EXECUTE_TASK,
+                    workKind = workKind,
+                    goal = effectiveGoal
+                )
+                // Validate + submit BEFORE posting the ack: a
+                // rejected command must never be acknowledged.
+                when (talkerBus.submit(cmd)) {
+                    TalkerExecutorBus.SubmitResult.INVALID -> {
+                        scope.launch {
+                            speak(TalkerReplyPolicy.invalidCommandLine(cmd.validate()))
+                        }
+                        return
+                    }
+                    TalkerExecutorBus.SubmitResult.DUPLICATE_ID -> {
+                        scope.launch { speak("Ye kaam pehle se chal raha hai — dobara bhejne ki zaroorat nahi.") }
+                        return
+                    }
+                    TalkerExecutorBus.SubmitResult.ACCEPTED -> Unit
+                }
+                supersedeRunningCommand(cmd.goal)
+                val ack = TalkerReplyPolicy.ackFor(cmd)
+                JarvisStateRepository.addChatMessage("You", effectiveGoal)
+                JarvisStateRepository.addChatMessage("Jarvis", ack)
+                persistChat()
+                executorTurnAlreadyPosted = true
+                scope.launch { speak(ack, alreadyPostedToChat = true) }
+                JarvisStateRepository.addDiagnostic(
+                    "talker", "ACK_MS",
+                    "Talker ack posted ${System.currentTimeMillis() - turnReceivedMs}ms after turn received."
+                )
+                if (workKind == ExecutorWorkKind.PLAN) {
+                    launchExecutorCommand(cmd) { planExecutor.startNewPlan(effectiveGoal) }
+                } else {
+                    val memoryContext = buildMemoryContext(
+                        effectiveGoal, docContext, recallHits.size
+                    )
+                    launchExecutorCommand(cmd) { runAutonomousLoop(effectiveGoal, memoryContext) }
+                }
+                return
+            }
+            TalkerDispatcher.TalkerDecision.TALK -> {
+                scope.launch {
+                    val answered = tryTalkerLocalReply(effectiveGoal)
+                    if (!answered) {
+                        val running = talkerBus.pendingCommands().firstOrNull()
+                        if (running != null) {
+                            // Executor busy: NEVER launch the cloud
+                            // loop here — it would cancel the work.
+                            // The Talker says so plainly instead.
+                            val busy = TalkerReplyPolicy.busyLine(running.goal)
+                            JarvisStateRepository.addChatMessage("Jarvis", busy)
+                            persistChat()
+                            speak(busy, alreadyPostedToChat = true)
+                        } else {
+                            launchLoopTurn(effectiveGoal, docContext, recallHits.size)
+                        }
+                    }
+                }
+                return
+            }
         }
     }
 
@@ -1736,8 +2100,14 @@ class JarvisAgentEngine(
         // clear warning and do local work only — never fake a
         // cloud answer while offline.
         if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
-            JarvisStateRepository.addChatMessage("You", currentGoal)
+            postYouLineOnce(currentGoal)
             speak("Internet nahi hai — online kaam (AI planning, browsing, cloud actions) abhi nahi ho payega. Sirf phone ke andar wale kaam kar sakta hoon, jaise torch, volume, ya pehle se downloaded cheezein.")
+            // 1.8.0: BLOCKED, chat-only — the warning above was spoken.
+            reportExecutorOutcome(
+                ExecutorResultStatus.BLOCKED,
+                "Internet nahi hai — online kaam abhi nahi ho payega.",
+                "offline gate", speakResult = false
+            )
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Offline — local work only")
             return
         }
@@ -1747,7 +2117,7 @@ class JarvisAgentEngine(
                 JarvisStateRepository.restoreChatHistory(prefs.getSavedChatHistory())
             }
         }
-        JarvisStateRepository.addChatMessage("You", currentGoal)
+        postYouLineOnce(currentGoal)
         persistChat()
         JarvisStateRepository.setCurrentGoal(currentGoal)
 
@@ -1770,6 +2140,12 @@ class JarvisAgentEngine(
                 // persist a routine), not a faked continuation.
                 if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
                     speak("Internet chala gaya hai — kaam yahin rok raha hoon, complete nahi bol raha. Net aane par dobara bolo.")
+                    // 1.8.0: BLOCKED, chat-only — the warning above was spoken.
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.BLOCKED,
+                        "Internet chala gaya hai — kaam yahin rok raha hoon.",
+                        "offline mid-task", speakResult = false
+                    )
                     clearTaskScopedState()
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Paused offline mid-task")
                     JarvisStateRepository.setCurrentGoal("")
@@ -1864,6 +2240,11 @@ class JarvisAgentEngine(
                 when (decision.decisionKind) {
                     "ERROR" -> {
                         speak(decision.reply)
+                        // 1.8.0: FAILED, chat-only — the reply above was spoken.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.FAILED, decision.reply.take(300),
+                            "decision ERROR", speakResult = false
+                        )
                         clearTaskScopedState()
                         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Error — task stopped")
                         JarvisStateRepository.setCurrentGoal("")
@@ -1877,6 +2258,12 @@ class JarvisAgentEngine(
                             continue
                         }
                         speak("Jawab baar-baar adhoora aa raha hai, isliye kaam rok raha hoon.")
+                        // 1.8.0: FAILED, chat-only — the line above was spoken.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.FAILED,
+                            "Jawab baar-baar adhoora aa raha hai, isliye kaam rok raha hoon.",
+                            "decision PARSE_ERROR", speakResult = false
+                        )
                         clearTaskScopedState()
                         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Parse error — task stopped")
                         JarvisStateRepository.setCurrentGoal("")
@@ -1890,6 +2277,12 @@ class JarvisAgentEngine(
                             continue
                         }
                         speak("Rate limit baar-baar lag raha hai, isliye kaam rok raha hoon.")
+                        // 1.8.0: FAILED, chat-only — the line above was spoken.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.FAILED,
+                            "Rate limit baar-baar lag raha hai, isliye kaam rok raha hoon.",
+                            "decision RATE_LIMITED", speakResult = false
+                        )
                         clearTaskScopedState()
                         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Rate limited — task stopped")
                         JarvisStateRepository.setCurrentGoal("")
@@ -1962,6 +2355,12 @@ class JarvisAgentEngine(
                         // entirely — it is not a clarification.
                         if (isDeclineReply(userAnswer)) {
                             speak("Theek hai, kaam rok diya.")
+                            // 1.8.0: DECLINED, chat-only — the line above was spoken.
+                            reportExecutorOutcome(
+                                ExecutorResultStatus.DECLINED,
+                                "User ne kaam rok diya.",
+                                "askUser decline", speakResult = false
+                            )
                             clearTaskScopedState()
                             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
                             JarvisStateRepository.setCurrentGoal("")
@@ -1982,6 +2381,14 @@ class JarvisAgentEngine(
                         continue
                     } else {
                         // A-C7: ask-user timeout clears the buffer.
+                        // 1.8.0: BLOCKED, fully announced — nothing
+                        // was spoken for this pause, so the Talker
+                        // must tell the user what is needed.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.BLOCKED,
+                            "Sawal ka jawab nahi aaya — jawab do to aage badhaun.",
+                            "askUser no reply"
+                        )
                         clearTaskScopedState()
                         JarvisStateRepository.setAgentState(
                             AgentRunState.IDLE,
@@ -2003,6 +2410,13 @@ class JarvisAgentEngine(
                             continue
                         }
                         GateOutcome.PAUSE_TASK -> {
+                            // 1.8.0: BLOCKED, fully announced —
+                            // nothing was spoken for this pause.
+                            reportExecutorOutcome(
+                                ExecutorResultStatus.BLOCKED,
+                                "Ruk gaya — $gateReason",
+                                "gate PAUSE_TASK"
+                            )
                             clearTaskScopedState()
                             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Paused — $gateReason")
                             JarvisStateRepository.setCurrentGoal("")
@@ -2010,6 +2424,12 @@ class JarvisAgentEngine(
                         }
                         GateOutcome.ABORT_TASK -> {
                             speak("Theek hai, kaam rok diya.")
+                            // 1.8.0: DECLINED, chat-only — the line above was spoken.
+                            reportExecutorOutcome(
+                                ExecutorResultStatus.DECLINED,
+                                "User ne kaam rok diya.",
+                                "gate ABORT_TASK", speakResult = false
+                            )
                             clearTaskScopedState()
                             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
                             JarvisStateRepository.setCurrentGoal("")
@@ -2071,6 +2491,14 @@ class JarvisAgentEngine(
                         "Jarvis",
                         "WRITE_PROJECT_FILE fail ho gaya (written=false) — file disk par nahi likhi gayi."
                     )
+                    // 1.8.0: FAILED, unannounced — the failure is
+                    // already fully in chat AND spoken above.
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.FAILED,
+                        "File likh nahi paya — project ya file ka naam galat ho sakta hai.",
+                        "WRITE_PROJECT_FILE written=false",
+                        speakResult = false, chatResult = false
+                    )
                     clearTaskScopedState()
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Write failed — task stopped")
                     JarvisStateRepository.setCurrentGoal("")
@@ -2093,6 +2521,14 @@ class JarvisAgentEngine(
                     // for the next user command to answer, and the
                     // next loop start clears task state anyway.
                     if (decision.askUser || pendingBrowserApprovalUrl != null) {
+                        // 1.8.0: BLOCKED, fully announced — nothing
+                        // was spoken for this wait, so the Talker
+                        // must tell the user approval is needed.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.BLOCKED,
+                            "Approval ka intezaar hai — haan ya naa bolo to aage badhaun.",
+                            "waiting for approval"
+                        )
                         JarvisStateRepository.setAgentState(
                             AgentRunState.WAITING_USER_REPLY,
                             "Waiting for your approval..."
@@ -2110,6 +2546,14 @@ class JarvisAgentEngine(
                     // first: a NONE+askUser turn still waits for
                     // approval instead of ending here.
                     if (decision.action == "NONE" && decision.isCompleted) {
+                        // 1.8.0: DONE, unannounced — the reply was
+                        // already posted to chat AND spoken above.
+                        reportExecutorOutcome(
+                            ExecutorResultStatus.DONE,
+                            decision.reply.take(300),
+                            "NONE chat turn complete",
+                            speakResult = false, chatResult = false
+                        )
                         JarvisStateRepository.setAgentState(
                             AgentRunState.IDLE,
                             "Ready for next command"
@@ -2212,6 +2656,14 @@ class JarvisAgentEngine(
                             )
                             JarvisStateRepository.setCurrentGoal("")
                             clearTaskScopedState()
+                            // 1.8.0: DONE, unannounced — the verified
+                            // summary is already fully in chat AND
+                            // spoken above.
+                            reportExecutorOutcome(
+                                ExecutorResultStatus.DONE,
+                                lastReply.take(300),
+                                "verified exit", speakResult = false, chatResult = false
+                            )
                             speak("Aur kya karna hai?")
                             return
                         }
@@ -2248,6 +2700,14 @@ class JarvisAgentEngine(
                             )
                             JarvisStateRepository.setCurrentGoal("")
                             clearTaskScopedState()
+                            // 1.8.0: FAILED, unannounced — the
+                            // failure line is already fully in chat
+                            // AND spoken below.
+                            reportExecutorOutcome(
+                                ExecutorResultStatus.FAILED,
+                                "Kaam poora nahi ho paya — $detail",
+                                "evidence FAILED", speakResult = false, chatResult = false
+                            )
                             speak(
                                 "Bhai, kaam poora nahi ho paya — dobara batao to phir se koshish karunga.",
                                 alreadyPostedToChat = true
@@ -2279,6 +2739,12 @@ class JarvisAgentEngine(
                 AgentRunState.IDLE,
                 "Reached max steps ($maxSteps). Ready."
             )
+            // 1.8.0: FAILED, chat-only — the line below was spoken.
+            reportExecutorOutcome(
+                ExecutorResultStatus.FAILED,
+                "Kaam $maxSteps steps me poora nahi ho paya.",
+                "max steps reached", speakResult = false
+            )
             // 1.4.23-PRO Item 2 (C5): the old line claimed the steps
             // were "complete" for a task that did NOT complete. The
             // replacement states the non-completion, no success claim.
@@ -2286,6 +2752,13 @@ class JarvisAgentEngine(
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
+            // 1.8.0: FAILED, fully announced — nothing was spoken
+            // for this error, so the Talker must tell the user.
+            reportExecutorOutcome(
+                ExecutorResultStatus.FAILED,
+                "Kaam me error aa gaya — dobara bolo to phir se koshish karunga.",
+                "loop exception: ${(e.message ?: e.javaClass.simpleName).take(200)}"
+            )
             clearTaskScopedState()
             JarvisStateRepository.addLog("Agent Loop Error: ${e.message}")
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Error: ${e.localizedMessage}")

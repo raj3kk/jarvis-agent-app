@@ -41,8 +41,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 43
-        versionName = "1.7.1"
+        versionCode = 44
+        versionName = "1.8.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -156,6 +156,8 @@ dependencies {
     // (DocumentMemoryTest). JUnit4 for the pure search/chunk logic;
     // Robolectric so the file-backed store can be tested with a real
     // Context (filesDir) on the JVM — no emulator, no device.
+    // 1.8.0 (I2): same JUnit4 covers the Talker/Executor protocol,
+    // bus, dispatcher and reply policy (pure-Kotlin modules).
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.11.1")
 }

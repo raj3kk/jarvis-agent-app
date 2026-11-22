@@ -110,12 +110,21 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             )
             engine.planPersistChat()
         }
-        JarvisStateRepository.addChatMessage("You", goal)
+        // 1.8.0: the Talker already posted this turn's "You" line
+        // with the ack — postYouLineOnce dedupes it (no-op when the
+        // plan was NOT started by the Talker).
+        engine.planPostYouLineOnce(goal)
         engine.planPersistChat()
         JarvisStateRepository.setCurrentGoal(goal)
         JarvisStateRepository.setAgentState(AgentRunState.THINKING, "Plan bana raha hoon…")
         if (!engine.planIsOnline()) {
             engine.planSpeak("Internet nahi hai — plan banane ke liye online hona zaroori hai. Net aane par dobara bolo.")
+            // 1.8.0: BLOCKED, chat-only — the line above was spoken.
+            engine.planReportExecutorResult(
+                ExecutorResultStatus.BLOCKED,
+                "Internet nahi hai — plan banane ke liye online hona zaroori hai.",
+                "plan start offline", speakResult = false
+            )
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Offline — plan nahi bana")
             JarvisStateRepository.setCurrentGoal("")
             return
@@ -131,6 +140,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 JarvisStateRepository.addChatMessage("Jarvis", result.reason)
                 engine.planPersistChat()
                 engine.planSpeak(result.reason)
+                // 1.8.0: FAILED, unannounced — the reason is already
+                // fully in chat AND spoken above.
+                engine.planReportExecutorResult(
+                    ExecutorResultStatus.FAILED,
+                    result.reason.take(300),
+                    "planNext failed", speakResult = false, chatResult = false
+                )
                 JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Plan nahi bana")
                 JarvisStateRepository.setCurrentGoal("")
             }
@@ -451,6 +467,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         )
         JarvisStateRepository.setCurrentGoal("")
         engine.planClearTaskState()
+        // 1.8.0: DONE/FAILED, unannounced — the summary is already
+        // fully in chat AND spoken below.
+        engine.planReportExecutorResult(
+            if (allDone) ExecutorResultStatus.DONE else ExecutorResultStatus.FAILED,
+            summary.take(300),
+            if (allDone) "plan complete" else "plan stopped: ${failed.joinToString(", ") { it.title }}",
+            speakResult = false, chatResult = false
+        )
         engine.planSpeak(summary)
     }
 
@@ -481,6 +505,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Plan stopped by user")
         JarvisStateRepository.setCurrentGoal("")
         engine.planClearTaskState()
+        // 1.8.0: DECLINED, unannounced — already fully in chat AND
+        // spoken below.
+        engine.planReportExecutorResult(
+            ExecutorResultStatus.DECLINED,
+            "User ne plan rok diya — '${step.title}': $reason",
+            "plan aborted", speakResult = false, chatResult = false
+        )
         engine.planSpeak("Theek hai, plan rok diya.")
     }
 
@@ -494,6 +525,14 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }.copy(currentStepId = null, updatedAtMs = System.currentTimeMillis())
         AgentPlanStore.save(context, p)
         publish(p)
+        // 1.8.0: BLOCKED, fully announced — nothing was spoken for
+        // this park (the question was already spoken), so the
+        // Talker must tell the user the plan is waiting.
+        engine.planReportExecutorResult(
+            ExecutorResultStatus.BLOCKED,
+            reason.take(300),
+            "plan parked BLOCKED"
+        )
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Plan blocked — ${reason.take(80)}")
         JarvisStateRepository.setCurrentGoal("")
         engine.planClearTaskState()
