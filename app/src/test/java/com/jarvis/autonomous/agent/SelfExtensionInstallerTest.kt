@@ -7,24 +7,34 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import java.io.File
 import java.nio.file.Files
 
 /**
  * DESIGN §8.4 — installer refusal / budget / rollback / replay-gate
- * tests. The REAL installer runs against a harness-only stub
- * LearnedRoutineStore (in /tmp/selfext-harness/stubs) that mirrors
- * the real store's self-extension behaviour.
+ * tests. Runs on the JVM (JUnit4 + Robolectric, no emulator/device)
+ * with the REAL installer + REAL LearnedRoutineStore under a
+ * Robolectric application Context — the same pattern as
+ * DocumentMemoryTest / LearnedPatternStoreTest. (The first version
+ * of this file tried `android.content.Context()` directly; Context
+ * is abstract, so CI's compileDebugUnitTestKotlin failed with
+ * "Cannot create an instance of an abstract class" — fixed by
+ * using the Robolectric application Context.)
  */
+@RunWith(RobolectricTestRunner::class)
 class SelfExtensionInstallerTest {
 
-    // The REAL installer + a stub LearnedRoutineStore (harness-only,
-    // in /tmp/selfext-harness/stubs): install/rollback/markVerified
-    // run through production code, not a fake.
+    // The REAL installer + REAL LearnedRoutineStore under a
+    // Robolectric Context: install/rollback/markVerified run through
+    // production code, not a fake.
     private fun realInstaller(): Pair<SelfExtensionInstaller, com.jarvis.autonomous.data.LearnedRoutineStore> {
-        val store = com.jarvis.autonomous.data.LearnedRoutineStore(android.content.Context())
+        val appContext = RuntimeEnvironment.getApplication().applicationContext
+        val store = com.jarvis.autonomous.data.LearnedRoutineStore(appContext)
         val installer = SelfExtensionInstaller(
-            context = android.content.Context(),
+            context = appContext,
             routineStore = store,
             store = tempStore()
         )
