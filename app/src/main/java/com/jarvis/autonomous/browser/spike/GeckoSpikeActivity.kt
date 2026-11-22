@@ -21,6 +21,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.resume
+import kotlinx.coroutines.resumeWithException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -166,16 +168,30 @@ class GeckoSpikeActivity : ComponentActivity() {
                 }
 
                 override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
-                    log("[$label] onExternalResponse uri=${response.uri} " +
-                        "type=${response.contentType} len=${response.contentLength} " +
-                        "file=${response.filename}")
+                    // WebResponse has NO uri/contentType/contentLength/
+                    // filename fields (verified against mozilla-central
+                    // WebResponse.java + WebMessage.java): uri + headers
+                    // live on the WebMessage parent; body is @Nullable.
+                    // v160: content-disposition carries a filename
+                    // validated with desktop's save rules (bug 1822968).
+                    val uri = response.uri
+                    val contentType = response.headers["Content-Type"]
+                    val contentLength =
+                        response.headers["Content-Length"]?.toLongOrNull() ?: -1L
+                    val filename = parseDispositionFilename(
+                        response.headers["Content-Disposition"] ?: "",
+                    ) ?: uri.substringAfterLast('/').substringBefore('?')
+                        .takeIf { it.isNotBlank() }
+                    log("[$label] onExternalResponse uri=$uri " +
+                        "type=$contentType len=$contentLength " +
+                        "file=$filename status=${response.statusCode}")
                     lifecycleScope.launch(Dispatchers.IO) {
-                        val saved = saveDownload(response)
+                        val saved = saveDownload(response.body, filename, uri)
                         val obj = JSONObject().apply {
-                            put("uri", response.uri)
-                            put("contentType", response.contentType ?: JSONObject.NULL)
-                            put("contentLength", response.contentLength)
-                            put("filename", response.filename ?: JSONObject.NULL)
+                            put("uri", uri)
+                            put("contentType", contentType ?: JSONObject.NULL)
+                            put("contentLength", contentLength)
+                            put("filename", filename ?: JSONObject.NULL)
                             put("savedPath", saved?.absolutePath ?: JSONObject.NULL)
                             put("savedBytes", saved?.length() ?: 0)
                         }
@@ -206,19 +222,42 @@ class GeckoSpikeActivity : ComponentActivity() {
         }
 
         /** Save an onExternalResponse body to filesDir. Runs on IO. */
-        private fun saveDownload(response: WebResponse): File? {
+        private fun saveDownload(body: java.io.InputStream?, filename: String?, uri: String): File? {
+            if (body == null) {
+                log("[$label] download save FAILED: null body")
+                return null
+            }
             return runCatching {
-                val rawName = response.filename?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-                    ?: response.uri.substringAfterLast('/').substringBefore('?')
+                val rawName = filename?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                    ?: uri.substringAfterLast('/').substringBefore('?')
                         .takeIf { it.isNotBlank() } ?: "download.bin"
                 val safeName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
                 val dir = File(filesDir, "gecko-spike-download").apply { mkdirs() }
                 val out = File(dir, safeName)
                 FileOutputStream(out).use { fos ->
-                    response.body.copyTo(fos)
+                    body.copyTo(fos)
                 }
+                body.close()
                 out
             }.onFailure { log("[$label] download save FAILED: $it") }.getOrNull()
+        }
+
+        /** filename*=UTF-8''... preferred, else filename="...". */
+        private fun parseDispositionFilename(disposition: String): String? {
+            val star = Regex(
+                "filename\\*\\s*=\\s*UTF-8''([^;\\s]+)",
+                RegexOption.IGNORE_CASE,
+            ).find(disposition)
+            if (star != null) {
+                return runCatching {
+                    java.net.URLDecoder.decode(star.groupValues[1], "UTF-8")
+                }.getOrNull()?.takeIf { it.isNotBlank() }
+            }
+            return Regex(
+                "filename\\s*=\\s*\"?([^\";]+)\"?",
+                RegexOption.IGNORE_CASE,
+            ).find(disposition)?.groupValues?.getOrNull(1)?.trim()
+                ?.takeIf { it.isNotEmpty() }
         }
     }
 
