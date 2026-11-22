@@ -149,12 +149,14 @@ dependencies {
     // is AGP 9.1+ + compileSdk 37 (AGP 9.5 max API is 37; AGP 9 also
     // needs Gradle 9.x and drops the separate kotlin.android plugin)
     // — a full toolchain migration that is OUT of scope for this
-    // throwaway spike. Suppressing the check here ONLY measures the
-    // spike honestly (same AARs, same APK contents, same phone
-    // behaviour); S-9 is therefore CONDITIONAL — see SPIKE.md.
-    // If this suppression is ever seen on main, delete it.
-    tasks.named("checkDebugAarMetadata") { enabled = false }
-    tasks.named("checkReleaseAarMetadata") { enabled = false }
+    // throwaway spike. The suppression itself lives in an
+    // afterEvaluate block at the end of this file (AGP creates the
+    // variant tasks after configuration; tasks.named during
+    // configuration throws UnknownTaskException — CI run 44990074510).
+    // Suppressing the check here ONLY measures the spike honestly
+    // (same AARs, same APK contents, same phone behaviour); S-9 is
+    // therefore CONDITIONAL — see SPIKE.md. If this suppression is
+    // ever seen on main, delete it.
 
     // Coroutines & Networking
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
@@ -201,4 +203,13 @@ dependencies {
     // bus, dispatcher and reply policy (pure-Kotlin modules).
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.11.1")
+}
+
+// GeckoView spike ONLY — see the comment in dependencies {} above.
+// AGP creates the checkAarMetadata variant tasks AFTER configuration,
+// so the suppression must live in afterEvaluate (a tasks.named call
+// during configuration throws UnknownTaskException).
+afterEvaluate {
+    tasks.named("checkDebugAarMetadata") { enabled = false }
+    tasks.named("checkReleaseAarMetadata") { enabled = false }
 }
