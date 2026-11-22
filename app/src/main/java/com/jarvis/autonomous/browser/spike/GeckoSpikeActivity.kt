@@ -102,6 +102,7 @@ class GeckoSpikeActivity : ComponentActivity() {
 
     private var runtime: GeckoRuntime? = null
     private var extensionInstalled = false
+    private var installedExtension: WebExtension? = null
     private var running = false
 
     private val allSessions = mutableListOf<SpikeSession>()
@@ -205,6 +206,24 @@ class GeckoSpikeActivity : ComponentActivity() {
                 }
             })
             session.open(rt)
+            // Content-script messages (connectNative / sendNativeMessage
+            // from content.js) are delivered ONLY to the per-session
+            // delegate — WebExtension.setMessageDelegate receives
+            // background-script messages only (WebExtension.java
+            // setMessageDelegate javadoc + WebExtensionController.
+            // getDelegate(): session != null -> session delegate;
+            // session == null + ENV_TYPE_EXTENSION -> extension
+            // delegate). Without this call the bridge is deaf: onConnect
+            // never fires and auto-extract never arrives. Messages sent
+            // before this call are queued by Gecko and released after it
+            // (per Mozilla docs), so registering here, before loadUri,
+            // has no race. Mozilla's own MessagingExample does exactly
+            // this after ensureBuiltIn.
+            installedExtension?.let { ext ->
+                session.webExtensionController
+                    .setMessageDelegate(ext, bridgeDelegate, NATIVE_APP)
+                log("[$label] session message delegate set (nativeApp=$NATIVE_APP)")
+            } ?: log("[$label] WARNING: no installed extension — session delegate NOT set")
             session.setActive(true)
         }
 
@@ -583,6 +602,7 @@ class GeckoSpikeActivity : ComponentActivity() {
             }.onFailure { log("Extension install FAILED: $it") }.getOrNull()
             if (ext == null) return false
             ext.setMessageDelegate(bridgeDelegate, NATIVE_APP)
+            installedExtension = ext
             extensionInstalled = true
             log("Extension installed + MessageDelegate set (nativeApp=$NATIVE_APP)")
         }
