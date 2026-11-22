@@ -5,6 +5,9 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    // 1.12.0 FCM: applies app/google-services.json (Firebase project
+    // omnijarvis-2bdd6, package com.jarvis.autonomous).
+    id("com.google.gms.google-services")
 }
 
 // Production signing: if keystore.properties exists at the repo root
@@ -41,8 +44,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 47
-        versionName = "1.11.0-PRO"
+        versionCode = 48
+        versionName = "1.12.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -151,6 +154,12 @@ dependencies {
     // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
     // broke CI dependency resolution on 2026-11-02, so it is NOT used.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+
+    // 1.12.0 FCM: Firebase Cloud Messaging for hub -> phone push
+    // (data-only messages; the app renders the notification). Direct
+    // pin, no BOM, so resolution cannot drift. google-services.json
+    // (Firebase project omnijarvis-2bdd6) is client config, not a secret.
+    implementation("com.google.firebase:firebase-messaging:24.0.0")
 
     // 1.7.1 (I1): unit tests for on-device document memory
     // (DocumentMemoryTest). JUnit4 for the pure search/chunk logic;

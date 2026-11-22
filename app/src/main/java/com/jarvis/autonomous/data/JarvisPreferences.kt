@@ -151,6 +151,18 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getLong("pairing_paired_at_ms", 0L)
         set(value) = prefs.edit().putLong("pairing_paired_at_ms", value).apply()
 
+    // 1.12.0 FCM: last FCM token registered with the hub (plain prefs —
+    // the token is useless without the hub's server key, and Firebase
+    // keeps its own copy in prefs anyway). Used only to skip
+    // re-registering an unchanged token.
+    var fcmToken: String
+        get() = prefs.getString("fcm_token", "") ?: ""
+        set(value) = prefs.edit().putString("fcm_token", value).apply()
+
+    var fcmRegisteredAtMs: Long
+        get() = prefs.getLong("fcm_registered_at_ms", 0L)
+        set(value) = prefs.edit().putLong("fcm_registered_at_ms", value).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the

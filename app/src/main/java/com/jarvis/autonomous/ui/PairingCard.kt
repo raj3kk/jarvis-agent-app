@@ -147,6 +147,13 @@ fun PairingCard(prefs: JarvisPreferences) {
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold
             )
+            // 1.12.0 FCM: push status — ON once a token registered
+            // with the hub (read at card open; no live refresh).
+            Text(
+                text = "Push: " + if (prefs.fcmToken.isNotBlank()) "ON" else "OFF",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
             Text(text = "Key store: $keyStoreLabel", fontSize = 12.sp)
             if (pubPrefix.isNotEmpty()) {
                 Text(text = "Public key: $pubPrefix…", fontSize = 12.sp)

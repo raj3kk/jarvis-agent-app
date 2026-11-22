@@ -1,8 +1,12 @@
 package com.jarvis.autonomous
 
 import android.app.Application
+import com.jarvis.autonomous.data.FcmTokenClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.JarvisStateRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * 1.4.2 bug catcher — app entry point.
@@ -83,6 +87,14 @@ class JarvisApplication : Application() {
                 )
             }
             previous?.uncaughtException(thread, throwable)
+        }
+        if (proc.isEmpty()) {
+            // 1.12.0 FCM: register the push token when paired (main
+            // process only). Silent no-op when unpaired / no token /
+            // no network — the next app start retries.
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching { FcmTokenClient.syncToken(applicationContext) }
+            }
         }
     }
 }

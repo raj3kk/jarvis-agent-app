@@ -171,6 +171,17 @@
             </intent-filter>
         </receiver>
 
+        <!-- FCM push receiver (1.12.0): data-only messages from the
+             hub. No new permission — POST_NOTIFICATIONS is already
+             declared. -->
+        <service
+            android:name=".service.JarvisFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
         <!-- 1.4.4: FileProvider ONLY for sharing the bounce report
              file from the notification Share action (external
              files dir, JarvisDiagnostics/). No other files are

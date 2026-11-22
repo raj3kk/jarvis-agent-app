@@ -8,4 +8,7 @@ plugins {
     id("com.android.application") version "8.11.0" apply false
     id("org.jetbrains.kotlin.android") version "2.4.0" apply false
     id("org.jetbrains.kotlin.plugin.compose") version "2.4.0" apply false
+    // 1.12.0 FCM: google-services plugin reads app/google-services.json
+    // (client config from the Firebase console — NOT a secret).
+    id("com.google.gms.google-services") version "4.4.2" apply false
 }
