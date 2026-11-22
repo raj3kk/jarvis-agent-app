@@ -79,9 +79,14 @@
              branch. No new permission is added for it. -->
         <activity
             android:name=".browser.spike.GeckoSpikeActivity"
-            android:exported="false"
+            android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
-            android:label="Gecko Spike" />
+            android:label="Gecko Spike">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <!-- Autonomous Accessibility Service (Tap, Scroll, Type, Read Screen, Navigate) -->
         <service
