@@ -77,8 +77,10 @@ class GeckoSpikeActivity : ComponentActivity() {
         private const val GOOGLE_URL = "https://www.google.com/search?q=jarvis+autonomous+agent"
         private const val TURNSTILE_URL = "https://demo.turnstile.workers.dev/"
         private const val COOKIE_URL = "https://example.com/"
-        private const val DOWNLOAD_URL =
-            "https://www.w3.org/WAI/ER/tests/xhtml/testsuite/resources/pdf/dummy.pdf"
+        // orimi.com/pdf-test.pdf verified live 2026-11-22 (200,
+        // application/pdf, 20,597 B). The old W3C dummy.pdf URL is dead
+        // (404) — see BRIDGE_ROOT_CAUSE_AUDIT.md §6.
+        private const val DOWNLOAD_URL = "https://www.orimi.com/pdf-test.pdf"
 
         private const val PAGE_TIMEOUT_MS = 30_000L
         private const val EXT_TIMEOUT_MS = 15_000L
@@ -103,6 +105,11 @@ class GeckoSpikeActivity : ComponentActivity() {
     private var runtime: GeckoRuntime? = null
     private var extensionInstalled = false
     private var installedExtension: WebExtension? = null
+    // Background-owned native port (background.js connectNative). Stored
+    // when onConnect fires with session == null; preferred by
+    // requestViaPort. See BRIDGE_ROOT_CAUSE_AUDIT.md §5.
+    private var nativePort: WebExtension.Port? = null
+    private var bgAliveReceived = false
     private var running = false
 
     private val allSessions = mutableListOf<SpikeSession>()
@@ -441,6 +448,22 @@ class GeckoSpikeActivity : ComponentActivity() {
 
     /** Write gecko-spike-results.json to filesDir + external filesDir. */
     private fun writeResults() {
+        // writtenAt + testsCount + diagnostics make every copy
+        // self-identifying (the 2026-11-22 18:23 run's uploaded copy was
+        // stale — it matched the post-S-5 state; see
+        // BRIDGE_ROOT_CAUSE_AUDIT.md §6).
+        synchronized(resultsLock) {
+            results.put("writtenAt", Date().toString())
+            results.put("testsCount", testsObj.length())
+            results.put("diagnostics", JSONObject().apply {
+                put("bgAlive", bgAliveReceived)
+                put(
+                    "portKind",
+                    if (nativePort != null) "background"
+                    else if (allSessions.any { it.port != null }) "session" else "none",
+                )
+            })
+        }
         val snapshot: String = synchronized(resultsLock) { results.toString(2) }
         runCatching {
             File(filesDir, "gecko-spike-results.json").writeText(snapshot)
@@ -535,13 +558,24 @@ class GeckoSpikeActivity : ComponentActivity() {
 
         override fun onConnect(port: WebExtension.Port) {
             val session = port.sender.session
-            log("Bridge port connected (session=${session != null})")
-            val owner = allSessions.firstOrNull { it.session == session }
-            if (owner != null) {
-                owner.port = port
-                log("[${owner.label}] native port attached")
+            if (session == null) {
+                // Background-script port (background.js owns the native
+                // port — see BRIDGE_ROOT_CAUSE_AUDIT.md §5). There is no
+                // SpikeSession for it; keep it as the shared native port
+                // for all requests. The old code dropped session==null
+                // ports ("keeping no reference") — that was a bug for the
+                // background-port design.
+                nativePort = port
+                log("Bridge port connected (session=false) — background native port stored")
             } else {
-                log("Bridge port for unknown session — keeping no reference")
+                log("Bridge port connected (session=true)")
+                val owner = allSessions.firstOrNull { it.session == session }
+                if (owner != null) {
+                    owner.port = port
+                    log("[${owner.label}] native port attached")
+                } else {
+                    log("Bridge port for unknown session — keeping no reference")
+                }
             }
             port.setDelegate(object : WebExtension.PortDelegate {
                 override fun onPortMessage(message: Any, port: WebExtension.Port) {
@@ -552,6 +586,8 @@ class GeckoSpikeActivity : ComponentActivity() {
 
                 override fun onDisconnect(port: WebExtension.Port) {
                     log("Bridge port disconnected (session=${port.sender.session != null})")
+                    if (port.sender.session == null && nativePort == port) nativePort = null
+                    val owner = allSessions.firstOrNull { it.session == port.sender.session }
                     if (owner != null && owner.port == port) owner.port = null
                 }
             })
@@ -561,6 +597,11 @@ class GeckoSpikeActivity : ComponentActivity() {
     private fun handleBridgeMessage(msg: JSONObject, session: GeckoSession?) {
         val id = msg.optString("id", "")
         val type = msg.optString("type", "?")
+        if (type == "bg-alive") {
+            bgAliveReceived = true
+            log("Bridge bg-alive received (one-shot path works — background.js runs)")
+            return
+        }
         if (id.isNotEmpty()) {
             pending.remove(id)?.let { deferred ->
                 if (!deferred.isCompleted) deferred.complete(msg)
@@ -624,7 +665,9 @@ class GeckoSpikeActivity : ComponentActivity() {
         timeoutMs: Long = EXT_TIMEOUT_MS,
     ): JSONObject? {
         val id = msg.optString("id", "")
-        val port = spike.port
+        // Background-owned port first (background.js owns the native port);
+        // fall back to the per-session port (content-script port, legacy path).
+        val port = nativePort ?: spike.port
         if (port == null) {
             log("[${spike.label}] request $id FAILED: no native port yet")
             return null
@@ -663,11 +706,11 @@ class GeckoSpikeActivity : ComponentActivity() {
      */
     private suspend fun awaitPort(spike: SpikeSession, timeoutMs: Long = 10_000L): Boolean {
         val t0 = System.currentTimeMillis()
-        while (spike.port == null && System.currentTimeMillis() - t0 < timeoutMs) {
+        while (nativePort == null && spike.port == null && System.currentTimeMillis() - t0 < timeoutMs) {
             kotlinx.coroutines.delay(200)
         }
-        if (spike.port == null) log("[${spike.label}] no native port after ${timeoutMs}ms")
-        return spike.port != null
+        if (nativePort == null && spike.port == null) log("[${spike.label}] no native port after ${timeoutMs}ms")
+        return nativePort != null || spike.port != null
     }
 
     private suspend fun requestCaptcha(spike: SpikeSession): JSONObject? {

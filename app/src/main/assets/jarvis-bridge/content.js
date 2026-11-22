@@ -1,14 +1,15 @@
 // jarvis-bridge content script — GeckoView Phase 0 spike ONLY.
+// Talks ONLY to the background script (runtime.sendMessage /
+// runtime.onMessage). It NEVER calls connectNative: the content-script
+// native port died silently on the phone in S-2a and S-2b (see
+// BRIDGE_ROOT_CAUSE_AUDIT.md); the background script owns the native port.
 // Fixed operations only: extraction (title + innerText <= 2000 chars),
 // captcha detection with today's WebView selectors (DOM markers only —
-// NEVER a solver, never a challenge token), and cookie get/set relayed
-// via the background script (browser.cookies is background-only).
+// NEVER a solver, never a challenge token).
 // Every response carries the URL it was extracted from (B-C4 guard:
 // Kotlin discards any response whose URL != the requested URL).
 // No generic "run any JS string" bridge exists by design.
 (function () {
-  var APP = "jarvis-bridge";
-
   function captchaCheck() {
     function q(s) { try { return !!document.querySelector(s); } catch (e) { return false; } }
     if (q('iframe[src*="challenges.cloudflare.com"],[class*="cf-turnstile"]')) return "turnstile";
@@ -33,53 +34,27 @@
     return msg;
   }
 
-  var port = null;
-
-  function postToNative(obj) {
-    if (port) {
-      try { port.postMessage(obj); return; } catch (e) { /* fall through */ }
-    }
-    try { browser.runtime.sendMessage(obj); } catch (e2) { /* no channel */ }
-  }
-
-  // Cookie ops must run in the background script (browser.cookies is
-  // not available to content scripts). Relay via runtime.sendMessage;
-  // background.js returns the result, which we forward to Kotlin.
-  function handleCookieOp(msg) {
-    try {
-      browser.runtime.sendMessage(msg).then(function (result) {
-        postToNative(result || { type: msg.type + "-result", id: msg.id, ok: false, error: "empty-result" });
-      }, function (err) {
-        postToNative({ type: msg.type + "-result", id: msg.id, ok: false, error: String(err && err.message || err) });
-      });
-    } catch (e) {
-      postToNative({ type: msg.type + "-result", id: msg.id, ok: false, error: String(e && e.message || e) });
-    }
+  function postToBackground(obj) {
+    try { browser.runtime.sendMessage(obj); } catch (e) { /* no channel */ }
   }
 
   function handleRequest(msg) {
     if (!msg || typeof msg !== "object") return;
     if (msg.type === "extract") {
-      postToNative(extract(msg.id));
+      postToBackground(extract(msg.id));
     } else if (msg.type === "captcha") {
       var m = { type: "captcha", url: location.href, captcha: captchaCheck() };
       if (msg.id) m.id = msg.id;
-      postToNative(m);
-    } else if (msg.type === "cookie-get" || msg.type === "cookie-set") {
-      handleCookieOp(msg);
+      postToBackground(m);
     }
-    // Unknown types are ignored (enumerable surface — no generic eval).
+    // Cookie ops are handled in background.js directly (browser.cookies
+    // is background-only); unknown types are ignored (enumerable surface
+    // — no generic eval).
   }
 
-  // Primary channel: direct native-messaging port (needs the
-  // nativeMessagingFromContent permission in manifest.json).
-  try {
-    port = browser.runtime.connectNative(APP);
-    port.onMessage.addListener(handleRequest);
-    port.postMessage(extract(null));
-  } catch (e) {
-    // Fallback: one-shot via the background relay (background.js
-    // forwards with sendNativeMessage; Kotlin answers via onMessage).
-    try { browser.runtime.sendMessage(extract(null)); } catch (e2) { /* no channel */ }
-  }
+  browser.runtime.onMessage.addListener(handleRequest);
+
+  // Auto-extract on load: proves the content script ran, via the
+  // background relay (background.js forwards to the native port).
+  try { postToBackground(extract(null)); } catch (e) { /* no channel */ }
 })();
