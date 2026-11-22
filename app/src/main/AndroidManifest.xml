@@ -72,6 +72,17 @@
             </intent-filter>
         </activity>
 
+        <!-- GeckoView spike (Phase 0, throwaway — branch
+             geckoview-spike only). Launched by explicit intent only
+             (adb / dev trigger); never referenced from MainActivity,
+             BrowserScreen, or the foreground service. Delete with the
+             branch. No new permission is added for it. -->
+        <activity
+            android:name=".browser.spike.GeckoSpikeActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:label="Gecko Spike" />
+
         <!-- Autonomous Accessibility Service (Tap, Scroll, Type, Read Screen, Navigate) -->
         <service
             android:name=".service.JarvisAccessibilityService"

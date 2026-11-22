@@ -60,12 +60,19 @@ jobs:
       # obsolete 'tools' package, which sdkmanager no longer provides, so
       # that step fails the whole job. ubuntu-latest already ships an
       # Android SDK, so just ensure the exact platform/build-tools we need.
-      - name: Ensure Android SDK packages (platform 34, build-tools 34.0.0)
+      # GeckoView spike (Phase 0, branch geckoview-spike only):
+      # compileSdk 36 needs platforms;android-36. build-tools 35.0.0
+      # is installed too because AGP 8.11's default build-tools is
+      # 35.0.0 (the build fails if neither its default nor an
+      # explicit buildToolsVersion is present); 36.0.0 alongside it
+      # lets AGP pick the newest installed. 34 stays for the
+      # unchanged modules.
+      - name: Ensure Android SDK packages (platform 34+36, build-tools 34.0.0/35.0.0/36.0.0)
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls "$ANDROID_HOME/cmdline-tools" || true
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "platforms;android-36" "build-tools;34.0.0" "build-tools;35.0.0" "build-tools;36.0.0" "platform-tools"
 
       - name: Set up Gradle (uses gradlew wrapper, Gradle 8.13)
         uses: gradle/actions/setup-gradle@v3
@@ -156,6 +163,29 @@ jobs:
           set -e
           cp app/build/outputs/apk/release/*.apk Jarvis2026.apk
           ls -lh Jarvis2026.apk
+
+      # GeckoView spike S-1 (branch geckoview-spike only): release APK
+      # size gate — Play APK cap is 100 MB. Echoes the exact size
+      # every run and FAILS the build over the cap. Also confirms
+      # only the arm64-v8a native slice ships (no x86/armeabi libs).
+      - name: APK size gate (S-1, <= 100 MB) + ABI check
+        run: |
+          set -e
+          SIZE_BYTES=$(stat -c%s Jarvis2026.apk)
+          SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN{printf "%.2f", b/1048576}')
+          echo "Release APK size: $SIZE_BYTES bytes ($SIZE_MB MB)"
+          echo "APK_SIZE_BYTES=$SIZE_BYTES" >> "$GITHUB_ENV"
+          echo "Native libs in APK:"
+          unzip -l Jarvis2026.apk | grep -E "lib/[a-z0-9_-]+/" || echo "(no lib/ entries)"
+          if unzip -l Jarvis2026.apk | grep -qE "lib/(armeabi-v7a|armeabi|x86|x86_64|mips)/"; then
+            echo "FAIL: non-arm64 native libs present in release APK"
+            exit 1
+          fi
+          if [ "$SIZE_BYTES" -gt 104857600 ]; then
+            echo "FAIL: release APK $SIZE_MB MB exceeds 100 MB Play APK cap (S-1)"
+            exit 1
+          fi
+          echo "S-1 PASS: $SIZE_MB MB <= 100 MB, arm64-v8a only"
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4

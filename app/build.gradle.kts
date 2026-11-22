@@ -35,7 +35,10 @@ android {
     }
 
     namespace = "com.jarvis.autonomous"
-    compileSdk = 34
+    // GeckoView spike (Phase 0): compileSdk 34 -> 36. GeckoView raised
+    // compileSdk to 35 in v131 and to 36 in v139; the 160.x train
+    // requires at least 36. targetSdk stays 34 (separate decision).
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.jarvis.autonomous"
@@ -145,6 +148,26 @@ dependencies {
     // the build FAILS loudly; there is deliberately NO fallback
     // to plain SharedPreferences for these tokens.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // GeckoView spike (Phase 0, branch geckoview-spike only — throwaway):
+    // GeckoView 160.x Stable + Android Components 160.0.1 (matched pair).
+    // AC 160.0 pins the OLDER 10 Nov GV build (geckoview-omni
+    // 160.0.20261104181552) — do NOT use 160.0. AC 160.0.1 pins
+    // geckoview-omni 160.0.20261116130455 (17 Nov), which is the pin.
+    // NOTE: no direct org.mozilla.geckoview:geckoview dep on purpose —
+    // browser-engine-gecko already pulls geckoview-omni (same
+    // org.mozilla.geckoview.* classes); adding the fat geckoview AAR
+    // as well would put duplicate classes on the dex classpath.
+    // GeckoView classes (GeckoSession/GeckoRuntime/GeckoView) arrive
+    // transitively via geckoview-omni:160.0.20261116130455.
+    val geckoviewVersion = "160.0.20261116130455"
+    val androidComponentsVersion = "160.0.1"
+    implementation("org.mozilla.components:concept-engine:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-state:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-engine-gecko:$androidComponentsVersion")
+    implementation("org.mozilla.components:feature-tabs:$androidComponentsVersion")
+    implementation("org.mozilla.components:feature-downloads:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-session-storage:$androidComponentsVersion")
 
     // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
     // Localhost preview uses plain java.net ServerSocket (no dependency):
