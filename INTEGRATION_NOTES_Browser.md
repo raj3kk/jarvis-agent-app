@@ -648,3 +648,40 @@ before showing the preview, as the current code does.
   passed).
 - Not done by S3 (out of scope / forbidden): no edits to existing
   files, no push, no version-number change, no live-browser use.
+
+---
+
+## 16. 1.13.0 — Gecko browser (real browser in Jarvis)
+
+- **Engine dispatcher:** `BrowserScreen` (ui/BrowserScreen.kt) is now a
+  dispatcher: `JarvisPreferences.browserEngine` ("gecko" default,
+  "webview" fallback) picks `GeckoBrowserScreen` or the existing
+  WebView body (renamed `WebViewBrowserScreen`, private, unchanged
+  behaviour). MainActivity is untouched; the Browser tab still calls
+  `BrowserScreen(browserHost)`. Both screens share the same
+  `BrowserHostState`, so engine-driven loads work on either engine.
+- **Gecko engine:** `browser/gecko/GeckoBrowserManager.kt` (runtime +
+  built-in `jarvis-bridge` extension + tabs + bridge + downloads +
+  screenshots) and `browser/gecko/GeckoBrowserScreen.kt` (tabs, URL bar,
+  bridge-status diagnostics line, extraction preview, captcha badge,
+  downloads list). Pure helpers in `GeckoBridgeUtils.kt` (+ unit tests).
+- **Bridge design:** background.js owns the single native port; the
+  content script never calls connectNative (CI gate enforces it).
+  C1 mitigation: extension manifest version == the numeric part of
+  app versionName on every release (CI gate enforces it) + fresh
+  extension ID.
+- **Agent background browse STAYS on WebView** (JarvisBackgroundBrowser)
+  in 1.13.0 — the Gecko bridge is unproven on the phone; moving the
+  agent to it risks a regression. Gecko powers the visible Browser tab
+  only. A later release moves the agent over only with phone evidence.
+- **Captcha on Gecko:** detection only (badge + "WebView me solve karo"
+  action). Solving + the auto-solver stay WebView-only.
+- **Tabs are in-memory only** in v1 (no persistence). Downloads save to
+  filesDir/gecko-downloads/; screenshots to filesDir/gecko-shots/.
+- **Toolchain (D-1):** compileSdk 34 → 36; checkAarMetadata suppressed
+  (160.x AARs demand minCompileSdk 37) with a written justification in
+  app/build.gradle.kts. The AGP 9.1 + compileSdk 37 + Gradle 9.x
+  migration is a tracked follow-up before the next GeckoView bump.
+- **Size:** the release APK is ~235 MB (libxul.so ~147 MiB). The
+  ≤100 MB gate does NOT pass and is not claimed to — delivery is via
+  Drive, not Play.

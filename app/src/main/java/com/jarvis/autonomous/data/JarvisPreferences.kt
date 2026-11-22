@@ -163,6 +163,21 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getLong("fcm_registered_at_ms", 0L)
         set(value) = prefs.edit().putLong("fcm_registered_at_ms", value).apply()
 
+    // 1.13.0 Gecko browser: visible Browser-tab engine. "gecko" is the
+    // default (this release's point); "webview" is the fallback that
+    // never goes away. Any other stored value reads as "gecko" — a
+    // corrupt/unknown value must never blank the Browser tab. The
+    // agent's background browse does NOT read this: it stays on
+    // JarvisBackgroundBrowser (WebView) in 1.13.0 (D-2).
+    var browserEngine: String
+        get() {
+            val saved = prefs.getString("browser_engine", "gecko") ?: "gecko"
+            return if (saved == "webview") "webview" else "gecko"
+        }
+        set(value) = prefs.edit().putString(
+            "browser_engine", if (value == "webview") "webview" else "gecko"
+        ).apply()
+
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
         // replacement. This is the bug that broke existing installs: the

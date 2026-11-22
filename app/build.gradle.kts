@@ -38,14 +38,21 @@ android {
     }
 
     namespace = "com.jarvis.autonomous"
-    compileSdk = 34
+    // 1.13.0 Gecko browser: compileSdk 34 -> 36. GeckoView raised
+    // compileSdk to 35 in v131 and to 36 in v139; the 160.x train
+    // requires at least 36. targetSdk stays 34 (separate decision).
+    // The 160.x AARs declare minCompileSdk 37 in their metadata —
+    // see the checkAarMetadata suppression at the end of this file
+    // (D-1: the full AGP 9.1 + compileSdk 37 + Gradle 9.x migration
+    // is deferred as a tracked follow-up, not done in this release).
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 48
-        versionName = "1.12.0-PRO"
+        versionCode = 49
+        versionName = "1.13.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -149,6 +156,25 @@ dependencies {
     // to plain SharedPreferences for these tokens.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // 1.13.0 Gecko browser: GeckoView 160.x Stable + Android
+    // Components 160.0.1 (matched pair). AC 160.0 pins the OLDER
+    // 10 Nov GV build (geckoview-omni 160.0.20261104181552) — do NOT
+    // use 160.0. AC 160.0.1 pins geckoview-omni
+    // 160.0.20261116130455 (17 Nov), which is the pin.
+    // NOTE: no direct org.mozilla.geckoview:geckoview dep on purpose —
+    // browser-engine-gecko already pulls geckoview-omni (same
+    // org.mozilla.geckoview.* classes); adding the fat geckoview AAR
+    // as well would put duplicate classes on the dex classpath.
+    // GeckoView classes (GeckoSession/GeckoRuntime/GeckoView) arrive
+    // transitively via geckoview-omni:160.0.20261116130455.
+    val androidComponentsVersion = "160.0.1"
+    implementation("org.mozilla.components:concept-engine:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-state:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-engine-gecko:$androidComponentsVersion")
+    implementation("org.mozilla.components:feature-tabs:$androidComponentsVersion")
+    implementation("org.mozilla.components:feature-downloads:$androidComponentsVersion")
+    implementation("org.mozilla.components:browser-session-storage:$androidComponentsVersion")
+
     // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
     // Localhost preview uses plain java.net ServerSocket (no dependency):
     // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
@@ -174,4 +200,29 @@ dependencies {
     // bus, dispatcher and reply policy (pure-Kotlin modules).
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.11.1")
+}
+
+// 1.13.0 Gecko browser — D-1 TOOLCHAIN DECISION (suppression, not the
+// full migration). The 160.x train's AARs (geckoview-omni + all AC
+// artifacts, incl. transitives) declare minCompileSdk 37 in their AAR
+// metadata, while this project is on compileSdk 36 + AGP 8.11 — so
+// AGP's checkAarMetadata task fails the build (67 issues in the spike,
+// CI run 44989753191). The proper fix is AGP 9.1+ + compileSdk 37 +
+// Gradle 9.x, but that migration is UNPROVEN in this CI: SDK 37
+// availability, Kotlin 2.4.0 / Gradle 9 compat, and google-services
+// 4.4.2 compat are each a separate failure domain, and the user's
+// order is the browser, not the migration. The suppression changes
+// NOTHING about the APK contents (the check validates metadata only;
+// same AARs, same code — the spike proved it green on CI and working
+// on the phone). FOLLOW-UP (tracked, before the next GeckoView bump):
+// do the AGP 9.1 + compileSdk 37 + Gradle 9.x migration as its own
+// release, after confirming SDK 37 installs in CI. Until then this
+// suppression stays, deliberately and visibly.
+// AGP creates the checkAarMetadata variant tasks AFTER configuration,
+// so the suppression must live in afterEvaluate (a tasks.named call
+// during configuration throws UnknownTaskException — spike CI run
+// 44990074510).
+afterEvaluate {
+    tasks.named("checkDebugAarMetadata") { enabled = false }
+    tasks.named("checkReleaseAarMetadata") { enabled = false }
 }

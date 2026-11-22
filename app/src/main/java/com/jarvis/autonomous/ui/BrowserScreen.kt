@@ -60,6 +60,7 @@ import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import com.jarvis.autonomous.browser.gecko.GeckoBrowserScreen
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AutoSolveStatus
 import com.jarvis.autonomous.data.CaptchaAssistState
@@ -1548,8 +1549,33 @@ fun JarvisWebView(
 // ---------------------------------------------------------------------------
 
 /**
- * Browser tab. Works fully standalone — the user types a URL, browses
- * and navigates with no engine involvement at all.
+ * Browser tab — engine dispatcher (1.13.0).
+ *
+ * Gecko is the default engine; WebView stays as the fallback, selectable
+ * from the toggle at the top of either screen. The choice persists in
+ * JarvisPreferences.browserEngine. Both screens share the same
+ * [BrowserHostState], so engine-driven loads (loadUrl / showLoadedPage)
+ * work on either engine. MainActivity calls this function unchanged.
+ */
+@Composable
+fun BrowserScreen(browserHost: BrowserHostState? = null) {
+    val context = LocalContext.current
+    val prefs = remember { JarvisPreferences(context.applicationContext) }
+    var engine by remember { mutableStateOf(prefs.browserEngine) }
+    fun switchEngine(next: String) {
+        prefs.browserEngine = next
+        engine = next
+    }
+    if (engine == "gecko") {
+        GeckoBrowserScreen(browserHost, onSwitchEngine = ::switchEngine)
+    } else {
+        WebViewBrowserScreen(browserHost, onSwitchEngine = ::switchEngine)
+    }
+}
+
+/**
+ * Browser tab (WebView engine). Works fully standalone — the user types
+ * a URL, browses and navigates with no engine involvement at all.
  *
  * @param browserHost shared holder from the coordinator, or null for a
  * standalone instance (manual browsing only, no engine tab-switch).
@@ -1559,7 +1585,10 @@ fun JarvisWebView(
  * page, no reload). See the integration notes for the wiring.
  */
 @Composable
-fun BrowserScreen(browserHost: BrowserHostState? = null) {
+private fun WebViewBrowserScreen(
+    browserHost: BrowserHostState? = null,
+    onSwitchEngine: (String) -> Unit = {}
+) {
     val context = LocalContext.current
 
     // --- ALL state declarations FIRST (kotlin_prepush_checks: every
@@ -1637,6 +1666,19 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
             fontSize = 12.sp,
             color = Color(0xFF8A7A70)
         )
+
+        // Engine toggle (1.13.0): Gecko primary, WebView fallback.
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedButton(onClick = { onSwitchEngine("gecko") }) {
+                Text("Gecko", fontSize = 12.sp)
+            }
+            OutlinedButton(enabled = false, onClick = {}) {
+                Text("WebView ✓", fontSize = 12.sp)
+            }
+        }
 
         // URL bar: editable, bare domains get https:// by default.
         Row(
