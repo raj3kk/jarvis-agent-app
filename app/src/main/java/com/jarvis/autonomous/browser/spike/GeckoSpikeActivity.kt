@@ -604,6 +604,21 @@ class GeckoSpikeActivity : ComponentActivity() {
         return requestViaPort(spike, msg)
     }
 
+    /**
+     * The native port attaches when the page's content script connects
+     * (document_idle — usually around pageStop, but not guaranteed
+     * before it). Poll briefly before any requestViaPort so a
+     * just-loaded page is not failed for a port that lands 200 ms later.
+     */
+    private suspend fun awaitPort(spike: SpikeSession, timeoutMs: Long = 10_000L): Boolean {
+        val t0 = System.currentTimeMillis()
+        while (spike.port == null && System.currentTimeMillis() - t0 < timeoutMs) {
+            kotlinx.coroutines.delay(200)
+        }
+        if (spike.port == null) log("[${spike.label}] no native port after ${timeoutMs}ms")
+        return spike.port != null
+    }
+
     private suspend fun requestCaptcha(spike: SpikeSession): JSONObject? {
         val msg = JSONObject().apply {
             put("type", "captcha")
@@ -691,10 +706,12 @@ class GeckoSpikeActivity : ComponentActivity() {
     }
 
     private fun closeAllSessions() {
-        allSessions.forEach { it.close() }
-        allSessions.clear()
+        // Release views BEFORE closing sessions (setSession refuses /
+        // misbehaves when a previous open session is still attached).
         runCatching { tinyView.releaseSession() }
         runCatching { bigView.releaseSession() }
+        allSessions.forEach { it.close() }
+        allSessions.clear()
     }
 
     /** S-2 variant (a): unattached session + setActive, no GeckoView. */
@@ -756,7 +773,12 @@ class GeckoSpikeActivity : ComponentActivity() {
         var allOk = true
         for ((kind, url) in pages) {
             val stopped = loadAndWait(spike, url)
-            val extract = if (stopped) requestExtract(spike) else awaitAutoExtract(spike)
+            awaitPort(spike)
+            val extract = if (stopped) {
+                requestExtract(spike) ?: awaitAutoExtract(spike)
+            } else {
+                awaitAutoExtract(spike)
+            }
             val gotUrl = extract?.optString("url", "") ?: ""
             val gotTitle = extract?.optString("title", "") ?: ""
             val gotText = extract?.optString("text", "") ?: ""
@@ -788,7 +810,12 @@ class GeckoSpikeActivity : ComponentActivity() {
         val spike = newSpikeSession("S-4")
         tinyView.setSession(spike.session)
         val stopped = loadAndWait(spike, TURNSTILE_URL)
-        val extract = if (stopped) requestExtract(spike) else null
+        awaitPort(spike)
+        val extract = if (stopped) {
+            requestExtract(spike) ?: awaitAutoExtract(spike)
+        } else {
+            null
+        }
         val captchaMsg = requestCaptcha(spike)
         val viaExtract = extract?.optString("captcha", "null")
         val viaRequest = captchaMsg?.optString("captcha", "null")
@@ -816,6 +843,7 @@ class GeckoSpikeActivity : ComponentActivity() {
         var detail = "pageStop=$stopped"
         var ok = false
         if (stopped) {
+            awaitPort(spike)
             val value = "s5-${System.currentTimeMillis()}"
             val setMsg = JSONObject().apply {
                 put("type", "cookie-set")
@@ -938,6 +966,7 @@ class GeckoSpikeActivity : ComponentActivity() {
         loadAndWait(tabs[2], GOOGLE_URL)
         recordRss("S-8-3-tabs-loaded")
         // Background extraction running on one tab while 3 are open.
+        awaitPort(tabs[0])
         val extract = requestExtract(tabs[0])
         recordRss("S-8-3-tabs-plus-extraction")
         val extractOk = extract != null && extract.optString("text", "").isNotBlank()
