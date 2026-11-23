@@ -23,3 +23,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "JarvisAgentApp"
 include(":app")
+// M-I-1 spike (branch spike/mi1-litert ONLY — never merged to main):
+// the minimal on-demand-lib spike module. Its APK must NOT contain
+// liblitertlm_jni.so (see spike/build.gradle.kts packaging excludes).
+include(":spike")

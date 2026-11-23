@@ -1,0 +1,73 @@
+name: M-I-1 LiteRT Spike
+
+# Spike CI runs are workflow_dispatch ONLY — a push creates no run.
+# This workflow lives ONLY on branch spike/mi1-litert (never merged
+# to main). It builds the minimal spike APK (:spike:assembleDebug,
+# debug-signed — no production keystore, no release slot, no
+# version bump) and FAILS if the APK still bundles
+# liblitertlm_jni.so (the negative gate: the whole point is that
+# the .so is NOT in the APK).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-spike:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      # Same SDK setup as the app build (platform 34 + 36,
+      # build-tools 34.0.0). ubuntu-latest already ships an Android
+      # SDK; just ensure the exact packages we need.
+      - name: Ensure Android SDK packages (platform 34 + 36, build-tools 34.0.0)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/cmdline-tools" || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "platforms;android-36" "build-tools;34.0.0" "platform-tools"
+
+      - name: Set up Gradle (uses gradlew wrapper, Gradle 8.13)
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Run spike unit tests + build debug APK
+        run: ./gradlew :spike:testDebugUnitTest :spike:assembleDebug --stacktrace
+
+      - name: Verify spike APK (exists + badging + NO bundled .so)
+        run: |
+          set -e
+          APK=$(ls spike/build/outputs/apk/debug/*.apk)
+          echo "APK: $APK"
+          ls -lh "$APK"
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
+          "$AAPT2" dump badging "$APK" | head -5
+          # NEGATIVE GATE: the spike APK must NOT contain the .so.
+          if unzip -l "$APK" | grep -q "liblitertlm_jni.so"; then
+            echo "FAIL: spike APK bundles liblitertlm_jni.so — the on-demand proof would be contaminated."
+            exit 1
+          fi
+          echo "OK: no bundled liblitertlm_jni.so in the spike APK"
+          # The spike APK must be small (no .so, no ML Kit, no app
+          # code) — the 1.5.4 measurement said ~3.25 MB without the .so.
+          SIZE=$(stat -c %s "$APK")
+          echo "APK size: $SIZE bytes"
+          if [ "$SIZE" -gt 15000000 ]; then
+            echo "FAIL: spike APK unexpectedly large ($SIZE bytes > 15 MB) — something got bundled."
+            exit 1
+          fi
+
+      - name: Upload Spike APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MI1-Spike-APK
+          path: spike/build/outputs/apk/debug/*.apk
+          retention-days: 30
