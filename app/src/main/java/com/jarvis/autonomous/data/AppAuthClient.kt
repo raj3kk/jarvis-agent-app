@@ -210,7 +210,10 @@ class AppAuthClient(private val store: AppAuthTokenStore) {
             onResult(false, config.validate() ?: "authorization response me code nahi mila.")
             return
         }
-        service.performTokenRequest(tokenRequest, null) { resp: TokenResponse?, ex: AuthorizationException? ->
+        // Public client: the single-argument overload (no ClientAuthentication)
+        // is AppAuth's documented path — PKCE is the authentication, and the
+        // 3-arg overload rejects null ClientAuthentication at compile time.
+        service.performTokenRequest(tokenRequest) { resp: TokenResponse?, ex: AuthorizationException? ->
             if (resp == null) {
                 onResult(false, (ex?.message ?: "token exchange fail hua.").take(200))
                 return@performTokenRequest
