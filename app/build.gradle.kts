@@ -173,7 +173,31 @@ dependencies {
     // CDN load at runtime. If CI ever fails to resolve this pinned
     // commit, the fallback is vendoring the AAR source — never a
     // second bridge implementation.
-    implementation("com.github.wendux:DSBridge-Android:22b19ffaf1")
+    // TRANSITIVE-DEPS FIX (CI 45135413509 + 45136651748): DSBridge's
+    // pom depends on appcompat-v7:23.4.0, which pulls
+    // support-v4:23.4.0 — whose android.support.v4.os.ResultReceiver
+    // / INotificationSideChannel classes ALSO ship in
+    // androidx.core:1.13.1, so :app:checkDebugDuplicateClasses fails.
+    // Jetifier alone does NOT fix it (commit #6 PROVED it): those
+    // AIDL classes are deliberately excluded from Jetifier rewriting
+    // (their package is part of the Binder wire protocol), so the
+    // duplicates survive in the original package. The fix is
+    // exclusion: support-v4 + appcompat-v7 are BOTH excluded from
+    // DSBridge (its classes reference ONLY android.support.v7.app
+    // .AlertDialog + android.support.annotation.Keep — verified by
+    // reading its classes.jar constant pool), and androidx.appcompat
+    // is added directly below. Jetifier (gradle.properties) STAYS ON:
+    // it rewrites DSBridge's AlertDialog/Keep references to the
+    // androidx equivalents. A blanket exclude of com.android.support
+    // would be wrong for the same reason as before — DWebView calls
+    // AlertDialog.Builder at runtime.
+    implementation("com.github.wendux:DSBridge-Android:22b19ffaf1") {
+        exclude(group = "com.android.support", module = "support-v4")
+        exclude(group = "com.android.support", module = "appcompat-v7")
+    }
+    // 1.15.0 (R0): AndroidX replacement for DSBridge's excluded
+    // appcompat-v7 (its AlertDialog, rewritten by Jetifier, needs it).
+    implementation("androidx.appcompat:appcompat:1.7.0")
 
     // 1.15.0 (R0 parity spec §5 #10): WorkManager backstop — the Vivo
     // kills background WebViews/services, so a periodic worker re-arms
