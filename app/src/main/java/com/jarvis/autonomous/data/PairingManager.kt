@@ -88,7 +88,12 @@ object PairingManager {
         // U10 (R1): 409 device_mismatch — the licence is bound to a
         // DIFFERENT device. Same Licence-screen wording as the
         // verify 409 (LicenceScreen.kt), not a generic server error.
-        DEVICE_MISMATCH
+        DEVICE_MISMATCH,
+        // R4.1: /api/pairing/auto 403 device_limit — the tenant's
+        // plan device cap is full. Different from DEVICE_MISMATCH
+        // (licence bound elsewhere): this one is a plan limit, fixed
+        // by unpairing an old device or upgrading.
+        DEVICE_LIMIT
     }
 
     sealed interface InitResult {
@@ -99,6 +104,15 @@ object PairingManager {
     sealed interface RegisterResult {
         data object Ok : RegisterResult
         data class Err(val kind: PairingError) : RegisterResult
+    }
+
+    /**
+     * R4.1 — pairing auto-flow result. Ok carries the tenant the hub
+     * resolved from the licence key (the app does not invent one).
+     */
+    sealed interface AutoResult {
+        data class Ok(val tenantId: String) : AutoResult
+        data class Err(val kind: PairingError) : AutoResult
     }
 
     private val httpClient = OkHttpClient.Builder()
@@ -429,6 +443,82 @@ object PairingManager {
                 400 -> RegisterResult.Err(PairingError.BAD_REQUEST)
                 else -> RegisterResult.Err(PairingError.SERVER)
             }
+        }
+    }
+
+    // ---- R4.1 — pairing auto-flow (licence activation merges it) ----
+
+    /**
+     * POST /api/pairing/auto {device_id, licence_key, public_key} —
+     * one call that verifies the licence AND registers the device
+     * (hub registerDevice, tenant derived from the licence key).
+     * No 6-digit code, no second step. Callers keep the manual
+     * code path (init + register) as the fallback: auto is a
+     * convenience, never a gate — activation must never fail
+     * because auto-pairing did.
+     *
+     * Pure response mapping lives in parseAutoResponse (unit-tested);
+     * this function only does the network call + the keypair lookup.
+     */
+    fun autoPairing(context: Context, deviceId: String, licenceKey: String): AutoResult {
+        if (licenceKey.isBlank()) return AutoResult.Err(PairingError.NO_LICENCE)
+        val publicKey = runCatching { publicKeyB64(context) }
+            .getOrElse { return AutoResult.Err(PairingError.KEY_ERROR) }
+        val bodyJson = JSONObject()
+            .put("device_id", deviceId)
+            .put("licence_key", licenceKey)
+            .put("public_key", publicKey)
+            .toString()
+        val request = Request.Builder()
+            .url("$HUB_URL/api/pairing/auto")
+            .post(bodyJson.toRequestBody("application/json".toMediaType()))
+            .build()
+        val response = runCatching { httpClient.newCall(request).execute() }
+            .getOrElse { return AutoResult.Err(PairingError.NETWORK) }
+        response.use { resp ->
+            val text = runCatching { resp.body?.string() ?: "" }.getOrDefault("")
+            val result = parseAutoResponse(resp.code, text)
+            if (result is AutoResult.Ok) {
+                // Same hub-key store as register (M-4 §4.5): the auto
+                // response carries hub_public_key + key_id when the
+                // hub has one. Absent fields = old hub, ignore.
+                runCatching {
+                    val json = JSONObject(text)
+                    val hubKey = json.optString("hub_public_key", "")
+                    val hubKeyId = json.optString("key_id", "")
+                    if (hubKey.isNotBlank() && hubKeyId.isNotBlank()) {
+                        storeHubPublicKey(context, hubKey, hubKeyId)
+                    }
+                }
+            }
+            return result
+        }
+    }
+
+    /** Pure mapping of the /api/pairing/auto response (no I/O). */
+    fun parseAutoResponse(httpCode: Int, bodyText: String): AutoResult {
+        return when (httpCode) {
+            200 -> {
+                val json = runCatching { JSONObject(bodyText) }.getOrNull()
+                    ?: return AutoResult.Err(PairingError.SERVER)
+                if (!json.optBoolean("ok", false) || !json.optBoolean("paired", false)) {
+                    return AutoResult.Err(PairingError.SERVER)
+                }
+                AutoResult.Ok(json.optString("tenant_id", ""))
+            }
+            403 -> {
+                // licence_invalid vs device_limit — the error string
+                // decides; an unknown 403 is a licence failure.
+                val json = runCatching { JSONObject(bodyText) }.getOrNull()
+                if (json?.optString("error", "") == "device_limit") {
+                    AutoResult.Err(PairingError.DEVICE_LIMIT)
+                } else {
+                    AutoResult.Err(PairingError.LICENCE_INVALID)
+                }
+            }
+            429 -> AutoResult.Err(PairingError.RATE_LIMITED)
+            400 -> AutoResult.Err(PairingError.BAD_REQUEST)
+            else -> AutoResult.Err(PairingError.SERVER)
         }
     }
 }

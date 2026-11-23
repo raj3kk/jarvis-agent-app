@@ -316,6 +316,8 @@ private fun pairingErrorText(kind: PairingManager.PairingError): String {
             "Licence active nahi hai — Licence tab check karo."
         PairingManager.PairingError.DEVICE_MISMATCH ->
             "Ye licence kisi aur device se bound hai — pehle us device se Release karo (Licence tab), phir dobara Pair karo."
+        PairingManager.PairingError.DEVICE_LIMIT ->
+            "Device limit khatam hai — purana device unpair karo ya plan upgrade karo, phir dobara Pair karo."
         PairingManager.PairingError.RATE_LIMITED ->
             "Bahut jaldi try kar rahe ho — 1 minute ruk kar dobara try karo."
         PairingManager.PairingError.TOKEN_INVALID ->

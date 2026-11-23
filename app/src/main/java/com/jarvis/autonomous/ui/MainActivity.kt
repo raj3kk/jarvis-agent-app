@@ -140,6 +140,7 @@ import com.jarvis.autonomous.data.PlanView
 import com.jarvis.autonomous.voice.SwaraTtsClient
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.data.SkillApprovalClient
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.LearnedRoutineStore
@@ -203,6 +204,9 @@ class MainActivity : ComponentActivity() {
         /** R3.9: FCM tap payload (kind + text) — Talker speaks it. */
         const val EXTRA_FCM_KIND = "extra_fcm_kind"
         const val EXTRA_FCM_TEXT = "extra_fcm_text"
+        /** R4.2: FCM deep-link ids (hub sends job_id / skill_id in data). */
+        const val EXTRA_FCM_JOB_ID = "extra_fcm_job_id"
+        const val EXTRA_FCM_SKILL_ID = "extra_fcm_skill_id"
     }
 
     /**
@@ -230,6 +234,20 @@ class MainActivity : ComponentActivity() {
         val fcmText = intent.getStringExtra(EXTRA_FCM_TEXT).orEmpty()
         if (fcmText.isNotBlank()) {
             val fcmKind = intent.getStringExtra(EXTRA_FCM_KIND).orEmpty()
+            // R4.2 — deep-link: the tap opens the screen the push is
+            // about (skill → Skills/approve card on tab 3, due-job →
+            // cron list on tab 2, memory → Trained tab 9). The
+            // job/skill id rides along in the intent for future
+            // per-item highlight — today the tab opens and the item
+            // is visible in its list (no per-job detail screen
+            // exists yet; the id is logged, not faked as a detail
+            // view). Unknown kinds change no tab. The Talker speak
+            // below still runs for every kind (R3.9 behaviour kept).
+            when (fcmKind) {
+                "skill_approved" -> JarvisStateRepository.requestOpenTab(3)
+                "due-job" -> JarvisStateRepository.requestOpenTab(2)
+                "memory_push" -> JarvisStateRepository.requestOpenTab(9)
+            }
             val speak = Intent(this, JarvisForegroundService::class.java).apply {
                 action = JarvisForegroundService.ACTION_SPEAK_FCM_PUSH
                 putExtra(JarvisForegroundService.EXTRA_FCM_KIND, fcmKind)
@@ -3031,6 +3049,9 @@ fun MemoryRoutinesLogsScreen(
     }
     var proposals by remember { mutableStateOf(selfExtStore.loadProposals()) }
     var proposalNote by remember { mutableStateOf("") }
+    // R4.11 (U8-SERVER): the Approve tap below also signals the hub
+    // (POST /api/skills/approve) — this scope runs that call.
+    val approveScope = rememberCoroutineScope()
 
     val logs by JarvisStateRepository.executionLogs.collectAsState()
 
@@ -3316,6 +3337,39 @@ fun MemoryRoutinesLogsScreen(
                                             "self-extension", "PROPOSAL_USER_APPROVED",
                                             "capability=${proposal.capability}"
                                         )
+                                        // R4.11 (U8-SERVER): phone-side
+                                        // record pehle, phir server
+                                        // signal (POST /api/skills/
+                                        // approve, device-signed). The
+                                        // skill stays quarantined until
+                                        // admin review — this only
+                                        // records the user's yes. Server
+                                        // fail => phone record stays +
+                                        // the note says so (no silent
+                                        // drop). No serverSkillId means
+                                        // the proposal was never
+                                        // submitted to the hub — nothing
+                                        // to signal, and the note says
+                                        // that instead of faking an id.
+                                        val serverSkillId = proposal.serverSkillId
+                                        if (serverSkillId.isBlank()) {
+                                            proposalNote = "Approve kar diya — phone par record hua. " +
+                                                "Ye skill hub par submit hi nahi hui thi, isliye server ko kuch batana nahi tha."
+                                        } else {
+                                            approveScope.launch {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    SkillApprovalClient.approve(skillContext, serverSkillId)
+                                                }
+                                                proposalNote = when (result) {
+                                                    is SkillApprovalClient.ApproveResult.Ok ->
+                                                        "Approve kar diya — phone par record hua, server ko bhi bata diya. " +
+                                                            "Ab admin review + scan ka intezaar hai; kuch install nahi hua."
+                                                    is SkillApprovalClient.ApproveResult.Err ->
+                                                        "Approve kar diya — phone par record hua, par server ko batana fail hua (${result.message}). " +
+                                                            "Tumhari pasand phone par safe hai; dobara Approve dabane par phir bhej dunga."
+                                                }
+                                            }
+                                        }
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
                                 ) {

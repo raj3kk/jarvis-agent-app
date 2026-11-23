@@ -38,7 +38,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.LicenceKeyStore
+import com.jarvis.autonomous.data.PairingManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -141,6 +143,19 @@ private fun deviceId(context: Context): String {
         context.contentResolver,
         Settings.Secure.ANDROID_ID
     ) ?: ""
+}
+
+/** R4.1 — one-line reason when auto-pairing fails (activation stays). */
+private fun autoPairingErrorText(kind: PairingManager.PairingError): String {
+    return when (kind) {
+        PairingManager.PairingError.DEVICE_LIMIT ->
+            "device limit khatam hai"
+        PairingManager.PairingError.NETWORK ->
+            "network fail hua"
+        PairingManager.PairingError.RATE_LIMITED ->
+            "bahut jaldi try hua"
+        else -> "server ne pair nahi kiya"
+    }
 }
 
 // One licence-server call with primary→fallback failover (C-B11).
@@ -413,6 +428,34 @@ fun LicenceScreen() {
                                 if (saved) {
                                     activated = true
                                     status = "Activated ✅ — licence is bound to this device."
+                                    // R4.1 — pairing auto-flow: licence
+                                    // activate hote hi device ko pair
+                                    // karne ki koshish karo (ek call:
+                                    // /api/pairing/auto). Ye activation
+                                    // ka bonus hai, gate nahi — auto
+                                    // fail ho to activation phir bhi
+                                    // Activated rehti hai, aur manual
+                                    // code path (PairingCard) fallback
+                                    // rehta hai. Status line saaf
+                                    // batati hai kya hua.
+                                    val auto = withContext(Dispatchers.IO) {
+                                        PairingManager.autoPairing(context, id, key)
+                                    }
+                                    when (auto) {
+                                        is PairingManager.AutoResult.Ok -> {
+                                            val jp = JarvisPreferences(context)
+                                            jp.pairingPaired = true
+                                            jp.pairingDeviceId = id
+                                            jp.pairingPairedAtMs = System.currentTimeMillis()
+                                            status = "Activated ✅ — licence is bound to this device. " +
+                                                "Paired bhi ho gaya ✅ — ab code type karne ki zaroorat nahi."
+                                        }
+                                        is PairingManager.AutoResult.Err -> {
+                                            status = "Activated ✅ — licence is bound to this device. " +
+                                                "Pairing auto nahi hua (${autoPairingErrorText(auto.kind)}) — " +
+                                                "AI Brain > Pairing me 'Pair karo' dabao, code se pair hoga."
+                                        }
+                                    }
                                 } else {
                                     activated = false
                                     status = "Server ne activate kar diya, par is phone par " +

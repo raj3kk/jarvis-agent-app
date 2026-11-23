@@ -248,8 +248,7 @@ object CronJobClient {
 
     /** Enable / disable a job (enable recomputes next_run_at server-side). */
     suspend fun setEnabled(context: Context, jobId: String, enabled: Boolean): OpResult {
-        val path = "/api/billing/cron-jobs/$jobId/${if (enabled) "enable" else "disable"}"
-        val json = postSigned(context, path, JSONObject())
+        val json = postSigned(context, setEnabledPath(jobId, enabled), JSONObject())
             ?: return OpResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
         if (json.optBoolean("ok", false)) return OpResult.Ok
         return OpResult.Err(mapError(json))
@@ -257,11 +256,18 @@ object CronJobClient {
 
     /** Delete a job outright (no un-delete — the card confirms first). */
     suspend fun deleteJob(context: Context, jobId: String): OpResult {
-        val json = deleteSigned(context, "/api/billing/cron-jobs/$jobId")
+        val json = deleteSigned(context, deletePath(jobId))
             ?: return OpResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
         if (json.optBoolean("ok", false)) return OpResult.Ok
         return OpResult.Err(mapError(json))
     }
+
+    /** R4.7 — pure route builders (unit-tested; the lifecycle routes). */
+    fun setEnabledPath(jobId: String, enabled: Boolean): String =
+        "/api/billing/cron-jobs/$jobId/${if (enabled) "enable" else "disable"}"
+
+    /** R4.7 — pure route builder (unit-tested). */
+    fun deletePath(jobId: String): String = "/api/billing/cron-jobs/$jobId"
 
     private fun mapError(json: JSONObject): String {
         val error = json.optString("error", "")

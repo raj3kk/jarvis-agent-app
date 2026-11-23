@@ -61,6 +61,48 @@ object GoogleClient {
         data class Err(val message: String) : DriveResult
     }
 
+    // R4.8 (U27) — Drive upload + Calendar results. The hub returns
+    // {ok, file: {id, name, mimeType}} and {ok, event(s)} with
+    // CalendarEventSummary {id, summary, start, end, htmlLink?}
+    // (google.ts). The app never holds Google tokens — same
+    // device-signed pattern as the rest of this file.
+    data class DriveUploadFile(val id: String, val name: String, val mimeType: String)
+
+    sealed interface DriveUploadResult {
+        data class Ok(val file: DriveUploadFile) : DriveUploadResult
+        data class Err(val message: String) : DriveUploadResult
+    }
+
+    data class CalendarEvent(val id: String, val summary: String, val start: String, val end: String, val htmlLink: String?)
+
+    sealed interface CalendarListResult {
+        data class Ok(val events: List<CalendarEvent>) : CalendarListResult
+        data class Err(val message: String) : CalendarListResult
+    }
+
+    sealed interface CalendarCreateResult {
+        data class Ok(val event: CalendarEvent) : CalendarCreateResult
+        data class Err(val message: String) : CalendarCreateResult
+    }
+
+    /**
+     * R4.6 (D-R18) — content idempotency key: SHA-256 hex of
+     * "to\nsubject\nbody" — byte-identical to the hub's
+     * contentIdempotencyKey (src/idempotency.ts). A double-tap on
+     * the same mail is the same key, so the hub dedupes it; a
+     * retry reuses the same key trivially. A random UUID per tap
+     * would NOT dedupe (two taps = two UUIDs) — that is why the
+     * brief's UUID letter was deviated from (BUILD_NOTES §6).
+     */
+    fun idempotencyKey(to: String, subject: String, body: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("$to\n$subject\n$body".toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    /** R4.8 — server Drive upload cap (google.ts DRIVE_UPLOAD_MAX_BYTES). */
+    const val DRIVE_UPLOAD_MAX_BYTES = 1024 * 1024
+
     private fun signedHeaders(context: Context, payloadRaw: String): Map<String, String>? {
         val deviceId = runCatching { PairingManager.deviceId(context) }.getOrNull()
             ?.takeIf { it.isNotBlank() } ?: return null
@@ -102,11 +144,14 @@ object GoogleClient {
         }
     }
 
-    private suspend fun postSigned(context: Context, path: String, body: JSONObject): JSONObject? {
+    private suspend fun postSigned(context: Context, path: String, body: JSONObject, extraHeaders: Map<String, String> = emptyMap()): JSONObject? {
         val headers = signedHeaders(context, DocConfirmClient.sortedJson(body)) ?: return null
         val request = Request.Builder()
             .url("${PairingManager.HUB_URL}$path")
-            .apply { headers.forEach { (k, v) -> addHeader(k, v) } }
+            .apply {
+                headers.forEach { (k, v) -> addHeader(k, v) }
+                extraHeaders.forEach { (k, v) -> addHeader(k, v) }
+            }
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
         return withContext(Dispatchers.IO) {
@@ -125,6 +170,11 @@ object GoogleClient {
             "google_not_connected" -> "Google connect nahi hai — AI Brain > Google — Gmail & Drive me Connect dabao."
             "google_oauth_not_configured" -> "Hub par Google OAuth configure nahi hai — abhi setup baaki hai."
             "google_token_decrypt_failed" -> "Google tokens dobara connect karne honge — AI Brain > Google me Connect dabao."
+            // R4.8 — scope trap, live-proven: the old token is
+            // drive.readonly, so Drive write / Calendar need a NEW
+            // consent. The hub's detail already says this; the
+            // mapping keeps the line short and actionable.
+            "google_reconnect_required" -> "Google dobara connect karna hoga (naya permission) — AI Brain > Google me Connect dabao, purana token read-only chalta rahega."
             "" -> json.optString("detail", "Google call fail hua.")
             else -> json.optString("detail", err).take(200)
         }
@@ -169,7 +219,16 @@ object GoogleClient {
             .put("to", to)
             .put("subject", subject)
             .put("body", body)
-        val json = postSigned(context, "/api/google/gmail/send", jsonBody)
+        // R4.6 — Idempotency-Key: the content hash (same canonical
+        // form as the hub). A double-tap sends the same key, so the
+        // hub returns the first send (deduped:true) and sends no
+        // second mail. The key is a hash, never the mail content.
+        val json = postSigned(
+            context,
+            "/api/google/gmail/send",
+            jsonBody,
+            mapOf("Idempotency-Key" to idempotencyKey(to, subject, body))
+        )
             ?: return SendResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
         if (!json.optBoolean("ok", false)) return SendResult.Err(hubError(json))
         return SendResult.Ok(json.optString("id", ""))
@@ -223,5 +282,93 @@ object GoogleClient {
                 contentNote = f.optString("content_note", "").takeIf { it.isNotBlank() }
             )
         )
+    }
+
+    // ---- R4.8 (U27) — Drive write + Calendar (device-signed) ----
+
+    /**
+     * POST /api/google/drive/upload — multipart upload via the hub.
+     * Scope trap: needs the drive.file scope; the old drive.readonly
+     * token gets google_reconnect_required (hubError maps it to the
+     * re-consent line). The 1 MB cap is enforced here too, before
+     * any bytes leave the phone — the hub enforces the same cap.
+     * A reconnect failure is reported honestly, never faked as a
+     * successful upload.
+     */
+    suspend fun driveUpload(context: Context, name: String, mimeType: String, content: ByteArray): DriveUploadResult {
+        val deviceId = deviceIdOrNull(context)
+            ?: return DriveUploadResult.Err("Device paired nahi hai — pehle pairing karo.")
+        if (name.isBlank() || name.length > 255) {
+            return DriveUploadResult.Err("File ka naam chahiye (max 255 chars).")
+        }
+        if (content.size > DRIVE_UPLOAD_MAX_BYTES) {
+            return DriveUploadResult.Err("File bahut badi hai — Drive upload max 1 MB hai.")
+        }
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("name", name)
+            .put("mime_type", mimeType.ifBlank { "application/octet-stream" })
+            .put("content_base64", Base64.encodeToString(content, Base64.NO_WRAP))
+        val json = postSigned(context, "/api/google/drive/upload", body)
+            ?: return DriveUploadResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
+        if (!json.optBoolean("ok", false)) return DriveUploadResult.Err(hubError(json))
+        val f = json.optJSONObject("file") ?: return DriveUploadResult.Err("Drive upload ka jawab adhoora aaya.")
+        return DriveUploadResult.Ok(
+            DriveUploadFile(
+                id = f.optString("id", ""),
+                name = f.optString("name", name),
+                mimeType = f.optString("mimeType", mimeType)
+            )
+        )
+    }
+
+    private fun parseCalendarEvent(o: JSONObject): CalendarEvent {
+        return CalendarEvent(
+            id = o.optString("id", ""),
+            summary = o.optString("summary", "(no title)"),
+            start = o.optString("start", ""),
+            end = o.optString("end", ""),
+            htmlLink = o.optString("htmlLink", "").takeIf { it.isNotBlank() }
+        )
+    }
+
+    /** GET /api/google/calendar/events — upcoming events, soonest first. */
+    suspend fun calendarList(context: Context, maxResults: Int = 10): CalendarListResult {
+        val deviceId = deviceIdOrNull(context)
+            ?: return CalendarListResult.Err("Device paired nahi hai — pehle pairing karo.")
+        val json = getSigned(context, "/api/google/calendar/events?device_id=$deviceId&max_results=$maxResults")
+            ?: return CalendarListResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
+        if (!json.optBoolean("ok", false)) return CalendarListResult.Err(hubError(json))
+        val events = mutableListOf<CalendarEvent>()
+        val arr = json.optJSONArray("events") ?: return CalendarListResult.Ok(events)
+        for (i in 0 until arr.length()) {
+            val m = arr.optJSONObject(i) ?: continue
+            events.add(parseCalendarEvent(m))
+        }
+        return CalendarListResult.Ok(events)
+    }
+
+    /**
+     * POST /api/google/calendar/events — create an event. start/end
+     * are RFC 3339 date-times (the hub validates them). Needs the
+     * calendar.events scope — old token → re-consent line (hubError).
+     */
+    suspend fun calendarCreate(context: Context, summary: String, start: String, end: String, description: String? = null): CalendarCreateResult {
+        val deviceId = deviceIdOrNull(context)
+            ?: return CalendarCreateResult.Err("Device paired nahi hai — pehle pairing karo.")
+        if (summary.isBlank() || summary.length > 500) {
+            return CalendarCreateResult.Err("Event ka title chahiye (max 500 chars).")
+        }
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("summary", summary)
+            .put("start", start)
+            .put("end", end)
+        if (!description.isNullOrBlank()) body.put("description", description)
+        val json = postSigned(context, "/api/google/calendar/events", body)
+            ?: return CalendarCreateResult.Err("Hub se jawab nahi mila — pairing ya network check karo.")
+        if (!json.optBoolean("ok", false)) return CalendarCreateResult.Err(hubError(json))
+        val e = json.optJSONObject("event") ?: return CalendarCreateResult.Err("Calendar event ka jawab adhoora aaya.")
+        return CalendarCreateResult.Ok(parseCalendarEvent(e))
     }
 }

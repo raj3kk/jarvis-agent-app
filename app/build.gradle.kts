@@ -49,8 +49,17 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 54
-        versionName = "1.18.0-PRO"
+        versionCode = 55
+        versionName = "1.19.0-PRO"
+
+        // 1.19.0 (R4.4 AppAuth plumbing): AppAuth's
+        // RedirectUriReceiverActivity needs a redirect scheme at
+        // manifest-merge time — without this placeholder the build
+        // fails (manifest merger error). The scheme is a local app
+        // scheme only; no provider is configured yet (provider #2
+        // DEFER — user provider name de tabhi), so no OAuth flow
+        // can start from it today.
+        manifestPlaceholders["appAuthRedirectScheme"] = "com.jarvis.autonomous.oauth"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -225,6 +234,17 @@ dependencies {
     // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
     // broke CI dependency resolution on 2026-11-02, so it is NOT used.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+
+    // 1.19.0 (R4.4 AppAuth plumbing): AppAuth-Android, the reference
+    // OAuth 2.0 / OIDC client for native apps (RFC 8252). Pinned
+    // 0.11.1 — the current Maven Central release (Dec 2021; verified
+    // 2026-11-23). Plumbing only: AuthorizationService +
+    // AuthState + token vault (AppAuthClient.kt). NO provider is
+    // configured — provider #2 stays DEFER (user provider name de
+    // tabhi); the Google flow stays hub-mediated (GoogleClient).
+    // AppAuth's manifest declares RedirectUriReceiverActivity with
+    // the ${appAuthRedirectScheme} placeholder (defaultConfig above).
+    implementation("net.openid:appauth:0.11.1")
 
     // 1.12.0 FCM: kotlinx-coroutines-play-services provides the
     // `Task.await()` extension used by FcmTokenClient (Firebase token
