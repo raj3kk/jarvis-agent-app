@@ -995,6 +995,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             is StepOutcome.Done -> "DONE" to outcome.evidence
             is StepOutcome.Failed -> "FAILED" to outcome.reason
             is StepOutcome.Blocked -> "BLOCKED" to outcome.reason
+            // Decline / gate abort — abortPlan already ran inside the
+            // step; there is no reason string to carry.
+            is StepOutcome.Aborted -> "ABORTED" to "declined"
         }
         runTrajectory.add(
             PlanTrajectoryEntry(
@@ -1008,6 +1011,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             is StepOutcome.Done -> "${step.kind} ho gaya — ${detail.take(200)}"
             is StepOutcome.Failed -> "${step.kind} fail hua — ${detail.take(200)}"
             is StepOutcome.Blocked -> "${step.kind} ruka — ${detail.take(200)}"
+            is StepOutcome.Aborted -> "${step.kind} ruka — user ne mana kiya"
         }
         JarvisEventLog.log(
             engine.planCurrentTurnId().ifBlank { "resume" },
