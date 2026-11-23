@@ -24,7 +24,7 @@ package com.jarvis.autonomous.agent
 object TalkerDispatcher {
 
     enum class TalkerDecision {
-        /** Pure chat — Talker answers (local Gemma first, cloud fallback). */
+        /** Pure chat — Talker answers via the cloud loop. */
         TALK,
         /** Multi-step work via the agent-mode plan executor. */
         EXECUTE_PLAN,

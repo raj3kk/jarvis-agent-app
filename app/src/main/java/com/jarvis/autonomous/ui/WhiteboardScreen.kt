@@ -64,8 +64,8 @@ import java.util.Locale
 // terracotta primary 0xFFB85C38, text 0xFF3B2F2A. No default grey screens.
 //
 // HONEST LIMIT (also in WhiteboardStore and the integration notes):
-// On-device Gemma cannot see images and there is no vision model in the
-// app. "Jarvis sees the drawing/image" means the engine receives the
+// Jarvis has no on-device vision model (Gemma was removed in
+// 1.20.0). "Jarvis sees the drawing/image" means the engine receives the
 // text context from WhiteboardStore.describeForEngine() — stroke count
 // and bounds, image attachment, and YOUR description below — plus cloud
 // vision only if you have your own Gemini key. It does NOT literally

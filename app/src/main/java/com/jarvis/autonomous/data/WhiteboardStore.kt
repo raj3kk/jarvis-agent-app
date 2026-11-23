@@ -19,9 +19,10 @@ import org.json.JSONObject
 // Jarvis-posted messages, and the user's own description of the board.
 //
 // HONEST LIMIT (see also INTEGRATION_NOTES_Whiteboard.md):
-// On-device Gemma cannot see images and there is NO vision model in the
-// app, so "Jarvis sees the drawing/image" NEVER means pixel understanding.
-// The engine only ever receives describeForEngine() as TEXT context:
+// Jarvis has no on-device vision model (Gemma was removed in
+// 1.20.0), so "Jarvis sees the drawing/image" NEVER means pixel
+// understanding on the phone. The engine only ever receives
+// describeForEngine() as TEXT context:
 // stroke count/bounds, whether an image is attached (file path), and the
 // user's spoken/written description (userCaption) when given. Without a
 // user description, or cloud vision via the user's own Gemini key, a

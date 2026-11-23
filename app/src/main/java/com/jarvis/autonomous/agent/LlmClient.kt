@@ -1,6 +1,5 @@
 package com.jarvis.autonomous.agent
 
-import android.content.Context
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -62,7 +61,7 @@ data class AgentDecision(
  *  second merged object. Never converted into a partial action. */
 class DecisionParseException(message: String) : IllegalArgumentException(message)
 
-class LlmClient(private val context: Context, private val prefs: JarvisPreferences) {
+class LlmClient(private val prefs: JarvisPreferences) {
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
@@ -85,60 +84,12 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         // budget, never a step count. Null = prefs defaults.
         budgetLine: String? = null
     ): AgentDecision = withContext(Dispatchers.IO) {
-        // LOCAL fast path: casual chat answered by the on-device model
-        // with NO network call at all. This is the delay fix for chat:
-        // cloud calls wait on network + a big model; local answers are
-        // generated on the phone itself after the one-time load.
-        if (prefs.provider == AiProvider.LOCAL) {
-            if (!LocalLlmManager.isDownloaded(context)) {
-                // A-C6: a missing-model error is NOT a completed turn.
-                return@withContext AgentDecision(
-                    reply = "Bhai, local model abhi download nahi hua — AI Brain me 'Download Free Local Model' dabao (ek baar, ~304 MB), phir main bina internet ke baat karunga. Tab tak Gemini/Groq chuno.",
-                    thought = "Local model not downloaded",
-                    action = "NONE",
-                    isCompleted = false,
-                    decisionKind = "ERROR"
-                )
-            }
-            // Builder bypass (audit S7): the local chat path returns
-            // action=NONE for EVERYTHING, so a voice website build
-            // ("ek website banao") used to get a friendly chat reply
-            // and NO project at all — the user saw nothing built.
-            // The small local model has no structured-action path, so
-            // do not fake a build: say so plainly and point at the
-            // working paths (cloud AI, or manual Create in Projects).
-            if (isCodeBuilderRequest(userGoal)) {
-                return@withContext AgentDecision(
-                    reply = "Website banana local model se nahi hoga — iske liye AI Brain me Gemini ya Groq chuno, phir dobara bolo; ya Projects tab me Create Website Project dabao aur file khud edit karo.",
-                    thought = "Local provider cannot emit project actions",
-                    action = "NONE",
-                    isCompleted = false,
-                    decisionKind = "ERROR"
-                )
-            }
-            return@withContext try {
-                val history = recentChat.takeLast(6).mapNotNull { line ->
-                    val idx = line.indexOf(": ")
-                    if (idx > 0) line.substring(0, idx) to line.substring(idx + 2) else null
-                }
-                val reply = LocalLlmManager.chat(
-                    context = context,
-                    systemPrompt = prefs.personaPrompt,
-                    userText = userGoal,
-                    recentChat = history
-                )
-                AgentDecision(reply = reply, thought = "Local Gemma chat", action = "NONE", isCompleted = false)
-            } catch (e: Exception) {
-                AgentDecision(
-                    reply = "Local model se jawab nahi aaya (${(e.message ?: "").take(120)}). AI Brain me dobara Gemini chuno ya model reload karo.",
-                    thought = "Local LLM error: ${e.message}",
-                    action = "NONE",
-                    isCompleted = false,
-                    decisionKind = "ERROR"
-                )
-            }
-        }
-
+        // 1.20.0: the on-device LOCAL (Gemma) fast path that lived
+        // here is deleted — all chat goes through the cloud LLM
+        // below (Gemini 3.5-flash-lite primary, 3.1-flash-lite
+        // fallback, BYOK). No offline-chat fallback remains: with
+        // no network the cloud call fails honestly and the error
+        // path below reports it, never a crash.
         val apiKey = prefs.apiKey
         if (apiKey.isBlank()) {
             // 1.4.2: a missing key is a diagnosable state, not just
@@ -359,28 +310,6 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         }
     }
 
-    /** True when the user is asking to build or edit a website/page
-     *  (English + Hinglish triggers). Used only by the LOCAL-provider
-     *  guard above — cloud prompts carry the full builder rules. */
-    private fun isCodeBuilderRequest(text: String): Boolean {
-        val lower = text.lowercase()
-        if (lower.contains("website") || lower.contains("web site") ||
-            lower.contains("webpage") || lower.contains("web page") ||
-            lower.contains("portfolio") || lower.contains("landing page")
-        ) return true
-        if (lower.contains("rang badal") || lower.contains("color badal") ||
-            lower.contains("page jodo") || lower.contains("section add") ||
-            lower.contains("button ka") || lower.contains("naya page")
-        ) return true
-        val buildVerb = lower.contains("banao") || lower.contains("bana do") ||
-            lower.contains("banado") || lower.contains("banaye") ||
-            lower.contains("create") || lower.contains("build")
-        val buildObject = lower.contains("site") || lower.contains("page") ||
-            lower.contains("app") || lower.contains("calculator") ||
-            lower.contains("todo")
-        return buildVerb && buildObject
-    }
-
     /**
      * 1.4.13 (F-L2): non-retryable LLM errors. Both API callers
      * throw IllegalStateException("HTTP <code>: ..."), so a
@@ -570,17 +499,15 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
      * (SelfExtensionResearcher) supplies the fixed English research
      * prompt and parses the reply STRICTLY (malformed → research
      * failure, never best-effort prose parsing). No new LLM client,
-     * no new route, no new key. LOCAL provider cannot research (no
-     * cloud key path) — throws, and the loop treats it as no-leads.
+     * no new route, no new key. Research is cloud-only (it needs a
+     * BYOK key); with no key the blank-key check below throws, and
+     * the loop treats it as no-leads.
      *
      * Returns the model's RAW reply text (first successful model in
      * the chain). The API key is never included in any return value
      * or diagnostic (same rule as testApiKey).
      */
     suspend fun researchCandidates(prompt: String): String = withContext(Dispatchers.IO) {
-        if (prefs.provider == AiProvider.LOCAL) {
-            throw IllegalStateException("LOCAL provider: research needs Gemini/Groq/OpenRouter BYOK")
-        }
         val apiKey = prefs.apiKey
         if (apiKey.isBlank()) throw IllegalStateException("API key missing in preferences")
         val systemPrompt = "You are a research assistant. Reply with JSON only, exactly in the shape the user asks for. No prose, no markdown fences."
@@ -1060,9 +987,9 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
     // planNext / buildPlanPrompt / parsePlanJson are NEW functions
     // only; decideNextStep, buildSystemPrompt, answerWithLiveSearch
     // and callGeminiApi are untouched. The planner runs on the
-    // GEMINI chain only (same key, same fallback chain) — NEVER
-    // LOCAL Gemma (the on-device model has no structured-plan path,
-    // same reason as the builder guard above). Other providers get
+    // GEMINI chain only (same key, same fallback chain) — the
+    // on-device model is gone in 1.20.0, so there is no local
+    // path to exclude any more. Other providers get
     // a plain failure asking for Gemini; the planner does not
     // branch on provider in 1.4.21. Strict parsing mirrors
     // parseDecisionJson (A-M2): string-aware brace scan, trailing

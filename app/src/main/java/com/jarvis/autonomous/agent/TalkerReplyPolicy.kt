@@ -26,13 +26,10 @@ object TalkerReplyPolicy {
     /** Status answers use the same budget as acks (bus state only). */
     const val TALKER_STATUS_TARGET_MS = 300L
 
-    /** Local-Gemma first reply for a TALK turn: typical budget after
-     * the model is warm. The hard bound is [TALKER_LOCAL_REPLY_TIMEOUT_MS]. */
-    const val TALKER_REPLY_TARGET_MS = 1_500L
-
-    /** Hard bound on the local-Gemma attempt: on expiry the Talker falls
-     * through to today's cloud loop instead of stalling (DESIGN.md §6). */
-    const val TALKER_LOCAL_REPLY_TIMEOUT_MS = 5_000L
+    // 1.20.0: TALKER_REPLY_TARGET_MS + TALKER_LOCAL_REPLY_TIMEOUT_MS
+    // (the on-device Gemma first-reply budget + hard bound) are
+    // deleted with the model — a TALK turn goes straight to the
+    // cloud loop now, with no local attempt to bound.
 
     /**
      * Instant ack for a dispatched EXECUTE command. Templated — the
@@ -189,8 +186,8 @@ object TalkerReplyPolicy {
 
     /**
      * Line spoken when a chat turn cannot go to the cloud loop because
-     * an Executor command is running — and the local-Gemma attempt
-     * already failed. The Talker never cancels running work for chat.
+     * an Executor command is running. The Talker never cancels running
+     * work for chat.
      */
     fun busyLine(runningGoal: String): String {
         val goal = runningGoal.trim().take(80).ifBlank { "ek kaam" }

@@ -47,18 +47,14 @@ enum class AiProvider(
         "https://openrouter.ai/api/v1/chat/completions",
         listOf("google/gemini-3.8-flash", "google/gemini-3-flash-preview")
     ),
-    // FREE on-device model: Gemma 3 270M Q8 via LiteRT-LM.
-    // No card, no server — model downloads once (~304 MB) from
-    // Hugging Face into the app's own files. GATED: needs the user's
-    // own HF token (account must have accepted the Gemma licence).
-    // CHAT ONLY: a 270M model cannot reliably emit the strict JSON
-    // agent actions, so phone actions stay on a cloud Lite provider.
-    LOCAL(
-        "Local Gemma3-270M (Free, Offline Chat)",
-        "gemma3-270m-it-q8",
-        "",
-        emptyList()
-    )
+    // 1.20.0: the on-device LOCAL provider (Gemma 3 270M via
+    // LiteRT-LM) was REMOVED by user order 2026-11-23 — the whole
+    // entry is deleted, not deprecated. An install that saved
+    // ai_provider=LOCAL falls back to GEMINI via the getter's
+    // getOrDefault below, and a saved model_name of
+    // gemma3-270m-it-q8 is migrated to the provider default in
+    // modelName (see the guard there). No offline-chat fallback
+    // remains: no network = a clear message, never a crash.
 }
 
 data class VoiceRoutine(
@@ -78,11 +74,10 @@ class JarvisPreferences(context: Context) {
         }
         set(value) = prefs.edit().putString("ai_provider", value.name).apply()
 
-    // Hugging Face token for the gated Gemma download only. Stored
-    // on the phone, never in the APK or repo.
-    var hfToken: String
-        get() = prefs.getString("hf_token", "") ?: ""
-        set(value) = prefs.edit().putString("hf_token", value.trim()).apply()
+    // 1.20.0: the Hugging Face token pref (hf_token) is deleted
+    // with Gemma — no HF token is stored or used anywhere any more.
+    // Old installs keep a stale "hf_token" value in prefs; nothing
+    // reads it any more (harmless, never migrated).
 
     var apiKey: String
         get() = prefs.getString("api_key", "") ?: ""
@@ -197,6 +192,11 @@ class JarvisPreferences(context: Context) {
             val migrated = DEAD_MODEL_MAP[saved] ?: saved
             val resolved = when {
                 migrated.isBlank() -> provider.defaultModel
+                // 1.20.0: the removed on-device model's ID. A phone
+                // that had Local selected saved this as model_name;
+                // without this guard Gemini would be called with a
+                // model that does not exist on its API (404).
+                migrated == "gemma3-270m-it-q8" -> provider.defaultModel
                 // Cross-provider stale ID (e.g. a Gemini ID saved while on
                 // Groq): that provider will 404 it, so reset to its default.
                 provider == AiProvider.GEMINI &&

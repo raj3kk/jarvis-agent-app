@@ -3,8 +3,10 @@ package com.jarvis.autonomous.data
 /**
  * M-I-2 (1.14.0) — pure prompt assembly for the I1 → I2 doc-context
  * wiring: recalled on-device document snippets reach the planner
- * (EXECUTE_PLAN) and the Talker's on-device local reply (TALK) as
- * labelled prompt context.
+ * (EXECUTE_PLAN) and the Talker's reply (TALK) as labelled prompt
+ * context. (1.20.0: the Talker reply is the cloud loop now — Gemma
+ * is gone — so the snippets ride the cloud prompt, not an
+ * on-device model. See the Privacy bullet below.)
  *
  * Pure Kotlin, no Android — unit-tested by DocContextPromptTest.
  *
@@ -19,11 +21,14 @@ package com.jarvis.autonomous.data
  *   exact pre-I2 string, talkerSystemPrompt returns personaPrompt
  *   untouched (pinned by tests — a no-recall turn must be
  *   byte-identical to before).
- * - Privacy: doc text stays on the phone for the Talker local reply
- *   (on-device Gemma). For EXECUTE_PLAN the snippets ride the planner
- *   prompt to Gemini — the same cloud the plan already uses; the user
- *   explicitly saved these documents for Jarvis to use, and only
- *   recalled snippets (≤3 × ≤400 chars) are sent, never a whole doc.
+ * - Privacy (1.20.0: the on-device Gemma reply is gone, so this
+ *   changed): recalled snippets now ride the cloud prompt to Gemini
+ *   for TALK turns as well as EXECUTE_PLAN — the same cloud the
+ *   chat already uses; the user explicitly saved these documents
+ *   for Jarvis to use, and only recalled snippets (≤3 × ≤400 chars)
+ *   are sent, never a whole doc. The offline direct-answer path
+ *   (tryDocumentRecall) still answers without any LLM call and
+ *   keeps doc text on the phone.
  */
 object DocContextPrompt {
 
@@ -55,11 +60,15 @@ object DocContextPrompt {
     }
 
     /**
-     * System prompt for the Talker's on-device local reply: the persona
-     * prompt plus recalled doc context when there is any. The doc lines
-     * go in the system instruction (not the user text) so the user's
-     * own words stay untouched and the model treats the snippets as
-     * background, not as something the user said.
+     * System prompt for the Talker's reply: the persona prompt plus
+     * recalled doc context when there is any. The doc lines go in
+     * the system instruction (not the user text) so the user's own
+     * words stay untouched and the model treats the snippets as
+     * background, not as something the user said. (1.20.0: no
+     * production caller any more — the TALK turn goes through the
+     * cloud loop, which carries doc context via buildMemoryContext.
+     * Kept as a tested pure helper; delete in a later cleanup if
+     * it stays uncalled.)
      */
     fun talkerSystemPrompt(personaPrompt: String, docContext: String = ""): String =
         if (docContext.isBlank()) personaPrompt

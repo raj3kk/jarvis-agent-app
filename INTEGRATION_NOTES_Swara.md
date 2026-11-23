@@ -163,13 +163,15 @@ bundled assets are all deleted in the same change.
   quality-based hi-IN pick, network voice option, rate ~0.9/pitch 1.0,
   text cleanup) are NOT part of 1.4.12: `SystemTtsFallbackSpeaker.kt`
   is reused unchanged except header/comments.
-- **Gemma chat download UNCHANGED:** `LocalLlmManager.kt` (Gemma 3 270M
-  Q8, 304,005,120 bytes, `litert-community/gemma-3-270m-it`, token via
-  `BuildConfig.HF_TOKEN`) shares no code with the old voice except
-  `app/build.gradle.kts` itself; the Gemma `buildConfigField` was not
-  touched. One voice for ALL text (incl. English replies —
-  Indian-accented English is acceptable, spec-ordered); prosody defaults
-  rate +10%, pitch +0%, volume +0% (1.4.18: rate raised for clear-fast pacing; pitch unchanged); no speed slider.
+- **Gemma chat download REMOVED (1.20.0):** `LocalLlmManager.kt`
+  (Gemma 3 270M Q8, 304,005,120 bytes,
+  `litert-community/gemma-3-270m-it`) is deleted with the on-device
+  model — it shared no code with the voice except
+  `app/build.gradle.kts` itself. One voice for ALL text (incl.
+  English replies — Indian-accented English is acceptable,
+  spec-ordered); prosody defaults rate +10%, pitch +0%, volume +0%
+  (1.4.18: rate raised for clear-fast pacing; pitch unchanged); no
+  speed slider.
 
 ## Phone-test proof note (for the parent / tester — NOT done by Phase 1)
 
