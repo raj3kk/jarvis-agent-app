@@ -12,6 +12,7 @@ import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.jarvis.autonomous.data.JarvisStateRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -77,6 +78,34 @@ import kotlin.coroutines.resume
  * `run()` is serialised by a [Mutex] (one job per engine instance);
  * steps are validated BEFORE any WebView is created (fail fast).
  *
+ * Result contract — `run()` returns
+ * `{"ok":true,"steps":N,"finalUrl":"...","extract":{...},"frames":[...]}`.
+ * (Before the step-persistence fix it returned the bare `extracted`
+ * object, so the executor's finalUrl/extract reads were always empty.)
+ *
+ * Background (requirement (c), refined 2026-11-23 ~13:00 IST): the
+ * engine runs inside the foreground service, so a job keeps running
+ * while the user watches the app AND after the Activity dies — the
+ * plan is persisted (AgentPlanStore) and the WorkManager backstop
+ * (JarvisBackstopWorker, 15-min) re-starts the service when a plan is
+ * unfinished. Per-step persistence ([JarvisBrowserJobStore]) means a
+ * kill mid-job resumes from the next unfinished step (replaying from
+ * the last completed goto, since a fresh WebView has no page) instead
+ * of restarting the job — and the plan evidence is on disk, so the
+ * result is visible when the user reopens the app. HONEST LIMIT: a
+ * WebView cannot be driven with the app fully closed (Android needs
+ * a foreground Activity; Vivo kills background aggressively) — the
+ * backstop is the free alternative (work resumes in steps), not a
+ * guarantee of headless driving. Do NOT claim background driving
+ * works until phone test B-T13 proves it.
+ *
+ * Network (requirement (a)): the WebView uses the PHONE'S OWN
+ * network directly — no proxy, no hub routing for browsing. Page
+ * traffic never touches the hub (no proxy is configured anywhere in
+ * the app; the browser package makes zero hub calls). The hub is
+ * contacted only for LLM/plans, licence and cron APIs — never for
+ * page content.
+ *
  * DON'Ts (kept): no Whop/IG-specific code (service names, login URLs,
  * cookie-name lists, campaign templates, `__usProxy` relay, coins);
  * no server-side session-cookie store; no captcha auto-solve.
@@ -108,8 +137,15 @@ class JarvisJobEngine(private val ctx: Context) {
          * Validates a steps array BEFORE any WebView is created — a bad
          * job fails fast with a named reason instead of dying mid-run.
          * Pure (no Android calls) — covered by unit tests.
+         *
+         * @param requireGotoFirst when true (headless jobs — the only
+         *   R0 caller), step 0 must be `goto`: a fresh WebView has no
+         *   page, and the resume rule replays from the last completed
+         *   goto, so a job with no goto has nothing to restore from.
+         *   A future foreground-host caller (R3, page already open)
+         *   passes false.
          */
-        fun validateSteps(steps: JSONArray) {
+        fun validateSteps(steps: JSONArray, requireGotoFirst: Boolean = true) {
             for (i in 0 until steps.length()) {
                 val s = steps.optJSONObject(i)
                     ?: throw JobFailed("step $i: not a JSON object")
@@ -137,6 +173,11 @@ class JarvisJobEngine(private val ctx: Context) {
                     "screenshot", "upload" -> Unit
                     else -> throw JobFailed("step $i: unknown action: $action")
                 }
+            }
+            if (requireGotoFirst && steps.length() > 0 &&
+                steps.optJSONObject(0)?.optString("action") != "goto"
+            ) {
+                throw JobFailed("step 0 must be goto — a headless job starts by loading a page")
             }
         }
 
@@ -375,7 +416,13 @@ class JarvisJobEngine(private val ctx: Context) {
         }
 
     /**
-     * Runs all steps; returns extracted values. Must be called off the main thread.
+     * Runs all steps; returns `{"ok":true,"steps":N,"finalUrl":"...",
+     * "extract":{...},"frames":[...]}`. Must be called off the main thread.
+     * Per-step progress is persisted ([JarvisBrowserJobStore]) — a kill
+     * mid-job resumes from the next unfinished step (replaying from the
+     * last completed goto) instead of restarting. A job id is required
+     * for persistence (the executor passes the plan step id); without
+     * one the job still runs, but cannot resume.
      * @param job `{"id": "...", "steps": [...], "login_url": "...", "login_cookies": ["..."]}`
      * @param externalWebView when a foreground host supplies its DWebView (file-chooser
      *   steps only) — the engine uses it and does NOT destroy it afterwards.
@@ -395,9 +442,39 @@ class JarvisJobEngine(private val ctx: Context) {
             // Validate BEFORE creating any WebView — a bad job fails fast.
             validateSteps(steps)
             val ownsWebView = externalWebView == null
-            val jobDesc = "job ${job.optString("id", "").take(8)}"
+            val jobId = job.optString("id", "").trim()
+            val jobDesc = "job ${jobId.take(8)}"
             setCurrentJob("Chal raha: $jobDesc (${steps.length()} steps)")
             Log.i(TAG, "job start: $jobDesc")
+
+            // Step persistence (requirement (c)): a kill mid-job must
+            // NOT restart from step 0. Reload the saved progress (if
+            // the steps array changed since, the save is stale — run
+            // fresh instead of resuming against a different job).
+            val framePaths = mutableListOf<String>()
+            var lastFinalUrl = ""
+            val completed = mutableSetOf<Int>()
+            var resumeFrom = 0
+            if (jobId.isNotBlank()) {
+                val progress = JarvisBrowserJobStore.load(ctx, jobId)
+                if (progress != null && progress.totalSteps == steps.length()) {
+                    progress.extracted.keys().forEach { k -> extracted.put(k, progress.extracted.get(k)) }
+                    lastFinalUrl = progress.finalUrl
+                    completed.addAll(progress.completed)
+                    resumeFrom = JarvisBrowserJobStore.resumeStartIndex(steps, completed)
+                    if (resumeFrom < steps.length()) {
+                        Log.i(TAG, "job resume: $jobDesc from step $resumeFrom (${completed.size} done)")
+                        JarvisStateRepository.addDiagnostic(
+                            "browser", "BROWSER_JOB_RESUME",
+                            "Browser job dobara shuru — step $resumeFrom se continue ho raha hai " +
+                                "(kill se pehle ${completed.size} steps ho gaye the)."
+                        )
+                    }
+                } else if (progress != null) {
+                    Log.w(TAG, "job progress stale (steps changed) — fresh run: $jobDesc")
+                    JarvisBrowserJobStore.clear(ctx, jobId)
+                }
+            }
 
             // Session pre-check (cookie login truth): a job that names a
             // login_url must have the session BEFORE any step runs —
@@ -441,10 +518,20 @@ class JarvisJobEngine(private val ctx: Context) {
                 for (i in 0 until steps.length()) {
                     val s = steps.getJSONObject(i)
                     val action = s.optString("action")
+                    // Resume: steps before the replay point are already
+                    // done (their extracts are restored above) — skip
+                    // them, do not re-click/re-type. Steps from the last
+                    // completed goto onward REPLAY (fresh WebView = no
+                    // page state), so they are executed, not skipped.
+                    if (i < resumeFrom) {
+                        onStep?.invoke(i, "$action:skipped")
+                        continue
+                    }
                     onStep?.invoke(i, action)
                     when (action) {
                         "goto" -> {
                             val url = resolveGotoUrl(s.getString("url"), extracted)
+                            lastFinalUrl = url
                             if (ownsWebView) {
                                 val latch = CountDownLatch(1)
                                 @Volatile var loadError: String? = null
@@ -588,6 +675,7 @@ class JarvisJobEngine(private val ctx: Context) {
                             val key = s.optString("key", "frame_$i.png")
                             val path = captureScreenshot(wv, key)
                             extracted.put(key, path)
+                            framePaths.add(path)
                             onFrame?.invoke(path)
                             if (s.optBoolean("upload", false)) {
                                 // No hub /api/frames endpoint in 1.15.0 (R1) —
@@ -624,13 +712,51 @@ class JarvisJobEngine(private val ctx: Context) {
                     if (JarvisBrowserSetup.consumeRenderGone())
                         throw JobFailed("renderer_gone: browser renderer crash ho gaya (step $i: $action)")
                     Log.i(TAG, "step $i ok: $action")
+                    // Per-step persistence: the step is DONE only once
+                    // it is on disk — a kill one second later resumes
+                    // after it, never before it.
+                    completed.add(i)
+                    if (jobId.isNotBlank()) {
+                        JarvisBrowserJobStore.save(
+                            ctx, jobId, steps.length(), completed, extracted, lastFinalUrl
+                        )
+                    }
+                }
+                // Final URL, read on the main thread before the WebView
+                // is destroyed (wv.url is a main-thread getter). Only
+                // when a step actually ran — when everything was
+                // already complete (all steps skipped), the WebView is
+                // still blank and reading it would clobber the saved
+                // URL with about:blank. Falls back to the last goto
+                // target on any failure.
+                if (resumeFrom < steps.length()) {
+                    lastFinalUrl = readCurrentUrl(wv) ?: lastFinalUrl
                 }
             } finally {
                 if (ownsWebView) mainHandler.post { wv.destroy() }
                 setCurrentJob(null)
                 Log.i(TAG, "job done: $jobDesc")
             }
-            extracted
+            // Success: the progress file is cleared (a re-run starts
+            // fresh) and the real result contract is returned — the
+            // executor reads ok/steps/finalUrl/extract/frames from it.
+            // (Before this fix run() returned the bare `extracted`
+            // object, so the executor's finalUrl/extract reads were
+            // always empty — a contract bug, not a crash.)
+            if (jobId.isNotBlank()) JarvisBrowserJobStore.clear(ctx, jobId)
+            JSONObject().apply {
+                put("ok", true)
+                put("steps", steps.length())
+                put("finalUrl", lastFinalUrl)
+                put("extract", extracted)
+                put("frames", JSONArray(framePaths))
+            }
         }
     }
+
+    /** Current URL from the main thread (WebView getters are main-thread only). Null on any failure. */
+    private suspend fun readCurrentUrl(wv: WebView): String? =
+        suspendCancellableCoroutine { cont ->
+            mainHandler.post { cont.resume(runCatching { wv.url }.getOrNull()) }
+        }
 }

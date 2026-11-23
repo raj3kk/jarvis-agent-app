@@ -120,6 +120,79 @@ class JarvisJobEngineTest {
         assertTrue(err.message!!.contains("unresolved"))
     }
 
+    @Test
+    fun `first step must be goto for headless jobs`() {
+        val steps = JSONArray("""[{"action":"click_text","text":"Next"}]""")
+        val err = assertThrows(JarvisJobEngine.JobFailed::class.java) {
+            JarvisJobEngine.validateSteps(steps)
+        }
+        assertTrue(err.message!!.contains("step 0 must be goto"))
+    }
+
+    @Test
+    fun `goto-first rule can be relaxed for foreground hosts`() {
+        val steps = JSONArray("""[{"action":"click_text","text":"Next"}]""")
+        // Must not throw — the R3 foreground host's page is already open.
+        JarvisJobEngine.validateSteps(steps, requireGotoFirst = false)
+    }
+
+    // ---- resumeStartIndex (JarvisBrowserJobStore, pure) ----
+
+    private fun jobSteps(): JSONArray = JSONArray(
+        """[
+        {"action":"goto","url":"https://example.com"},
+        {"action":"click_text","text":"Next"},
+        {"action":"extract","key":"title","code":"document.title"},
+        {"action":"goto","url":"https://example.com/page2"},
+        {"action":"extract","key":"heading","code":"document.title"}
+        ]"""
+    )
+
+    @Test
+    fun `resume fresh job starts at step 0`() {
+        assertEquals(0, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), emptySet()))
+    }
+
+    @Test
+    fun `resume after first goto replays the goto`() {
+        assertEquals(0, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), setOf(0)))
+    }
+
+    @Test
+    fun `resume after goto plus click replays from the goto`() {
+        assertEquals(0, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), setOf(0, 1)))
+    }
+
+    @Test
+    fun `resume replays from the last completed goto`() {
+        // Steps 0-3 done (goto, click, extract, goto) — the page is
+        // page2, so resume re-runs step 3 (the goto), not step 0.
+        assertEquals(3, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), setOf(0, 1, 2, 3)))
+    }
+
+    @Test
+    fun `resume with no completed goto returns first todo step`() {
+        // No goto in the completed prefix (cannot happen for a headless
+        // job — step 0 must be goto — but the pure rule degrades safely).
+        val steps = JSONArray(
+            """[{"action":"click_text","text":"Next"},{"action":"extract","key":"t","code":"document.title"}]"""
+        )
+        assertEquals(1, JarvisBrowserJobStore.resumeStartIndex(steps, setOf(0)))
+    }
+
+    @Test
+    fun `resume with all steps complete returns steps length`() {
+        assertEquals(5, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), setOf(0, 1, 2, 3, 4)))
+    }
+
+    @Test
+    fun `resume with a gap stops at the first missing step`() {
+        // Completed {0, 2} cannot happen in a real run (steps run in
+        // order) — the rule still degrades safely: first todo is 1,
+        // last completed goto before it is 0.
+        assertEquals(0, JarvisBrowserJobStore.resumeStartIndex(jobSteps(), setOf(0, 2)))
+    }
+
     // ---- sanitizeFrameKey ----
 
     @Test
