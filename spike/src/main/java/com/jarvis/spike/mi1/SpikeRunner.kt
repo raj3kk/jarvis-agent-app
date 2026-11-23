@@ -7,7 +7,6 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.NativeLibraryLoader
 import com.google.ai.edge.litertlm.SamplerConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,11 +35,14 @@ import java.util.zip.ZipFile
  *     against the hash measured from the 1.19.0 APK's bundled .so
  *     (byte-identical — proven on the VM before this spike was
  *     written).
- *  3. chmod + System.load(absolute path), then call the AAR's own
- *     NativeLibraryLoader.load() — it must succeed via the
+ *  3. chmod + System.load(absolute path), then probe the AAR's own
+ *     loader (NativeLibraryLoader — internal in Kotlin, so via
+ *     reflection, best-effort): it must succeed via the
  *     already-loaded short-circuit (System.loadLibrary on an
- *     already-loaded soname is a no-op success). If it throws,
- *     the on-demand path does NOT work on this phone.
+ *     already-loaded soname is a no-op success). If it throws, the
+ *     on-demand path does NOT work on this phone. If the probe
+ *     itself is unavailable, step 5 (Engine init) is the
+ *     definitive proof — it calls the same loader internally.
  *  4. Gemma model (304 MB, gated HF — the user's OWN token, typed
  *     in the spike UI, never stored, never logged; same policy as
  *     Jarvis B1). Already-downloaded model is reused.
@@ -105,13 +107,15 @@ object SpikeRunner {
      * the worker thread — the caller must post to the UI thread.
      * Returns the verdict line ("SPIKE PASS ..." or "SPIKE FAIL ...").
      * With [withTurn] = false only steps 0–4 run (model download) —
-     * used by the "Download model only" button.
+     * used by the "Download model only" button. [log] is the LAST
+     * parameter on purpose, so callers can pass it as a trailing
+     * lambda.
      */
     fun run(
         context: Context,
         hfToken: String?,
-        log: (String) -> Unit,
-        withTurn: Boolean = true
+        withTurn: Boolean = true,
+        log: (String) -> Unit
     ): String {
         val t0 = System.currentTimeMillis()
         return try {
@@ -151,7 +155,7 @@ object SpikeRunner {
 
     /** Steps 0–4 only (model download, no turn). */
     fun downloadModel(context: Context, hfToken: String?, log: (String) -> Unit): String =
-        run(context, hfToken, log, withTurn = false)
+        run(context, hfToken, withTurn = false, log = log)
 
     private fun step1DownloadAar(context: Context, log: (String) -> Unit) {
         val t0 = System.currentTimeMillis()
@@ -231,15 +235,29 @@ object SpikeRunner {
             throw SpikeFailure("step 3 (System.load)", t)
         }
         log("step 3a OK — System.load(${file.absolutePath}) in ${System.currentTimeMillis() - t0}ms")
-        // The AAR's own loader must now succeed via the
-        // already-loaded short-circuit. If THIS throws, the
-        // on-demand path does not work on this phone.
+        // The AAR's own loader (NativeLibraryLoader) is internal in
+        // Kotlin — it cannot be called directly, so probe it via
+        // reflection (best-effort): the class is public bytecode
+        // with a public load() method, so reflection works. If the
+        // probe itself is unavailable (class/method renamed in a
+        // future AAR), step 5 is the definitive proof — Engine init
+        // calls the same loader internally. If load() itself throws
+        // (e.g. UnsatisfiedLinkError), the already-loaded
+        // short-circuit does NOT work on this phone → FAIL.
         try {
-            NativeLibraryLoader.load()
+            val loaderClass =
+                Class.forName("com.google.ai.edge.litertlm.NativeLibraryLoader")
+            val instance = loaderClass.getField("INSTANCE").get(null)
+            loaderClass.getMethod("load").invoke(instance)
+            log("step 3b OK — NativeLibraryLoader.load() (via reflection) succeeded (already-loaded short-circuit works)")
+        } catch (e: ClassNotFoundException) {
+            log("step 3b SKIP — NativeLibraryLoader class not found; step 5 is the proof")
+        } catch (e: NoSuchMethodException) {
+            log("step 3b SKIP — load() not found; step 5 is the proof")
         } catch (t: Throwable) {
             throw SpikeFailure("step 3 (NativeLibraryLoader.load)", t)
         }
-        log("step 3b OK — NativeLibraryLoader.load() succeeded (already-loaded short-circuit works)")
+        log("step 3 OK")
     }
 
     private fun step4Model(context: Context, hfToken: String?, log: (String) -> Unit) {
