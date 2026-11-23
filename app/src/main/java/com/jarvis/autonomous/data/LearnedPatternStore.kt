@@ -685,7 +685,7 @@ class FilePatternStorage(context: Context) : PatternStorage {
  * R2.6 (1.17.0-PRO) — Store-backed [PatternStorage]: learned patterns
  * + instructions live in the Jarvis Store (sections
  * SEC_LEARNED_PATTERNS / SEC_INSTRUCTIONS) once migrated, instead of
- * device-memory/patterns/*.json + instructions/*.json. Same seam, so
+ * device-memory/patterns/<id>.json + instructions/<id>.json. Same seam, so
  * LearnedPatternStore (and its unit test) work unchanged. The file
  * implementation stays as the legacy reader for the one-time
  * migration and for pre-migration launches.
