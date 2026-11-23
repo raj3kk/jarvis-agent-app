@@ -162,14 +162,18 @@ dependencies {
 
     // 1.15.0 (R0 Whop browser): DSBridge (MIT, wendux/DSBridge-Android
     // via JitPack) — the JobEngine's 1-method JS bridge (DWebView +
-    // addJavascriptObject). Pinned to the documented 3.0-SNAPSHOT
-    // coordinate from the upstream README. The page-side half
-    // (dsbridge.js v3.1.3, MIT) is vendored in app/src/main/assets/
-    // and injected per page by the engine — no CDN load at runtime.
-    // If CI ever fails to resolve this SNAPSHOT, the fallback is the
-    // commit-pinned JitPack coordinate (master 22b19ffa) or vendoring
-    // the AAR source — never a second bridge implementation.
-    implementation("com.github.wendux:DSBridge-Android:3.0-SNAPSHOT")
+    // addJavascriptObject). Pinned to the master-HEAD commit
+    // 22b19ffaf1 ("fix #85") — NOT the README's 3.0-SNAPSHOT: CI
+    // 45132051346 PROVED the SNAPSHOT unresolvable (JitPack builds API
+    // says master=Error; the 3.0.0 tag has a pom but NO aar). The
+    // commit-pinned coordinate is verified live: JitPack builds API
+    // "22b19ffaf1":"ok", pom 200 (1,397 B) + aar 200 (37,056 B).
+    // The page-side half (dsbridge.js v3.1.3, MIT) is vendored in
+    // app/src/main/assets/ and injected per page by the engine — no
+    // CDN load at runtime. If CI ever fails to resolve this pinned
+    // commit, the fallback is vendoring the AAR source — never a
+    // second bridge implementation.
+    implementation("com.github.wendux:DSBridge-Android:22b19ffaf1")
 
     // 1.15.0 (R0 parity spec §5 #10): WorkManager backstop — the Vivo
     // kills background WebViews/services, so a periodic worker re-arms
