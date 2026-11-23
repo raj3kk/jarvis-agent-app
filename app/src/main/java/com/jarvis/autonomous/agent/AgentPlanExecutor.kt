@@ -1,5 +1,6 @@
 package com.jarvis.autonomous.agent
 
+import com.jarvis.autonomous.browser.JarvisJobEngine
 import com.jarvis.autonomous.data.AgentPlan
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
@@ -840,6 +841,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             "GMAIL_SEND" -> executeGmailSend(step)
             "GMAIL_READ" -> executeGmailRead(step)
             "DRIVE_READ" -> executeDriveRead(step)
+            // 1.15.0 (R0 Whop browser): headless WebView job — the
+            // JobEngine drives a page by steps (goto/click/type/
+            // extract/screenshot). Session/captcha/foreground failures
+            // park as BLOCKED (user help needed), everything else Failed.
+            "BROWSER_JOB" -> executeBrowserJob(step)
             // 1.11.0-PRO (self-extension): the T-NO-HANDLER marker
             // names the trigger for the detector (§2.2) while keeping
             // the v1 "Unknown step kind:" wording intact.
@@ -1679,6 +1685,62 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             ?: return StepOutcome.Failed("HTTP_CHECK me url nahi diya gaya.")
         val marker = parseDetailRest(step.detail, "marker")
         return httpCheck(url, marker)
+    }
+
+    // ---- BROWSER_JOB (1.15.0 R0 Whop browser) ----
+
+    /**
+     * Headless WebView job, driven by the step array in the detail:
+     * `steps=<JSON array>` (each step: {"action":"goto"|"click_text"|
+     * "type"|"extract"|"screenshot"|"wait"|"wait_text"|"assert_text"|
+     * "js"|"upload", ...}). Optional `login_url=<url>` (+
+     * `login_cookies=<a,b>` names) makes the engine fail fast with
+     * session_expired when the user is not logged in — the user then
+     * logs in once in the Browser tab and the plan resumes.
+     *
+     * Outcome mapping (honest): session/captcha/foreground failures
+     * are BLOCKED — the executor cannot fix them alone, the user (or
+     * a foreground host in R3) must. A job that ran but proved nothing
+     * is Failed, never Done. Done evidence carries the final URL and
+     * the first extract, truncated.
+     */
+    private suspend fun executeBrowserJob(step: PlanStep): StepOutcome {
+        val stepsJson = parseDetailRest(step.detail, "steps")
+            ?: return StepOutcome.Failed("BROWSER_JOB me steps nahi diye gaye (steps=<JSON array>).")
+        val steps = runCatching { JSONArray(stepsJson) }.getOrNull()
+            ?: return StepOutcome.Failed("BROWSER_JOB steps JSON parse nahi hua.")
+        val job = JSONObject().apply {
+            put("id", step.id)
+            put("steps", steps)
+            parseDetailValue(step.detail, "login_url")?.let { put("login_url", it) }
+            parseDetailRest(step.detail, "login_cookies")?.let { raw ->
+                val names = raw.split(",").map { it.trim() }.filter { it.isNotBlank() }
+                if (names.isNotEmpty()) put("login_cookies", JSONArray(names))
+            }
+        }
+        return try {
+            val jobEngine = JarvisJobEngine(engine.planContext())
+            val result = jobEngine.run(job)
+            val finalUrl = result.optString("finalUrl", "")
+            val extract = result.optJSONObject("extract")?.toString()?.take(300) ?: ""
+            StepOutcome.Done(
+                "Browser job OK — ${result.optInt("steps", steps.length())} steps" +
+                    if (finalUrl.isNotBlank()) "; final URL: $finalUrl" else "" +
+                    if (extract.isNotBlank()) "; extract: $extract" else ""
+            )
+        } catch (e: JarvisJobEngine.JobFailed) {
+            val msg = e.message ?: "browser job fail hua"
+            val lower = msg.lowercase()
+            if (lower.contains("session_expired") || lower.contains("captcha") ||
+                lower.contains("needs_foreground") || lower.contains("login")
+            ) {
+                StepOutcome.Blocked(msg.take(300))
+            } else {
+                StepOutcome.Failed(msg.take(300))
+            }
+        } catch (e: Exception) {
+            StepOutcome.Failed("Browser job fail: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+        }
     }
 
     private suspend fun httpCheck(url: String, marker: String?): StepOutcome {

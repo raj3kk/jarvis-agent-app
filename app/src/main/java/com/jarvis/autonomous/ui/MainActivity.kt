@@ -186,6 +186,19 @@ class MainActivity : ComponentActivity() {
         Thread {
             runCatching { JarvisStateRepository.loadPersistedDiagnostics() }
         }.start()
+        // 1.15.0 memory-loss fix (F1): restore the saved chat history
+        // ONCE at process start, before any UI turn or persist can run
+        // — the old code restored only inside runAutonomousLoop, so the
+        // first Talker turn after a relaunch overwrote the saved history
+        // on disk before any restore ran. Same background-thread pattern
+        // as diagnostics; the repository's AtomicBoolean makes the
+        // restore exactly-once even if the service restores too.
+        Thread {
+            runCatching {
+                val saved = JarvisPreferences(this).getSavedChatHistory()
+                JarvisStateRepository.restoreChatHistory(saved)
+            }
+        }.start()
         // 1.4.21 Agent Mode: seed the plan card from the persisted
         // plan file so it is correct even before the service resume
         // runs (same background-thread pattern as diagnostics).

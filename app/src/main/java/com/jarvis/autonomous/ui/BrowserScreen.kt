@@ -10,8 +10,10 @@ import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.GeolocationPermissions
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
+import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
@@ -60,7 +62,7 @@ import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
-import com.jarvis.autonomous.browser.gecko.GeckoBrowserScreen
+import com.jarvis.autonomous.browser.JarvisBrowserSetup
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AutoSolveStatus
 import com.jarvis.autonomous.data.CaptchaAssistState
@@ -928,6 +930,12 @@ object JarvisBackgroundBrowser {
             settings.setGeolocationEnabled(false)
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.safeBrowsingEnabled = true
+            // 1.15.0 (R0 Whop browser): desktop mode — desktop Chrome UA
+            // + Client Hints (Sec-CH-UA-Mobile: ?0) so sites serve the
+            // desktop bundle, not the mobile one (Whop LoginActivity
+            // pattern). Applied AFTER the generic settings so the
+            // desktop UA/metadata win.
+            JarvisBrowserSetup.applyDesktopMode(this)
             webViewClient = SharedWebViewClient()
             webChromeClient = SharedWebChromeClient()
             // Downloads are disabled: tapping a download does nothing
@@ -1372,6 +1380,21 @@ object JarvisBackgroundBrowser {
             }
         }
 
+        // 1.15.0 (R0): permission prompts are denied silently — the
+        // shared WebView must never pop a system permission UI while
+        // the user is browsing (camera/mic/geolocation are not part
+        // of browsing; a mid-browse prompt is a failure mode).
+        override fun onPermissionRequest(request: PermissionRequest) {
+            request.deny()
+        }
+
+        override fun onGeolocationPermissionsShowPrompt(
+            origin: String,
+            callback: GeolocationPermissions.Callback
+        ) {
+            callback.invoke(origin, false, false)
+        }
+
         // B-M4: console errors are wired to the foreground error
         // channel (the old client swallowed them entirely, so a page
         // whose JS died left a blank-looking result with no reason).
@@ -1549,28 +1572,19 @@ fun JarvisWebView(
 // ---------------------------------------------------------------------------
 
 /**
- * Browser tab — engine dispatcher (1.13.0).
+ * Browser tab (1.15.0, redesign R0): System WebView ONLY.
  *
- * Gecko is the default engine; WebView stays as the fallback, selectable
- * from the toggle at the top of either screen. The choice persists in
- * JarvisPreferences.browserEngine. Both screens share the same
- * [BrowserHostState], so engine-driven loads (loadUrl / showLoadedPage)
- * work on either engine. MainActivity calls this function unchanged.
+ * Gecko was removed fully in 1.15.0 (redesign R0 — its bridge never
+ * connected, and the APK was 234 MB). There is no engine switch any
+ * more: this function IS the browser tab — [WebViewBrowserScreen] is
+ * called directly, desktop mode on, same shared WebView as before.
+ * The old `browserEngine` preference is left unread in
+ * JarvisPreferences (harmless stale key, documented there).
+ * MainActivity calls this function unchanged.
  */
 @Composable
 fun BrowserScreen(browserHost: BrowserHostState? = null) {
-    val context = LocalContext.current
-    val prefs = remember { JarvisPreferences(context.applicationContext) }
-    var engine by remember { mutableStateOf(prefs.browserEngine) }
-    fun switchEngine(next: String) {
-        prefs.browserEngine = next
-        engine = next
-    }
-    if (engine == "gecko") {
-        GeckoBrowserScreen(browserHost, onSwitchEngine = ::switchEngine)
-    } else {
-        WebViewBrowserScreen(browserHost, onSwitchEngine = ::switchEngine)
-    }
+    WebViewBrowserScreen(browserHost)
 }
 
 /**
@@ -1586,8 +1600,7 @@ fun BrowserScreen(browserHost: BrowserHostState? = null) {
  */
 @Composable
 private fun WebViewBrowserScreen(
-    browserHost: BrowserHostState? = null,
-    onSwitchEngine: (String) -> Unit = {}
+    browserHost: BrowserHostState? = null
 ) {
     val context = LocalContext.current
 
@@ -1666,19 +1679,6 @@ private fun WebViewBrowserScreen(
             fontSize = 12.sp,
             color = Color(0xFF8A7A70)
         )
-
-        // Engine toggle (1.13.0): Gecko primary, WebView fallback.
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            OutlinedButton(onClick = { onSwitchEngine("gecko") }) {
-                Text("Gecko", fontSize = 12.sp)
-            }
-            OutlinedButton(enabled = false, onClick = {}) {
-                Text("WebView ✓", fontSize = 12.sp)
-            }
-        }
 
         // URL bar: editable, bare domains get https:// by default.
         Row(

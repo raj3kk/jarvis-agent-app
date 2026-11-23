@@ -38,21 +38,19 @@ android {
     }
 
     namespace = "com.jarvis.autonomous"
-    // 1.13.0 Gecko browser: compileSdk 34 -> 36. GeckoView raised
-    // compileSdk to 35 in v131 and to 36 in v139; the 160.x train
-    // requires at least 36. targetSdk stays 34 (separate decision).
-    // The 160.x AARs declare minCompileSdk 37 in their metadata —
-    // see the checkAarMetadata suppression at the end of this file
-    // (D-1: the full AGP 9.1 + compileSdk 37 + Gradle 9.x migration
-    // is deferred as a tracked follow-up, not done in this release).
+    // 1.15.0 Gecko REMOVED (redesign R0): the checkAarMetadata
+    // suppression left with the 160.x AARs. compileSdk stays 36
+    // (no AC dep needs it any more; lowering it is a separate
+    // decision, not churned into this release). The AGP 9.1 +
+    // compileSdk 37 migration stays a deferred follow-up.
     compileSdk = 36
 
     defaultConfig {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 50
-        versionName = "1.14.0-PRO"
+        versionCode = 51
+        versionName = "1.15.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -156,24 +154,30 @@ dependencies {
     // to plain SharedPreferences for these tokens.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // 1.13.0 Gecko browser: GeckoView 160.x Stable + Android
-    // Components 160.0.1 (matched pair). AC 160.0 pins the OLDER
-    // 10 Nov GV build (geckoview-omni 160.0.20261104181552) — do NOT
-    // use 160.0. AC 160.0.1 pins geckoview-omni
-    // 160.0.20261116130455 (17 Nov), which is the pin.
-    // NOTE: no direct org.mozilla.geckoview:geckoview dep on purpose —
-    // browser-engine-gecko already pulls geckoview-omni (same
-    // org.mozilla.geckoview.* classes); adding the fat geckoview AAR
-    // as well would put duplicate classes on the dex classpath.
-    // GeckoView classes (GeckoSession/GeckoRuntime/GeckoView) arrive
-    // transitively via geckoview-omni:160.0.20261116130455.
-    val androidComponentsVersion = "160.0.1"
-    implementation("org.mozilla.components:concept-engine:$androidComponentsVersion")
-    implementation("org.mozilla.components:browser-state:$androidComponentsVersion")
-    implementation("org.mozilla.components:browser-engine-gecko:$androidComponentsVersion")
-    implementation("org.mozilla.components:feature-tabs:$androidComponentsVersion")
-    implementation("org.mozilla.components:feature-downloads:$androidComponentsVersion")
-    implementation("org.mozilla.components:browser-session-storage:$androidComponentsVersion")
+    // 1.15.0 (R0 Whop browser): androidx.webkit for
+    // WebSettingsCompat.setUserAgentMetadata — desktop Client Hints
+    // (Sec-CH-UA-Mobile: ?0) need it; a UA string alone is not
+    // enough (the server keeps serving the mobile bundle).
+    implementation("androidx.webkit:webkit:1.12.1")
+
+    // 1.15.0 (R0 Whop browser): DSBridge (MIT, wendux/DSBridge-Android
+    // via JitPack) — the JobEngine's 1-method JS bridge (DWebView +
+    // addJavascriptObject). Pinned to the documented 3.0-SNAPSHOT
+    // coordinate from the upstream README. The page-side half
+    // (dsbridge.js v3.1.3, MIT) is vendored in app/src/main/assets/
+    // and injected per page by the engine — no CDN load at runtime.
+    // If CI ever fails to resolve this SNAPSHOT, the fallback is the
+    // commit-pinned JitPack coordinate (master 22b19ffa) or vendoring
+    // the AAR source — never a second bridge implementation.
+    implementation("com.github.wendux:DSBridge-Android:3.0-SNAPSHOT")
+
+    // 1.15.0 (R0 parity spec §5 #10): WorkManager backstop — the Vivo
+    // kills background WebViews/services, so a periodic worker re-arms
+    // the foreground service when a plan or browser job is pending.
+    // 15-min minimum interval (WorkManager floor); the user must allow
+    // the battery exemption once (already prompted, A-M8) or the OS
+    // may still defer the worker — see BUILD_NOTES phone preconditions.
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
 
     // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
     // Localhost preview uses plain java.net ServerSocket (no dependency):
@@ -207,29 +211,4 @@ dependencies {
     // shadows the stub on the unit-test classpath; production code
     // still uses the device's org.json — nothing ships differently.
     testImplementation("org.json:json:20240303")
-}
-
-// 1.13.0 Gecko browser — D-1 TOOLCHAIN DECISION (suppression, not the
-// full migration). The 160.x train's AARs (geckoview-omni + all AC
-// artifacts, incl. transitives) declare minCompileSdk 37 in their AAR
-// metadata, while this project is on compileSdk 36 + AGP 8.11 — so
-// AGP's checkAarMetadata task fails the build (67 issues in the spike,
-// CI run 44989753191). The proper fix is AGP 9.1+ + compileSdk 37 +
-// Gradle 9.x, but that migration is UNPROVEN in this CI: SDK 37
-// availability, Kotlin 2.4.0 / Gradle 9 compat, and google-services
-// 4.4.2 compat are each a separate failure domain, and the user's
-// order is the browser, not the migration. The suppression changes
-// NOTHING about the APK contents (the check validates metadata only;
-// same AARs, same code — the spike proved it green on CI and working
-// on the phone). FOLLOW-UP (tracked, before the next GeckoView bump):
-// do the AGP 9.1 + compileSdk 37 + Gradle 9.x migration as its own
-// release, after confirming SDK 37 installs in CI. Until then this
-// suppression stays, deliberately and visibly.
-// AGP creates the checkAarMetadata variant tasks AFTER configuration,
-// so the suppression must live in afterEvaluate (a tasks.named call
-// during configuration throws UnknownTaskException — spike CI run
-// 44990074510).
-afterEvaluate {
-    tasks.named("checkDebugAarMetadata") { enabled = false }
-    tasks.named("checkReleaseAarMetadata") { enabled = false }
 }

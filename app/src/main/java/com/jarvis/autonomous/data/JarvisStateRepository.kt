@@ -530,14 +530,30 @@ object JarvisStateRepository {
         _chatHistory.value = updated
     }
 
-    // Restore a persisted conversation on app relaunch, but only when the
-    // in-memory history is still just the greeting — never overwrite a
-    // live conversation with a stale one.
+    // 1.15.0 memory-loss fix (F1): restore exactly once per process,
+    // guarded by a dedicated flag — NOT by the in-memory size. The old
+    // size <= 1 guard let any single addChatMessage before the restore
+    // (Talker ack, mic line, captcha line) disable restore for the
+    // whole process, while the next persistChat() then overwrote the
+    // saved history on disk. If lines were added before the restore
+    // runs, MERGE: saved entries first, then the new lines, deduped
+    // (same sender+message adjacent duplicates dropped) — never refuse
+    // and never overwrite a live conversation with a stale one.
+    private val chatRestored = java.util.concurrent.atomic.AtomicBoolean(false)
+
     fun restoreChatHistory(entries: List<ChatEntry>) {
         if (entries.isEmpty()) return
-        if (_chatHistory.value.size <= 1) {
-            _chatHistory.value = entries.takeLast(30)
+        if (!chatRestored.compareAndSet(false, true)) return
+        val saved = entries.takeLast(80)
+        val current = _chatHistory.value
+        if (current.size <= 1) {
+            _chatHistory.value = saved
+            return
         }
+        // Merge: saved first, then lines added pre-restore (usually
+        // the greeting + one fresh turn), deduped, capped at 80.
+        val merged = (saved + current).distinct().takeLast(80)
+        _chatHistory.value = merged
     }
 
     fun addLog(log: String) {

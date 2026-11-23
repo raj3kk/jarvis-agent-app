@@ -32,7 +32,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (49 = 1.13.0) — BUMP THIS FLOOR ON
+      # last delivered vc (50 = 1.14.0) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,10 +41,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=49, previous delivered 1.13.0)"
+          echo "versionCode in tree: $VC (floor PREV_VC=50, previous delivered 1.14.0)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=49
+          PREV_VC=50
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1
@@ -123,37 +123,9 @@ jobs:
           print("OK: only the VERIFIED line claims completion")
           PY
 
-      # 1.13.0 Gecko browser: C1 mitigation + bridge-design gates.
-      # (a) The extension manifest version MUST equal the NUMERIC part
-      # of the app versionName on every release (manifest versions are
-      # digits-and-dots only, so "1.13.0-PRO" maps to "1.13.0") — a
-      # version bump forces ADDON_UPGRADE + updateReason, which makes
-      # Gecko build the background directly instead of relying on the
-      # APP_STARTUP fallback that silently never started it in the
-      # spike's persisted runs.
-      # (b) content.js must NEVER call connectNative (the
-      # content-script native port died silently twice); only
-      # background.js may own the native port.
-      - name: Enforce Gecko extension version + bridge design
-        run: |
-          set -e
-          VN=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
-          echo "versionName in tree: $VN"
-          test -n "$VN"
-          VN_NUM=$(echo "$VN" | sed 's/-.*//')
-          echo "versionName numeric part: $VN_NUM"
-          EXT_V=$(python3 -c "import json; print(json.load(open('app/src/main/assets/jarvis-bridge/manifest.json'))['version'])")
-          echo "extension manifest version: $EXT_V"
-          if [ "$EXT_V" != "$VN_NUM" ]; then
-            echo "FAIL: extension version $EXT_V != app versionName numeric part $VN_NUM — bump the manifest on every release (C1 mitigation)."
-            exit 1
-          fi
-          if grep -q "connectNative(" app/src/main/assets/jarvis-bridge/content.js; then
-            echo "FAIL: content.js calls connectNative — the background script must own the native port."
-            exit 1
-          fi
-          grep -q "connectNative(" app/src/main/assets/jarvis-bridge/background.js || (echo "FAIL: background.js must own the native port (connectNative missing)."; exit 1)
-          echo "Gecko extension gates OK: version $EXT_V, background-owned native port"
+      # 1.15.0 Gecko REMOVED (redesign R0): the extension-version +
+      # bridge-design gate left with the Gecko files — there is no
+      # extension any more, so there is nothing to gate.
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -165,8 +137,9 @@ jobs:
       # obsolete 'tools' package, which sdkmanager no longer provides, so
       # that step fails the whole job. ubuntu-latest already ships an
       # Android SDK, so just ensure the exact platform/build-tools we need.
-      # 1.13.0: platform 36 added (compileSdk 36 for GeckoView 160.x —
-      # spike CI proved it installs on the runner).
+      # 1.13.0: platform 36 added (compileSdk 36 — CI proved it
+      # installs on the runner). GeckoView is gone in 1.15.0, but
+      # compileSdk stays 36, so platform 36 stays required.
       - name: Ensure Android SDK packages (platform 34 + 36, build-tools 34.0.0)
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"

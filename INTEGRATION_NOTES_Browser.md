@@ -685,3 +685,48 @@ before showing the preview, as the current code does.
 - **Size:** the release APK is ~235 MB (libxul.so ~147 MiB). The
   ≤100 MB gate does NOT pass and is not claimed to — delivery is via
   Drive, not Play.
+
+---
+
+## 17. 1.15.0 — Gecko REMOVED, Whop-style WebView browser only (redesign R0)
+
+- **Gecko is gone, fully.** 1.15.0 deletes `browser/gecko/`
+  (GeckoBrowserManager.kt, GeckoBrowserScreen.kt, GeckoBridgeUtils.kt
+  + tests), the `jarvis-bridge` extension assets (manifest.json,
+  content.js, background.js), the Android Components 160.0.1
+  dependencies, the Mozilla Maven repo, the `browserEngine`
+  preference (left unread as a stale key — harmless), the CI Gecko
+  gate (extension-version + bridge-design checks), and the
+  compileSdk checkAarMetadata suppression (the 160.x AARs demanded
+  minCompileSdk 37; compileSdk stays 36).
+- **Why:** the Gecko bridge never connected on the phone (three
+  phone runs, two bridge designs — the WebExtension native-messaging
+  port never delivered a single bg-alive; see
+  `~/workspace/omnijarvis-implementation/expansion/browser/BRIDGE_ROOT_CAUSE_AUDIT.md`
+  + Mozilla Bug 1793235, OPEN 4 years) and the APK was 234 MB
+  (libxul.so alone 154.6 MB) against the 100 MB cap. The 1.13.0
+  browser was delivered-but-unverified (G-T0 never run); the
+  redesign (user order 2026-11-23) removes Gecko instead of
+  debugging it further.
+- **Replacement:** the Whop/AutoClip-style browser — System WebView
+  only, no engine switch. The visible Browser tab is
+  `WebViewBrowserScreen` called directly from `BrowserScreen`
+  (desktop mode on: desktop Chrome UA + Client Hints). The agent
+  side is the new `JarvisJobEngine` (`browser/JarvisJobEngine.kt`):
+  a headless per-job WebView (DSBridge 1-method bridge, MIT) +
+  step language (goto/wait/wait_text/assert_text/click_text/type/
+  js/extract/screenshot/upload) + cookie-login session pre-check +
+  screenshot evidence. The old shared WebView (`JarvisBackgroundBrowser`)
+  keeps its "NO addJavascriptInterface" rule for general browsing.
+- **What it does NOT do yet (honest):** no foreground upload host
+  until R3 (headless upload step returns `needs_foreground`); no
+  screenshot upload to the hub until R1 (`/api/frames`); no tabs;
+  no downloads (AgentWeb is R0+1); no live frame loop (R3). The
+  WorkManager backstop (`JarvisBackstopWorker`, 15-min) re-arms the
+  foreground service when a plan is unfinished — it needs the battery
+  exemption allowed once, or the OS denies the background start.
+- **Size:** the release APK is back in the ~25 MB class (1.12.0 was
+  25.4 MB; 1.14.0 was 234.7 MB with Gecko). The ≤100 MB gate passes
+  again. Install OVER 1.14.0.
+- **History:** §16 above is kept as-is for the record — it describes
+  what 1.13.0 shipped, not what the app contains now.

@@ -1248,11 +1248,11 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             appendLine()
             appendLine("PLAN RULES (strict — inhe todna plan reject kar dega):")
             appendLine("1. Output SIRF ek JSON object ho, is schema me (no prose, no fences):")
-            appendLine("{ \"planTitle\": \"short title\", \"steps\": [ { \"kind\": \"BUILD|GITHUB_PUSH|SUPABASE_TABLES|VERCEL_DEPLOY|HTTP_CHECK\", \"title\": \"short\", \"detail\": \"...\", \"needsGate\": false } ] }")
+            appendLine("{ \"planTitle\": \"short title\", \"steps\": [ { \"kind\": \"BUILD|GITHUB_PUSH|SUPABASE_TABLES|VERCEL_DEPLOY|HTTP_CHECK|BROWSER_JOB\", \"title\": \"short\", \"detail\": \"...\", \"needsGate\": false } ] }")
             appendLine("2. Steps 1 se 8 ke beech — zyada steps ho to plan ko chhota rakho, silently truncate mat karo.")
-            appendLine("3. Step kinds sirf ye 5 allowed hain: BUILD (website banao — existing builder checklist ke saath), GITHUB_PUSH (code GitHub repo me push karo), SUPABASE_TABLES (built backend/schema.sql se tables banao), VERCEL_DEPLOY (GitHub repo se Vercel deploy karo), HTTP_CHECK (ek URL check karo). Koi aur kind mat likho.")
+            appendLine("3. Step kinds sirf ye 6 allowed hain: BUILD (website banao — existing builder checklist ke saath), GITHUB_PUSH (code GitHub repo me push karo), SUPABASE_TABLES (built backend/schema.sql se tables banao), VERCEL_DEPLOY (GitHub repo se Vercel deploy karo), HTTP_CHECK (ek URL check karo), BROWSER_JOB (headless WebView se kisi website par kaam karo — kholo, click karo, type karo, text nikalo, screenshot lo; step language: goto/click_text/type/extract/screenshot/wait/wait_text/assert_text/js). Koi aur kind mat likho.")
             appendLine("4. Order dependency ka dhyaan rakho: BUILD pehle, phir GITHUB_PUSH, phir SUPABASE_TABLES, phir VERCEL_DEPLOY. Vercel deploy ke liye GitHub push DONE hona zaroori hai — uske bina Vercel step mat rakho.")
-            appendLine("5. detail me har step ke liye zaroori naam likho, is format me: BUILD -> \"project=<project-name>; <site kaisa ho, ek line>\"; GITHUB_PUSH -> \"repo=<repo-name>\" (user ne naam diya ho to wahi, nahi diya to \"repo=?\"); SUPABASE_TABLES -> \"project=<project-name>\"; VERCEL_DEPLOY -> \"project=<project-name>; repo=<owner>/<repo>\" (repo pata ho to); HTTP_CHECK -> \"url=<full-url> marker=<expected text>\".")
+            appendLine("5. detail me har step ke liye zaroori naam likho, is format me: BUILD -> \"project=<project-name>; <site kaisa ho, ek line>\"; GITHUB_PUSH -> \"repo=<repo-name>\" (user ne naam diya ho to wahi, nahi diya to \"repo=?\"); SUPABASE_TABLES -> \"project=<project-name>\"; VERCEL_DEPLOY -> \"project=<project-name>; repo=<owner>/<repo>\" (repo pata ho to); HTTP_CHECK -> \"url=<full-url> marker=<expected text>\"; BROWSER_JOB -> \"steps=<JSON array>\" — array ke har item me action + zaroori fields: goto {url}, click_text {text}, type {selector, text}, extract {selector, key}, screenshot {}, wait {ms}, wait_text {text}, assert_text {text}, js {code}. Login wali site ho to aage likho: login_url=<url> (user ko pehle Browser tab me login karna hoga).")
             appendLine("6. Naam KABHI invent mat karo: repo naam, project naam, table naam user ne diya ho ya conversation me ho to wahi use karo — nahi ho to \"repo=?\" / project poochne ke liye detail me likho, khud ka naam mat gadh lo.")
             appendLine("7. needsGate=true set karo jab step paise kharch kare, kuch delete kare, login/2FA maange, ya kisi existing non-empty project ko overwrite kare — us step se pehle user se poocha jayega.")
             appendLine("8. Phone par koi backend server nahi chalta — backend files (backend/server.js, backend/schema.sql) deploy ke liye generate hoti hain, phone par run hone ka daava mat karo.")
@@ -1308,7 +1308,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         if (stepsArr.length() == 0) throw PlanParseException("Plan me koi step nahi hai")
         if (stepsArr.length() > 8) throw PlanParseException("Plan me 8 se zyada steps hain (${stepsArr.length()}) — chhota plan banao")
         val allowedKinds = setOf(
-            "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK"
+            "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK", "BROWSER_JOB"
         )
         val steps = mutableListOf<PlanStepDraft>()
         for (i in 0 until stepsArr.length()) {

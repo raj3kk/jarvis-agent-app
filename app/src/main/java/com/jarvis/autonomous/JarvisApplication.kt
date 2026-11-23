@@ -4,6 +4,7 @@ import android.app.Application
 import com.jarvis.autonomous.data.FcmTokenClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.service.JarvisBackstop
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -95,6 +96,12 @@ class JarvisApplication : Application() {
             CoroutineScope(Dispatchers.IO).launch {
                 runCatching { FcmTokenClient.syncToken(applicationContext) }
             }
+            // 1.15.0 (R0 backstop): enqueue the 15-min WorkManager
+            // backstop (KEEP — one periodic worker per install). It
+            // only acts when a plan is unfinished; otherwise it is a
+            // cheap no-op. Main process only — the :tts process never
+            // touches WorkManager.
+            JarvisBackstop.enqueue(applicationContext)
         }
     }
 }

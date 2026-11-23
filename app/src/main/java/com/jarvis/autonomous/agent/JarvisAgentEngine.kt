@@ -213,7 +213,9 @@ class JarvisAgentEngine(
     // check (no timer, no handler); expired keys are dropped,
     // never consulted.
     private val recentAnnounces = mutableMapOf<String, Long>()
-    private var chatRestored = false
+    // 1.15.0 memory-loss fix (F2): the engine keeps NO chatRestored
+    // flag any more — the exactly-once guard lives in
+    // JarvisStateRepository (AtomicBoolean); see ensureChatRestored().
 
     // 1.4.0 browser approval state (see Browser §7): a URL Jarvis
     // proposed is only loaded after the user's immediately following
@@ -486,8 +488,25 @@ class JarvisAgentEngine(
     }
 
     private fun persistChat() {
+        // 1.15.0 memory-loss fix (F2): restore-first — the Talker fast
+        // paths persist BEFORE any loop turn runs, so a persist with no
+        // restore yet would overwrite the saved history on disk with
+        // just [greeting + new turn]. ensureChatRestored() is a no-op
+        // after the first call (repository AtomicBoolean), so calling
+        // it here is free and covers all 45 persist sites.
+        ensureChatRestored()
         runCatching {
             prefs.saveChatHistory(JarvisStateRepository.chatHistory.value)
+        }
+    }
+
+    // 1.15.0 memory-loss fix (F2): the once-per-process restore, in one
+    // place. Called from persistChat(), handleUserCommand(), and the
+    // autonomous loop (harmless fallback). The repository owns the
+    // exactly-once flag — the engine keeps no flag of its own any more.
+    private fun ensureChatRestored() {
+        runCatching {
+            JarvisStateRepository.restoreChatHistory(prefs.getSavedChatHistory())
         }
     }
 
@@ -2576,6 +2595,10 @@ class JarvisAgentEngine(
     fun handleUserCommand(rawCommand: String) {
         val trimmed = rawCommand.trim()
         if (trimmed.isEmpty()) return
+        // 1.15.0 memory-loss fix (F2): restore before ANY chat line is
+        // added or persisted — this is the single choke point for all
+        // user commands, so no first-turn path can overwrite history.
+        ensureChatRestored()
 
         // 1.4.4 startup guard: this is the single choke point for
         // ALL user commands (mic turn, typed text, wake word,
@@ -3628,12 +3651,9 @@ class JarvisAgentEngine(
             JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Offline — local work only")
             return
         }
-        if (!chatRestored) {
-            chatRestored = true
-            runCatching {
-                JarvisStateRepository.restoreChatHistory(prefs.getSavedChatHistory())
-            }
-        }
+        // 1.15.0 memory-loss fix (F2): the in-loop restore is now just
+        // the shared ensureChatRestored() (no-op after the first call).
+        ensureChatRestored()
         postYouLineOnce(currentGoal)
         persistChat()
         JarvisStateRepository.setCurrentGoal(currentGoal)

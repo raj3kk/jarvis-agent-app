@@ -10,11 +10,14 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // 1.13.0 Gecko browser: Mozilla Maven repo — REQUIRED for
-        // GeckoView + Android Components. No auth. Must live here
-        // (FAIL_ON_PROJECT_REPOS forbids project-level repos in
-        // app/build.gradle.kts).
-        maven { url = uri("https://maven.mozilla.org/maven2/") }
+        // 1.15.0 Gecko REMOVED (redesign R0): the Mozilla Maven repo
+        // left with the Android Components deps — no org.mozilla.*
+        // artifact is resolved any more.
+        // 1.15.0 (R0 Whop browser): JitPack hosts DSBridge-Android
+        // (wendux/DSBridge-Android, MIT) — the JobEngine's 1-method
+        // JS bridge. No auth. Declared here (FAIL_ON_PROJECT_REPOS
+        // forbids project-level repos in app/build.gradle.kts).
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

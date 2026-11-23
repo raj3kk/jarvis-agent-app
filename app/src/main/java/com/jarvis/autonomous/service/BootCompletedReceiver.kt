@@ -33,6 +33,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
                     context.startService(serviceIntent)
                 }
             }
+            // 1.15.0 (R0 backstop): re-arm the periodic worker after
+            // every boot, unconditionally — the worker itself is a
+            // no-op unless a plan is unfinished, so this does not
+            // start anything the user did not ask for.
+            JarvisBackstop.enqueue(context)
         }
     }
 }

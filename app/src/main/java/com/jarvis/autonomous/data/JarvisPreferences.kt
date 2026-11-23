@@ -163,20 +163,10 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getLong("fcm_registered_at_ms", 0L)
         set(value) = prefs.edit().putLong("fcm_registered_at_ms", value).apply()
 
-    // 1.13.0 Gecko browser: visible Browser-tab engine. "gecko" is the
-    // default (this release's point); "webview" is the fallback that
-    // never goes away. Any other stored value reads as "gecko" — a
-    // corrupt/unknown value must never blank the Browser tab. The
-    // agent's background browse does NOT read this: it stays on
-    // JarvisBackgroundBrowser (WebView) in 1.13.0 (D-2).
-    var browserEngine: String
-        get() {
-            val saved = prefs.getString("browser_engine", "gecko") ?: "gecko"
-            return if (saved == "webview") "webview" else "gecko"
-        }
-        set(value) = prefs.edit().putString(
-            "browser_engine", if (value == "webview") "webview" else "gecko"
-        ).apply()
+    // 1.15.0 Gecko REMOVED (redesign R0): the browser_engine pref is
+    // gone — the browser is System WebView only, no engine toggle.
+    // Old installs keep a stale "browser_engine" value in prefs;
+    // nothing reads it any more (harmless, never migrated).
 
     companion object {
         // Dead model IDs that return 404 today, mapped to their live
@@ -304,8 +294,14 @@ class JarvisPreferences(context: Context) {
         }
         set(value) = prefs.edit().putLong("step_delay_ms", value.coerceIn(300L, 5000L)).apply()
 
-    // Persistent chat memory: the last 30 turns survive app restarts, so
+    // Persistent chat memory: the last 80 turns survive app restarts, so
     // Jarvis does not forget the conversation (or the user) on relaunch.
+    // 1.15.0 memory-loss fix (F4): persisted cap 30 -> 80, aligned with
+    // the in-memory cap (JarvisStateRepository.addChatMessage) — turns
+    // 31-80 used to vanish on every restart by design. F3: commit(),
+    // not apply() — the chat key is the one the user sees, so the
+    // write must be on disk before the next line is spoken, even on
+    // force-stop right after a reply. Other prefs keep apply().
     // ChatEntry lives in this same package, so no import is needed.
     fun getSavedChatHistory(): List<ChatEntry> {
         val raw = prefs.getString("chat_history_json", "[]") ?: "[]"
@@ -323,13 +319,13 @@ class JarvisPreferences(context: Context) {
 
     fun saveChatHistory(entries: List<ChatEntry>) {
         val arr = JSONArray()
-        entries.takeLast(30).forEach { e ->
+        entries.takeLast(80).forEach { e ->
             arr.put(JSONObject().apply {
                 put("sender", e.sender)
                 put("message", e.message)
             })
         }
-        prefs.edit().putString("chat_history_json", arr.toString()).apply()
+        prefs.edit().putString("chat_history_json", arr.toString()).commit()
     }
 
     // Long-term Friend Memory Notes

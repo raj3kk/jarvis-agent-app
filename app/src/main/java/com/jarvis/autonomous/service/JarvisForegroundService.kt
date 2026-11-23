@@ -407,6 +407,18 @@ class JarvisForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 1.15.0 memory-loss fix (F1): the service can run without the
+        // Activity (mic loop, boot) — restore the saved chat history
+        // once at service start too, on a background thread, so a
+        // mic/captcha line can never persist before a restore. The
+        // repository's AtomicBoolean makes this exactly-once per
+        // process even when MainActivity restores as well.
+        Thread {
+            runCatching {
+                val saved = JarvisPreferences(this).getSavedChatHistory()
+                JarvisStateRepository.restoreChatHistory(saved)
+            }
+        }.start()
         // 1.4.2: a startup crash used to die silently (no record of
         // WHICH init step failed — the likely "home redirect" cause).
         // Record the failure to the persisted diagnostics file first,
