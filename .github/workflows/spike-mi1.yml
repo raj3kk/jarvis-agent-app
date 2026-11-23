@@ -1,13 +1,19 @@
 name: M-I-1 LiteRT Spike
 
-# Spike CI runs are workflow_dispatch ONLY — a push creates no run.
-# This workflow lives ONLY on branch spike/mi1-litert (never merged
-# to main). It builds the minimal spike APK (:spike:assembleDebug,
-# debug-signed — no production keystore, no release slot, no
-# version bump) and FAILS if the APK still bundles
-# liblitertlm_jni.so (the negative gate: the whole point is that
-# the .so is NOT in the APK).
+# The workflow file lives ONLY on branch spike/mi1-litert (never
+# merged to main). It runs on PUSH to that branch AND on
+# workflow_dispatch — the push trigger is REQUIRED, not optional:
+# a branch created via the Git Data API fires a `create` event, not
+# a `push` event, so GitHub never indexes the workflow file and
+# `workflow_dispatch` 404s ("Not Found") until a real push to the
+# branch registers it (proven 2026-11-23: 5 dispatch attempts all
+# 404, file present on the branch, YAML valid). After the first
+# push registers it, dispatch works too. A push to main never
+# triggers this workflow (branch filter), and it never touches
+# the release.
 on:
+  push:
+    branches: ["spike/mi1-litert"]
   workflow_dispatch:
 
 permissions:
