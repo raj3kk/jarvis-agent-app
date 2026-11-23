@@ -14,16 +14,23 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 1.4.17: Gemini Live API session — conversation ONLY.
+ * 1.4.17: Gemini Live API session — conversation + R3.6 live tools.
  *
- * Structural no-action boundary (not a prompt hope): this class
- * receives NO engine, LLM client, accessibility service, or
- * memory/routine reference, and its setup message carries NO
- * function-calling field — with that field omitted the model
- * cannot legitimately emit a function call. Defense in depth:
- * a call message arriving anyway is dropped, never answered,
- * logged LIVE_TOOLCALL_DROPPED, and the session continues as
- * conversation.
+ * R3.6 (1.18.0-PRO): the structural no-action boundary is LIFTED
+ * for exactly 6 tools (3 registry SAFE tools + 3 local device
+ * tools). The setup message now carries a function-calling field
+ * with those declarations; a toolCall message is parsed and
+ * delivered to [Listener.onToolCall] (call id + name + args JSON),
+ * and the service answers with [sendFunctionResponse]. Everything
+ * else stays: the class receives NO engine, LLM client,
+ * accessibility service, or memory/routine reference — the
+ * service (FGS) owns the dispatch through the engine's
+ * executeLiveTool, which gate-checks through ToolRegistry.
+ * CONFIRM / SENSITIVE registry tools are never declared here, so
+ * the model cannot call them; a call for any undeclared name is
+ * refused by the engine with an error functionResponse (PARK —
+ * the 5 hard gates never run from live mode). An unknown toolCall
+ * shape is logged LIVE_TOOLCALL_DROPPED and the session continues.
  *
  * Pinned model: gemini-2.5-flash-native-audio-dialog. Endpoint:
  * the Developer-API WebSocket BidiGenerateContent, auth via the
@@ -56,7 +63,15 @@ class GeminiLiveSession {
         fun onSetupComplete()
         fun onAudioFrame(pcm: ByteArray)
         fun onInterrupted()
-        fun onToolCallDropped()
+        /**
+         * R3.6: the model called a declared function. [callId] is
+         * the server's function-call id (echoed back in
+         * [sendFunctionResponse]); [argsJson] is the call's args
+         * object as JSON. The listener MUST answer every call with
+         * sendFunctionResponse (even a refusal — an unanswered call
+         * stalls the model's turn).
+         */
+        fun onToolCall(callId: String, name: String, argsJson: String)
         fun onEnded(kind: EndKind)
     }
 
@@ -72,13 +87,60 @@ class GeminiLiveSession {
          * CONNECT_TIMEOUT_MS (15 s). */
         const val SETUP_TIMEOUT_MS: Long = 15_000L
 
-        /** Frozen setup-time system instruction (conversation
-         * only, no phone actions). */
+        /** Frozen setup-time system instruction (R3.6: live tools
+         *  allowed — 3 read-only checks + 3 local device tools.
+         *  Money / delete / login / OTP / biometric / sending
+         *  messages / app operations stay forbidden in live mode;
+         *  if asked, reply conversationally that Live mode cannot
+         *  do that and offer the normal command path. */
         const val SYSTEM_INSTRUCTION =
-            "You are Jarvis in Live conversation mode. Conversation only. " +
-                "Never ask for or perform phone actions, payments, messages, " +
-                "deletions, or app operations; if asked, reply conversationally " +
-                "that Live mode cannot do actions."
+            "You are Jarvis in Live conversation mode. You can use " +
+                "these tools when the user asks: http_check (check a URL), " +
+                "gmail_read (read the inbox), drive_read (read a Drive file), " +
+                "set_torch, set_volume, media_control (play/pause). " +
+                "Never ask for or perform payments, messages, deletions, " +
+                "logins, OTP, biometric, or other app operations; if asked, " +
+                "reply conversationally that Live mode cannot do that."
+
+        /**
+         * R3.6: the 6 live tools, as Gemini function declarations.
+         * Only SAFE (read-only / harmless local) tools are declared
+         * — CONFIRM / SENSITIVE registry tools are never offered to
+         * the model. The service dispatches through the engine,
+         * which re-checks the gate per call.
+         */
+        val LIVE_TOOLS_JSON = """
+            [{
+                "functionDeclarations": [
+                    {"name": "http_check", "description": "Kisi URL ko kholo aur status/content check karo (read-only).",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "url": {"type": "STRING", "description": "Poora http(s) URL"},
+                         "expect": {"type": "STRING", "description": "Page me dhoondhne wala text (optional)"}},
+                         "required": ["url"]}},
+                    {"name": "gmail_read", "description": "Gmail inbox padho (read-only, hub OAuth).",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "query": {"type": "STRING", "description": "Search query (optional)"},
+                         "limit": {"type": "INTEGER", "description": "Max messages, 1-10 (optional)"}},
+                         "required": []}},
+                    {"name": "drive_read", "description": "Google Drive se file padho (read-only, hub OAuth).",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "file_id": {"type": "STRING", "description": "Drive file id"}},
+                         "required": ["file_id"]}},
+                    {"name": "set_torch", "description": "Phone ki torch on/off karo.",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "enable": {"type": "BOOLEAN", "description": "true = on, false = off"}},
+                         "required": ["enable"]}},
+                    {"name": "set_volume", "description": "Media volume set karo (percent).",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "percent": {"type": "INTEGER", "description": "0-100"}},
+                         "required": ["percent"]}},
+                    {"name": "media_control", "description": "Media play/pause/next/previous karo.",
+                     "parameters": {"type": "OBJECT", "properties": {
+                         "action": {"type": "STRING", "description": "play, pause, next, ya previous"}},
+                         "required": ["action"]}}
+                ]
+            }]
+        """.trimIndent()
     }
 
     private var httpClient: OkHttpClient? = null
@@ -187,9 +249,10 @@ class GeminiLiveSession {
     }
 
     private fun sendSetup(ws: WebSocket) {
-        // NOTE: deliberately NO function-calling field, NO
-        // transcription fields, NO voice selection — see class
-        // doc. responseModalities AUDIO = spoken replies.
+        // R3.6: the function-calling field is now present with the
+        // 6 live tools (LIVE_TOOLS_JSON) — the model may call them.
+        // No transcription fields, no voice selection — see class doc.
+        // responseModalities AUDIO = spoken replies.
         val setup = JSONObject().apply {
             put("model", "models/$LIVE_MODEL")
             put("systemInstruction", JSONObject().apply {
@@ -200,9 +263,35 @@ class GeminiLiveSession {
             put("generationConfig", JSONObject().apply {
                 put("responseModalities", org.json.JSONArray().put("AUDIO"))
             })
+            put("tools", org.json.JSONArray(LIVE_TOOLS_JSON))
         }
         val msg = JSONObject().apply { put("setup", setup) }
         runCatching { ws.send(msg.toString()) }
+    }
+
+    /**
+     * R3.6: answer one function call. [resultJson] is a JSON string
+     * (the engine's result — evidence or an "ERROR: ..." refusal);
+     * it is wrapped as the response object so the model can speak
+     * it. Dropped silently before setupComplete or after close.
+     */
+    fun sendFunctionResponse(callId: String, name: String, resultJson: String): Boolean {
+        if (closed.get() || !setupComplete) return false
+        val ws = webSocket ?: return false
+        val msg = JSONObject().apply {
+            put("toolResponse", JSONObject().apply {
+                put("functionResponses", org.json.JSONArray().put(
+                    JSONObject().apply {
+                        put("id", callId)
+                        put("name", name)
+                        put("response", JSONObject().apply {
+                            put("result", resultJson)
+                        })
+                    }
+                ))
+            })
+        }
+        return runCatching { ws.send(msg.toString()) }.getOrDefault(false)
     }
 
     private fun handleServerText(text: String) {
@@ -234,14 +323,35 @@ class GeminiLiveSession {
             closeSocket()
             return
         }
-        // A call message despite no function-calling field in
-        // setup: dropped, never answered, session continues.
+        // R3.6: a toolCall message — parse the function calls and
+        // deliver them to the listener (the service dispatches
+        // through the engine and answers with sendFunctionResponse).
+        // An unparseable call is dropped + logged, never answered,
+        // and the session continues as conversation.
         if (json.has("toolCall")) {
-            JarvisStateRepository.addDiagnostic(
-                "live", "LIVE_TOOLCALL_DROPPED",
-                "Server sent a call message despite no function-calling field in setup — dropped, no response sent, session continues as conversation."
-            )
-            listener?.onToolCallDropped()
+            val toolCall = json.optJSONObject("toolCall")
+            val calls = toolCall?.optJSONArray("functionCalls")
+            if (calls == null || calls.length() == 0) {
+                JarvisStateRepository.addDiagnostic(
+                    "live", "LIVE_TOOLCALL_DROPPED",
+                    "Server sent a toolCall with no functionCalls — dropped, no response sent, session continues."
+                )
+                return
+            }
+            for (i in 0 until calls.length()) {
+                val call = calls.optJSONObject(i) ?: continue
+                val name = call.optString("name", "")
+                val id = call.optString("id", "")
+                val args = call.optJSONObject("args")?.toString() ?: "{}"
+                if (name.isBlank() || id.isBlank()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_TOOLCALL_DROPPED",
+                        "Server sent a function call without name/id — dropped, session continues."
+                    )
+                    continue
+                }
+                listener?.onToolCall(id, name, args)
+            }
             return
         }
         val content = json.optJSONObject("serverContent") ?: return

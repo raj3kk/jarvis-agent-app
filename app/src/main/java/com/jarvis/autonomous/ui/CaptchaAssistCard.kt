@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jarvis.autonomous.data.CaptchaAssistState
+import com.jarvis.autonomous.data.CaptchaSolvePolicy
 import com.jarvis.autonomous.data.CaptchaStatus
 import kotlinx.coroutines.delay
 
@@ -124,6 +125,35 @@ fun CaptchaAssistCard(
                 fontSize = 13.sp,
                 color = Color(0xFF3B2F2A)
             )
+            // R3.7: show what was detected. Slider / GeeTest /
+            // Turnstile are human-only (D3 lock — never auto-solved):
+            // the card never offers an auto-solve button for them
+            // (the SOLVING state is only entered by runAutoSolve,
+            // which the policy gate blocks for these types).
+            if (state.challengeType.isNotBlank()) {
+                val typeLabel = when (state.challengeType) {
+                    CaptchaSolvePolicy.TYPE_SLIDER -> "Slider"
+                    CaptchaSolvePolicy.TYPE_GEETEST -> "GeeTest"
+                    CaptchaSolvePolicy.TYPE_RECAPTCHA_GRID -> "reCAPTCHA grid"
+                    CaptchaSolvePolicy.TYPE_HCAPTCHA_GRID -> "hCaptcha grid"
+                    CaptchaSolvePolicy.TYPE_TEXT -> "Text captcha"
+                    "turnstile" -> "Turnstile"
+                    else -> state.challengeType
+                }
+                Text(
+                    text = "Captcha type: $typeLabel",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF3B2F2A)
+                )
+                if (!CaptchaSolvePolicy.isAutoSolvableType(state.challengeType)) {
+                    Text(
+                        text = "Ye auto-solve nahi hota — khud solve karo, main intezaar kar raha hoon.",
+                        fontSize = 13.sp,
+                        color = Color(0xFF7A5A00)
+                    )
+                }
+            }
 
             when (state.status) {
                 CaptchaStatus.SOLVED -> {

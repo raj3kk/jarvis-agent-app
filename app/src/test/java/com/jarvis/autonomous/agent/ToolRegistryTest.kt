@@ -60,4 +60,32 @@ class ToolRegistryTest {
             ToolRegistry.resolve("HTTP_CHECK")!!.gate
         )
     }
+
+    // R3.6: live-mode tools — only the 3 registry SAFE tools may
+    // run from a Gemini Live function call (executeLiveTool
+    // gate-checks through here). CONFIRM / SENSITIVE tools are
+    // REFUSED from live mode; the local device tools (torch /
+    // volume / media) are not registry tools — the engine allowlists
+    // them by name.
+    @Test
+    fun liveModeRegistryToolsAreSafeOnly() {
+        for (kind in listOf("HTTP_CHECK", "GMAIL_READ", "DRIVE_READ")) {
+            assertEquals(
+                ToolRegistry.GateLevel.SAFE,
+                ToolRegistry.resolve(kind)!!.gate
+            )
+        }
+        for (kind in listOf("BUILD", "GITHUB_PUSH", "VERCEL_DEPLOY", "BROWSER_JOB")) {
+            assertEquals(
+                ToolRegistry.GateLevel.CONFIRM,
+                ToolRegistry.resolve(kind)!!.gate
+            )
+        }
+        for (kind in listOf("GMAIL_SEND", "SUPABASE_TABLES")) {
+            assertEquals(
+                ToolRegistry.GateLevel.SENSITIVE,
+                ToolRegistry.resolve(kind)!!.gate
+            )
+        }
+    }
 }

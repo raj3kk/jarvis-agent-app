@@ -31,6 +31,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -47,6 +49,7 @@ import com.jarvis.autonomous.data.JarvisStorePatternStorage
 import com.jarvis.autonomous.data.LearnedPatternStore
 import com.jarvis.autonomous.data.MemoryClient
 import com.jarvis.autonomous.data.TrainedIngestion
+import com.jarvis.autonomous.service.JarvisForegroundService
 import java.io.File
 import kotlinx.coroutines.launch
 
@@ -98,6 +101,18 @@ fun TrainedJarvisScreen() {
     var deleteArmedId by remember { mutableStateOf<String?>(null) }
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     val memoryPushVersion by JarvisStateRepository.memoryPushVersion.collectAsState()
+    // R3.3: an overlay-requested ingest gets a spoken confirmation
+    // ("Padh liya, yaad rakhunga") from the Talker on success.
+    var overlayIngestPending by remember { mutableStateOf(false) }
+    val linkFocusRequester = remember { FocusRequester() }
+
+    fun speakOverlayConfirmation() {
+        val intent = Intent(context, JarvisForegroundService::class.java).apply {
+            action = JarvisForegroundService.ACTION_SPEAK_TEXT
+            putExtra(JarvisForegroundService.EXTRA_SPEAK_TEXT, "Padh liya, yaad rakhunga.")
+        }
+        runCatching { context.startService(intent) }
+    }
 
     fun refresh() {
         docs = runCatching { documentMemory.listDocuments() }.getOrDefault(emptyList())
@@ -138,6 +153,12 @@ fun TrainedJarvisScreen() {
                     pasteText = ""
                     linkUrl = ""
                     refresh()
+                    // R3.3: the overlay asked for this ingest — the
+                    // Talker confirms aloud (O-T9).
+                    if (overlayIngestPending) {
+                        overlayIngestPending = false
+                        speakOverlayConfirmation()
+                    }
                 }
                 is TrainedIngestion.IngestResult.Err -> {
                     status = "✗ ${result.reason}"
@@ -216,6 +237,25 @@ fun TrainedJarvisScreen() {
         runCatching { speakLauncher.launch(intent) }
     }
 
+    // R3.3: overlay panel asked for a picker — launch it once,
+    // then clear. The ingestion itself runs the normal runIngest
+    // path (same as the on-screen buttons); the spoken
+    // confirmation fires from there (overlayIngestPending).
+    val overlayAction by JarvisStateRepository.overlayAction.collectAsState()
+    LaunchedEffect(overlayAction) {
+        val action = overlayAction ?: return@LaunchedEffect
+        JarvisStateRepository.setOverlayAction(null)
+        overlayIngestPending = true
+        when (action) {
+            JarvisStateRepository.OverlayAction.ADD_DOC -> pickFile.launch("*/*")
+            JarvisStateRepository.OverlayAction.ADD_IMAGE -> startPhoto()
+            JarvisStateRepository.OverlayAction.ADD_LINK -> {
+                status = "Link paste karo, phir 'Padho' dabao."
+                runCatching { linkFocusRequester.requestFocus() }
+            }
+        }
+    }
+
     val stats = remember(docs) {
         runCatching { documentMemory.stats() }.getOrNull()
     }
@@ -279,7 +319,7 @@ fun TrainedJarvisScreen() {
                 onValueChange = { linkUrl = it },
                 label = { Text("Link daalo (https://…)") },
                 singleLine = true,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f).focusRequester(linkFocusRequester)
             )
             Button(
                 onClick = { runIngest { ingestion.ingestLink(linkUrl) } },

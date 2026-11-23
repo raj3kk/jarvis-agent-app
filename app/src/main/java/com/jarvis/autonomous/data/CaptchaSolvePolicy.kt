@@ -41,6 +41,17 @@ object CaptchaSolvePolicy {
     const val TYPE_HCAPTCHA_GRID = "hcaptcha_grid"
     const val TYPE_TEXT = "text"
 
+    /**
+     * R3.7 — DETECT-ONLY hub types (D3 lock): slider + GeeTest are
+     * KNOWN challenge types (the hub detects + audits them) but are
+     * NEVER auto-solved — they stay in NEVER_AUTO_TYPES below and
+     * isAutoSolvableType still returns false for them. The mapping
+     * exists so the type flows to the human-assist card + hub audit
+     * instead of being dropped to null/"unknown".
+     */
+    const val TYPE_SLIDER = "slider"
+    const val TYPE_GEETEST = "geetest"
+
     /** Types that are NEVER auto-solved, whatever the flag says (§5). */
     val NEVER_AUTO_TYPES = setOf("audio", "turnstile", "recaptcha_v3", "slider", "geetest")
 
@@ -55,11 +66,16 @@ object CaptchaSolvePolicy {
      * CAPTCHA_CHECK_JS) to a hub challenge_type, or null when the
      * detected challenge is outside the auto scope (turnstile /
      * unknown / anything else → human-only, unchanged).
+     * R3.7: "slider" and "geetest" map to their hub KNOWN types for
+     * detection + human-assist routing only — isAutoSolvableType
+     * still returns false for them (D3 lock: never auto-solved).
      */
     fun challengeTypeForDetected(detected: String): String? = when (detected) {
         "recaptcha" -> TYPE_RECAPTCHA_GRID
         "hcaptcha" -> TYPE_HCAPTCHA_GRID
         "text" -> TYPE_TEXT
+        "slider" -> TYPE_SLIDER
+        "geetest" -> TYPE_GEETEST
         else -> null
     }
 

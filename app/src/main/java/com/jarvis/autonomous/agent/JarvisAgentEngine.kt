@@ -9,6 +9,7 @@ import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.FilePatternStorage
+import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisEventLog
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -24,6 +25,8 @@ import com.jarvis.autonomous.data.LearnedInstructionMeta
 import com.jarvis.autonomous.data.LearnedPattern
 import com.jarvis.autonomous.data.LearnedPatternMeta
 import com.jarvis.autonomous.data.LearnedPatternStep
+import com.jarvis.autonomous.data.TalkerCard
+import com.jarvis.autonomous.data.TalkerCardKind
 import com.jarvis.autonomous.data.LearnedPatternStore
 import com.jarvis.autonomous.data.LearnedRoutine
 import com.jarvis.autonomous.data.LearnedRoutineStore
@@ -37,6 +40,8 @@ import com.jarvis.autonomous.data.SaveResult
 import com.jarvis.autonomous.data.SelfExtensionStore
 import com.jarvis.autonomous.service.JarvisAccessibilityService
 import com.jarvis.autonomous.service.JarvisNotificationService
+import com.jarvis.autonomous.service.LiveScreenFrame
+import com.jarvis.autonomous.service.LiveScreenWatcher
 import com.jarvis.autonomous.service.ScreenSnapshot
 import com.jarvis.autonomous.ui.BrowserBrowseStatus
 import com.jarvis.autonomous.ui.JarvisBackgroundBrowser
@@ -99,6 +104,186 @@ class JarvisAgentEngine(
     // (same ownership shape as llmClient above). Lazy so the
     // executor receives a fully-constructed engine.
     private val planExecutor: AgentPlanExecutor by lazy { AgentPlanExecutor(this) }
+    // R3.1 (1.18.0-PRO): live-screen watcher — the phone's own eyes
+    // for tap-to-operate (stills + on-device ML Kit OCR). Created
+    // lazily from the AccessibilityService instance when it exists;
+    // null when the service is off (every caller null-checks). The
+    // watcher holds the service instance it was built from; if the
+    // service restarts, liveWatcher() rebuilds it.
+    private var liveScreenWatcher: LiveScreenWatcher? = null
+
+    /** R3.1: the live-screen watcher, or null when the a11y service is off. */
+    private fun liveWatcher(): LiveScreenWatcher? {
+        val acc = JarvisAccessibilityService.instance ?: return null
+        val existing = liveScreenWatcher
+        if (existing != null && existing.service === acc) return existing
+        return LiveScreenWatcher(acc, scope).also { liveScreenWatcher = it }
+    }
+
+    /**
+     * R3.1: forward one live-screen frame to the hub (signed WS
+     * LIVE_SCREEN — text + boxes only, never pixels; sensitive
+     * frames never reach here — the watcher excludes them first).
+     * Called from the watch loop only.
+     */
+    private fun sendLiveFrameToHub(frame: LiveScreenFrame) {
+        if (frame.excluded || frame.text.isBlank()) return
+        val boxesJson = JSONArray().apply {
+            for (b in frame.boxes) {
+                put(
+                    JSONObject().put("x", b.x).put("y", b.y)
+                        .put("w", b.w).put("h", b.h).put("label", b.label)
+                )
+            }
+        }
+        HubWsClient.instance?.sendLiveScreenEvent(frame.text, boxesJson, frame.screenKind)
+    }
+
+    /**
+     * R3.2 — CFD (Check–Fix–Decide) for tap-type actions: run the
+     * action, then VERIFY via the live screen that something changed
+     * (node-tree hash differs) or — for TYPE_TEXT — that the typed
+     * text now appears on screen (node tree or OCR). ONE retry on a
+     * failed verify; a second failure returns success=false with the
+     * reason, so the loop decides (retry the plan / escalate to Main
+     * / park and tell the user). Never a silent stop, never an
+     * infinite loop: at most 2 attempts per action. The watch is
+     * kept alive by the tap itself (noteTapActivity) and stops
+     * itself when taps stop coming.
+     */
+    private suspend fun tapActionWithVerify(
+        acc: JarvisAccessibilityService?,
+        label: String,
+        expectedText: String?,
+        run: () -> Boolean
+    ): ActionResult {
+        if (acc == null) {
+            return ActionResult(false, "$label -> Accessibility service band hai — Settings me Jarvis Accessibility ON karo")
+        }
+        // Node-exposure opt-out (R3.2): the foreground app shows no
+        // nodes at all — tapping is blind. Tell the user (via the
+        // failure summary the loop speaks) and park, never tap blind.
+        val preSnapshot = acc.captureScreenSnapshot()
+        if (preSnapshot.elements.isEmpty()) {
+            return ActionResult(
+                false,
+                "$label -> '${preSnapshot.packageName}' app apne nodes nahi dikhata — is screen par tap/type nahi kar sakta. " +
+                    "App ko khud operate karo ya dusra tareeka batao."
+            )
+        }
+        val watcher = liveWatcher()
+        watcher?.noteTapActivity()
+        watcher?.startWatch { frame -> sendLiveFrameToHub(frame) }
+        val preHash = preSnapshot.formattedTree.hashCode()
+        repeat(2) { attempt ->
+            val ok = runCatching { run() }.getOrDefault(false)
+            if (!ok) {
+                if (attempt == 1) {
+                    return ActionResult(false, "$label -> success=false (2 koshish)")
+                }
+                delay(300L)
+                return@repeat
+            }
+            delay(300L)
+            val verified = verifyScreenChanged(acc, preHash, expectedText)
+            if (verified) {
+                return ActionResult(ok, "$label -> success=true (verify: screen badla)")
+            }
+            if (attempt == 1) {
+                return ActionResult(
+                    false,
+                    "$label -> tap chala par screen nahi badla (2 koshish) — " +
+                        "galat jagah tap hua ho sakta hai ya app respond nahi kar raha."
+                )
+            }
+            delay(300L)
+        }
+        return ActionResult(false, "$label -> success=false")
+    }
+
+    /**
+     * R3.2 verify: true when the node-tree hash changed since
+     * [preHash], or when [expectedText] (TYPE_TEXT) now appears in
+     * the node tree or the live OCR text. An excluded (sensitive)
+     * OCR frame never verifies a type — the node tree decides alone.
+     */
+    private suspend fun verifyScreenChanged(
+        acc: JarvisAccessibilityService?,
+        preHash: Int,
+        expectedText: String?
+    ): Boolean {
+        val post = acc?.captureScreenSnapshot() ?: return false
+        if (post.formattedTree.hashCode() != preHash) return true
+        val expected = expectedText?.takeIf { it.isNotBlank() } ?: return false
+        if (post.formattedTree.contains(expected, ignoreCase = true)) return true
+        val frame = liveWatcher()?.readScreen() ?: return false
+        if (frame.excluded) return false
+        return frame.text.contains(expected, ignoreCase = true)
+    }
+
+    /**
+     * R3.6: run ONE Live-mode function call (Gemini Live toolCall).
+     * Public — the FGS liveListener calls it. Only the 6 declared
+     * tools execute: 3 registry SAFE tools (via the plan executor,
+     * gate-checked through ToolRegistry) + 3 local device tools
+     * (torch / volume / media — via the same executeDecisionAction
+     * the loop uses). Anything else — including every CONFIRM /
+     * SENSITIVE registry tool — is REFUSED with an error string
+     * (PARK; the 5 hard gates never run from live mode). Returns
+     * evidence on success, or an "ERROR: ..." string the model can
+     * speak as the function response.
+     */
+    suspend fun executeLiveTool(name: String, argsJson: String): String {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return "ERROR: args parse nahi hue"
+        val result = when (name) {
+            "http_check" -> {
+                val url = args.optString("url", "")
+                if (url.isBlank()) {
+                    "ERROR: http_check me url nahi diya gaya."
+                } else {
+                    planExecutor.executeLiveTool(
+                        "HTTP_CHECK", "url=$url marker=${args.optString("expect", "")}"
+                    )
+                }
+            }
+            "gmail_read" -> planExecutor.executeLiveTool(
+                "GMAIL_READ", "max=${args.optInt("limit", 5)} q=${args.optString("query", "")}"
+            )
+            "drive_read" -> {
+                val fileId = args.optString("file_id", "")
+                if (fileId.isBlank()) {
+                    "ERROR: drive_read me file_id nahi diya gaya."
+                } else {
+                    planExecutor.executeLiveTool("DRIVE_READ", "file_id=$fileId")
+                }
+            }
+            "set_torch" -> {
+                val d = AgentDecision(
+                    reply = "", thought = "live tool", action = "FLASHLIGHT",
+                    enableFlag = args.optBoolean("enable", true)
+                )
+                executeDecisionAction(d, JarvisAccessibilityService.instance).summary
+            }
+            "set_volume" -> {
+                val d = AgentDecision(
+                    reply = "", thought = "live tool", action = "VOLUME",
+                    volumePercent = args.optInt("percent", 50).coerceIn(0, 100)
+                )
+                executeDecisionAction(d, JarvisAccessibilityService.instance).summary
+            }
+            "media_control" -> {
+                val d = AgentDecision(
+                    reply = "", thought = "live tool", action = "MEDIA_CONTROL",
+                    text = args.optString("action", "play")
+                )
+                executeDecisionAction(d, JarvisAccessibilityService.instance).summary
+            }
+            else -> "ERROR: live mode me '$name' tool nahi hai."
+        }
+        JarvisStateRepository.addLog("Live tool: $name -> ${result.take(200)}")
+        return result
+    }
     private var activeTaskJob: Job? = null
     // R2.2: the current turn's id for the on-device event log.
     private var currentTurnId: String = ""
@@ -552,6 +737,8 @@ class JarvisAgentEngine(
         activeTaskJob?.cancel()
         activeTaskJob = null
         clearTaskScopedState()
+        // R3.10: a cancelled task leaves no stale card behind.
+        JarvisStateRepository.clearTalkerCard()
         // 1.8.0: a job cancelled before its first "You" post must not
         // leave executorTurnAlreadyPosted set — the next turn's "You"
         // line would be wrongly skipped.
@@ -1560,6 +1747,10 @@ class JarvisAgentEngine(
         // Only DONE carries it; other statuses pass "".
         evidenceJson: String = ""
     ) {
+        // R3.10: the loop is over — the progress card goes away.
+        // This is the loop's outcome funnel; the guard below
+        // returns early for plain turns, so the clear sits first.
+        JarvisStateRepository.clearTalkerCard()
         val cmd = activeExecutorCommand ?: return
         if (status == ExecutorResultStatus.TIMEOUT) {
             executorTimedOut = true
@@ -1671,8 +1862,18 @@ class JarvisAgentEngine(
         activeTaskJob?.cancel()
         activeTaskJob = null
         clearTaskScopedState()
+        // R3.10: a superseded plain turn's card goes away; the
+        // Executor turn publishes its own progress card below.
+        JarvisStateRepository.clearTalkerCard()
         activeExecutorCommand = cmd
         executorTimedOut = false
+        JarvisStateRepository.setTalkerCard(
+            TalkerCard(
+                kind = TalkerCardKind.PROGRESS,
+                title = "Kaam kar raha hoon",
+                body = cmd.goal.take(200)
+            )
+        )
         executorWatchdogJob = scope.launch {
             delay(cmd.timeoutMs)
             if (talkerBus.isPending(cmd.id)) {
@@ -1735,6 +1936,16 @@ class JarvisAgentEngine(
      *  the pre-1.8.0 path for chat turns that miss the local reply. */
     private fun launchLoopTurn(goal: String, docContext: String, recallHitCount: Int) {
         val memoryContext = buildMemoryContext(goal, docContext, recallHitCount)
+        // R3.10: the task's progress card (replaces any doc card —
+        // the task is now the focus). Cleared by the loop's outcome
+        // funnel (reportExecutorOutcome) or by cancelActiveTask.
+        JarvisStateRepository.setTalkerCard(
+            TalkerCard(
+                kind = TalkerCardKind.PROGRESS,
+                title = "Kaam kar raha hoon",
+                body = goal.take(200)
+            )
+        )
         activeTaskJob?.cancel()
         activeTaskJob = scope.launch {
             runAutonomousLoop(goal, memoryContext)
@@ -1818,6 +2029,10 @@ class JarvisAgentEngine(
     internal fun planLlm(): LlmClient = llmClient
     internal fun planPrefs(): JarvisPreferences = prefs
     internal fun planContext(): Context = context
+
+    /** R3.4: true when the Browser tab is currently visible (the
+     *  JobEngine drives the active tab only then). */
+    internal fun isBrowserTabVisibleNow(): Boolean = isBrowserTabVisible?.invoke() == true
 
     // 1.11.0-PRO (self-extension, DESIGN §1): the loop lives inside
     // the Executor's single job — owned here like llmClient above,
@@ -2620,6 +2835,45 @@ class JarvisAgentEngine(
     /**
      * Entry point for any voice or text command from the user.
      */
+    /**
+     * R3.10: tap answer for the browser-approval card (Approve /
+     * Reject). Mirrors the voice-answer branch in handleUserCommand
+     * exactly: approve → record + open (external / show page /
+     * background load); reject → "Theek hai, page nahi khola."
+     * The tap IS the recorded approval (U8 phone-side record —
+     * no server route exists).
+     */
+    fun answerBrowserApproval(approved: Boolean) {
+        val url = pendingBrowserApprovalUrl ?: return
+        pendingBrowserApprovalUrl = null
+        JarvisStateRepository.clearTalkerCard()
+        if (!approved) {
+            pendingBrowserShowPage = false
+            scope.launch { speak("Theek hai, page nahi khola.") }
+            return
+        }
+        val openExternal = pendingBrowserOpenExternal
+        pendingBrowserOpenExternal = false
+        approvedBrowserUrls.add(url)
+        val showPage = pendingBrowserShowPage
+        pendingBrowserShowPage = false
+        activeTaskJob?.cancel()
+        activeTaskJob = scope.launch {
+            if (openExternal) {
+                val ok = JarvisAccessibilityService.instance?.openUrlOrDeepLink(url) ?: false
+                JarvisStateRepository.addChatMessage("Jarvis", "Link khola: $url (success=$ok)")
+            } else if (showPage && onShowBrowserPage != null) {
+                onShowBrowserPage?.invoke(url)
+                JarvisStateRepository.addChatMessage("Jarvis", "Page dikha raha hoon: $url")
+            } else {
+                val summary = executeBrowserLoad(url, speakSummary = true)
+                JarvisStateRepository.addLog(summary)
+            }
+            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Ready for next command")
+            speak("Aur kya karna hai?")
+        }
+    }
+
     fun handleUserCommand(rawCommand: String) {
         val trimmed = rawCommand.trim()
         if (trimmed.isEmpty()) return
@@ -2632,6 +2886,11 @@ class JarvisAgentEngine(
         // added or persisted — this is the single choke point for all
         // user commands, so no first-turn path can overwrite history.
         ensureChatRestored()
+
+        // R3.10: a new command starts with no card — the recall /
+        // loop / approval sites below publish fresh. (The pending
+        // browser approval below consumes the card with the answer.)
+        JarvisStateRepository.clearTalkerCard()
 
         // 1.4.4 startup guard: this is the single choke point for
         // ALL user commands (mic turn, typed text, wake word,
@@ -2682,6 +2941,16 @@ class JarvisAgentEngine(
                 pendingBrowserApprovalUrl = interruptedUrl
                 pendingBrowserShowPage = false
                 justSetInterrupted = true
+                // R3.10: the interrupted-browse question gets a card
+                // (the tap answer retries it, like the voice answer).
+                JarvisStateRepository.setTalkerCard(
+                    TalkerCard(
+                        kind = TalkerCardKind.APPROVAL,
+                        title = "Browsing ruk gaya — dobara koshish karun?",
+                        body = interruptedUrl,
+                        approvalUrl = interruptedUrl
+                    )
+                )
                 scope.launch { speak("Browsing ruk gaya, dobara koshish karun?") }
             }
         }
@@ -2766,6 +3035,18 @@ class JarvisAgentEngine(
             DocumentSearch.isRecallHit(it.score, it.titleMatched)
         }
         val docContext = DocumentText.buildDocContext(recallHits)
+        // R3.10: recalled docs get a card (the turn's doc source).
+        // A loop turn replaces it with its progress card.
+        if (recallHits.isNotEmpty()) {
+            JarvisStateRepository.setTalkerCard(
+                TalkerCard(
+                    kind = TalkerCardKind.DOC,
+                    title = "Yaad rakhe docs se",
+                    body = docContext.take(300),
+                    sourceLabel = "${recallHits.size} document mile"
+                )
+            )
+        }
         if (!isOnline() && tryDocumentRecall(effectiveGoal, docHits)) return
 
         // 1.8.0 Talker/Executor: the Talker classifies every turn
@@ -3814,6 +4095,20 @@ class JarvisAgentEngine(
                 val recentChat = JarvisStateRepository.chatHistory.value.takeLast(6).map {
                     "${it.sender}: ${it.message}"
                 }
+                // R3.1: live-screen OCR text rides with the node tree
+                // when the watch has a fresh, non-excluded frame —
+                // buttons the node tree misses (WebView / canvas /
+                // Flutter text) become visible to the planner.
+                // Excluded (sensitive) frames never reach the prompt.
+                val liveOcrText = liveWatcher()?.latestFrame
+                    ?.takeIf { !it.excluded && System.currentTimeMillis() - it.atMs < 3_000 }
+                    ?.text?.takeIf { it.isNotBlank() }
+                val screenTreeForPlanner = if (liveOcrText != null) {
+                    snapshot.formattedTree +
+                        "\n[Live screen OCR — screen par dikh raha text]\n$liveOcrText"
+                } else {
+                    snapshot.formattedTree
+                }
                 val recentNotifs = JarvisStateRepository.recentNotifications.value.takeLast(5).map {
                     "[${it.packageName}] ${it.title}: ${it.text}"
                 }
@@ -3834,7 +4129,7 @@ class JarvisAgentEngine(
                     answeredClarifications = answeredClarifications,
                     recentChat = recentChat,
                     recentNotifications = recentNotifs,
-                    screenTree = snapshot.formattedTree,
+                    screenTree = screenTreeForPlanner,
                     hasSensitivePaymentScreen = snapshot.hasSensitivePaymentPrompt,
                     isStuckWarning = isStuck,
                     screenImageBase64 = visionBase64,
@@ -4842,6 +5137,17 @@ class JarvisAgentEngine(
                         pendingBrowserApprovalUrl = url
                         pendingBrowserOpenExternal = true
                         pendingBrowserShowPage = false
+                        // R3.10: the "ye link kholun?" question gets a
+                        // card — Approve / Reject tap the same answer
+                        // as the voice reply.
+                        JarvisStateRepository.setTalkerCard(
+                            TalkerCard(
+                                kind = TalkerCardKind.APPROVAL,
+                                title = "Ye link kholun?",
+                                body = url,
+                                approvalUrl = url
+                            )
+                        )
                         speak("Ye link kholun? $url")
                         ActionResult(false, "OPEN_URL awaiting approval for '$url'")
                     } else {
@@ -4859,29 +5165,38 @@ class JarvisAgentEngine(
             }
 
             "TAP_NODE" -> {
-                val ok = acc?.tapNode(d.nodeId) ?: false
-                ActionResult(ok, "TAP_NODE(${d.nodeId}) -> success=$ok")
+                // R3.2 CFD: verify via live screen, 1 retry, then
+                // fail with the reason (loop decides / escalates).
+                tapActionWithVerify(acc, "TAP_NODE(${d.nodeId})", null) {
+                    acc?.tapNode(d.nodeId) ?: false
+                }
             }
 
             "TAP_XY" -> {
-                val ok = acc?.tapCoordinates(d.x, d.y) ?: false
-                ActionResult(ok, "TAP_XY(${d.x}, ${d.y}) -> success=$ok")
+                tapActionWithVerify(acc, "TAP_XY(${d.x}, ${d.y})", null) {
+                    acc?.tapCoordinates(d.x, d.y) ?: false
+                }
             }
 
             "LONG_PRESS_XY" -> {
-                val ok = acc?.longPressCoordinates(d.x, d.y) ?: false
-                ActionResult(ok, "LONG_PRESS_XY(${d.x}, ${d.y}) -> success=$ok")
+                tapActionWithVerify(acc, "LONG_PRESS_XY(${d.x}, ${d.y})", null) {
+                    acc?.longPressCoordinates(d.x, d.y) ?: false
+                }
             }
 
             "TYPE_TEXT" -> {
                 val nodeId = if (d.nodeId > 0) d.nodeId else null
-                val ok = acc?.typeText(nodeId, d.text, d.pressEnter) ?: false
-                ActionResult(ok, "TYPE_TEXT(node=$nodeId, text='${d.text}', enter=${d.pressEnter}) -> success=$ok")
+                // R3.2 CFD: verify = typed text now on screen
+                // (node tree or live OCR).
+                tapActionWithVerify(acc, "TYPE_TEXT(node=$nodeId, text='${d.text}', enter=${d.pressEnter})", d.text) {
+                    acc?.typeText(nodeId, d.text, d.pressEnter) ?: false
+                }
             }
 
             "SCROLL" -> {
-                val ok = acc?.scrollScreen(d.direction) ?: false
-                ActionResult(ok, "SCROLL(${d.direction}) -> success=$ok")
+                tapActionWithVerify(acc, "SCROLL(${d.direction})", null) {
+                    acc?.scrollScreen(d.direction) ?: false
+                }
             }
 
             "NAVIGATE" -> {
@@ -5004,6 +5319,17 @@ class JarvisAgentEngine(
                     if (kind == null) {
                         pendingBrowserApprovalUrl = url
                         pendingBrowserShowPage = d.browserShowPage
+                        // R3.10: the "ye page kholun?" question gets a
+                        // card — Approve / Reject tap the same answer
+                        // as the voice reply.
+                        JarvisStateRepository.setTalkerCard(
+                            TalkerCard(
+                                kind = TalkerCardKind.APPROVAL,
+                                title = "Ye page kholun?",
+                                body = url,
+                                approvalUrl = url
+                            )
+                        )
                         speak("Ye page kholun? $url")
                         ActionResult(false, "OPEN_BROWSER awaiting approval for '$url'")
                     } else if (d.browserShowPage) {

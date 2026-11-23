@@ -99,7 +99,15 @@ data class CaptchaAssistState(
     /** Auto-solve phase state for this challenge (DESIGN §7.2). */
     val autoSolveStatus: AutoSolveStatus = AutoSolveStatus.OFF,
     /** Auto-solve attempts used for this challenge (0 = never tried). */
-    val autoSolveAttempts: Int = 0
+    val autoSolveAttempts: Int = 0,
+    /**
+     * R3.7: the mapped hub challenge type for this challenge
+     * ("recaptcha_grid" / "hcaptcha_grid" / "text" / "slider" /
+     * "geetest" / "" when unmapped). Shown on the assist card so
+     * the user knows what was detected; slider/geetest are
+     * human-only (D3 lock — never auto-solved).
+     */
+    val challengeType: String = ""
 )
 
 // ---- 3c doc confirm (3b /confirm contract) ----
@@ -497,6 +505,49 @@ object JarvisStateRepository {
 
     fun bumpMemoryPushVersion() {
         _memoryPushVersion.value = _memoryPushVersion.value + 1
+    }
+
+    // ---- R3.10 Talker cards --------------------------------------
+    // One card at a time (last publish wins). The Talker (engine)
+    // publishes; the Command tab renders. Cleared when the loop
+    // exits (reportExecutorOutcome), the task is cancelled, a new
+    // command starts, or the answer is consumed.
+    private val _talkerCard = MutableStateFlow<TalkerCard?>(null)
+    val talkerCard: StateFlow<TalkerCard?> = _talkerCard.asStateFlow()
+
+    fun setTalkerCard(card: TalkerCard?) {
+        _talkerCard.value = card
+    }
+
+    fun clearTalkerCard() {
+        _talkerCard.value = null
+    }
+
+    // ---- R3.3 overlay → Trained tab action ---------------------------
+    // The overlay panel's ＋ Document / ＋ Photo / ＋ Link opens
+    // MainActivity on the Trained tab and asks it to launch the
+    // matching picker. One-shot: the Trained tab consumes + clears.
+    enum class OverlayAction { ADD_DOC, ADD_IMAGE, ADD_LINK }
+
+    private val _overlayAction = MutableStateFlow<OverlayAction?>(null)
+    val overlayAction: StateFlow<OverlayAction?> = _overlayAction.asStateFlow()
+
+    fun setOverlayAction(action: OverlayAction?) {
+        _overlayAction.value = action
+    }
+
+    // ---- R3.3/R3.9 intent-driven tab switch -------------------------
+    // A launch intent (overlay action / FCM tap) asks the app to
+    // show a tab. One-shot: JarvisMainApp consumes + clears.
+    private val _openTabRequest = MutableStateFlow<Int?>(null)
+    val openTabRequest: StateFlow<Int?> = _openTabRequest.asStateFlow()
+
+    fun requestOpenTab(tab: Int) {
+        _openTabRequest.value = tab
+    }
+
+    fun clearOpenTabRequest() {
+        _openTabRequest.value = null
     }
 
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())

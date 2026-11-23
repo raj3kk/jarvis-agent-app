@@ -80,6 +80,19 @@ class JarvisForegroundService : Service() {
         const val ACTION_STOP_TASK = "com.jarvis.autonomous.ACTION_STOP_TASK"
         const val ACTION_TEXT_COMMAND = "com.jarvis.autonomous.ACTION_TEXT_COMMAND"
         const val EXTRA_COMMAND_TEXT = "extra_command_text"
+        // R3.3: speak a plain line (overlay "Bolo" button) through
+        // the NORMAL speak path — no command execution, no task.
+        const val ACTION_SPEAK_TEXT = "com.jarvis.autonomous.ACTION_SPEAK_TEXT"
+        const val EXTRA_SPEAK_TEXT = "extra_speak_text"
+        // R3.9: FCM tap → Talker speaks the push (kind + text from
+        // the notification's tap intent, via MainActivity).
+        const val ACTION_SPEAK_FCM_PUSH = "com.jarvis.autonomous.ACTION_SPEAK_FCM_PUSH"
+        const val EXTRA_FCM_KIND = "extra_fcm_kind"
+        const val EXTRA_FCM_TEXT = "extra_fcm_text"
+        // R3.10: Talker-card Approve / Reject tap → the engine's
+        // browser-approval answer (the U8 phone-side record).
+        const val ACTION_ANSWER_BROWSER_APPROVAL = "com.jarvis.autonomous.ACTION_ANSWER_BROWSER_APPROVAL"
+        const val EXTRA_APPROVAL_GRANTED = "extra_approval_granted"
         const val ACTION_REFRESH_OVERLAY = "com.jarvis.autonomous.ACTION_REFRESH_OVERLAY"
         /** WAVE-2 (§A): foreground-entry re-qualification — MainActivity
          * onResume sends this so a background-downgraded service
@@ -714,7 +727,31 @@ class JarvisForegroundService : Service() {
             onStopTap = {
                 voiceManager.stopSpeaking("HUD stop")
                 agentEngine.cancelActiveTask("Stopped from Floating HUD.")
-            }
+            },
+            // R3.3: overlay panel callbacks. Text → the SAME
+            // text-command path as the Command-tab input (Live
+            // rejects it there). Speak → the plain speak path.
+            // Add doc/image/link → MainActivity on the Trained tab
+            // (the pickers run there, not in the overlay).
+            onTextSend = { text ->
+                startService(
+                    Intent(this, JarvisForegroundService::class.java).apply {
+                        action = ACTION_TEXT_COMMAND
+                        putExtra(EXTRA_COMMAND_TEXT, text)
+                    }
+                )
+            },
+            onSpeakText = { text ->
+                startService(
+                    Intent(this, JarvisForegroundService::class.java).apply {
+                        action = ACTION_SPEAK_TEXT
+                        putExtra(EXTRA_SPEAK_TEXT, text)
+                    }
+                )
+            },
+            onAddDoc = { openTrainedTab("add_doc") },
+            onAddImage = { openTrainedTab("add_image") },
+            onAddLink = { openTrainedTab("add_link") }
         )
 
         if (prefs.floatingOverlayEnabled) {
@@ -871,6 +908,50 @@ class JarvisForegroundService : Service() {
                         speakWrapped("Namaste, main Jarvis hoon. Awaaz test safal raha.", "test")
                     }
                 }
+            }
+            ACTION_SPEAK_TEXT -> {
+                // R3.3: overlay "Bolo" — speak only, never a
+                // command. Suppressed during Live (same as announces).
+                if (isLiveActive()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_SPEAK_SUPPRESSED",
+                        "Speak-text suppressed during Live."
+                    )
+                    return START_STICKY
+                }
+                val text = intent.getStringExtra(EXTRA_SPEAK_TEXT) ?: ""
+                if (text.isNotBlank()) {
+                    serviceScope.launch {
+                        runCatching { speakWrapped(text, "speak_text") }
+                    }
+                }
+            }
+            ACTION_SPEAK_FCM_PUSH -> {
+                // R3.9: FCM tap → Talker speaks what arrived
+                // ("<kind> aaya: <text>"). Suppressed during Live.
+                if (isLiveActive()) {
+                    JarvisStateRepository.addDiagnostic(
+                        "live", "LIVE_FCM_SPEAK_SUPPRESSED",
+                        "FCM push speak suppressed during Live."
+                    )
+                    return START_STICKY
+                }
+                val kind = intent.getStringExtra(EXTRA_FCM_KIND).orEmpty()
+                val text = intent.getStringExtra(EXTRA_FCM_TEXT).orEmpty()
+                if (text.isNotBlank()) {
+                    val line = if (kind.isNotBlank()) "$kind aaya: $text" else text
+                    JarvisStateRepository.addChatMessage("Jarvis", "📩 $line")
+                    serviceScope.launch {
+                        runCatching { speakWrapped(line, "fcm_push") }
+                    }
+                }
+            }
+            ACTION_ANSWER_BROWSER_APPROVAL -> {
+                // R3.10: Talker-card tap answer — the engine mirrors
+                // the voice-answer branch exactly (record + open, or
+                // decline). No-op when nothing is pending.
+                val granted = intent.getBooleanExtra(EXTRA_APPROVAL_GRANTED, false)
+                agentEngine?.answerBrowserApproval(granted)
             }
             ACTION_START_LISTENING -> {
                 // Always-on mic path (1.4.0): start once, stays on.
@@ -1273,6 +1354,20 @@ class JarvisForegroundService : Service() {
      * mic transition refreshes, so transient orderings
      * self-correct.
      */
+    /**
+     * R3.3: open MainActivity on the Trained tab with an overlay
+     * action (add_doc / add_image / add_link) — MainActivity routes
+     * it through the overlay-action flow and the Trained tab
+     * launches the picker for it.
+     */
+    private fun openTrainedTab(action: String) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(MainActivity.EXTRA_OVERLAY_ACTION, action)
+        }
+        runCatching { startActivity(intent) }
+    }
+
     private fun refreshForegroundTypes() {
         // 1.4.10 (Step 5): change-only marker — refresh runs on
         // EVERY mic transition, so an every-call marker would
@@ -1306,7 +1401,7 @@ class JarvisForegroundService : Service() {
         override fun onSetupComplete() {
             JarvisStateRepository.addDiagnostic(
                 "live", "LIVE_STARTED",
-                "Live session ready (model gemini-2.5-flash-native-audio-dialog) — conversation only, no phone actions."
+                "Live session ready (model gemini-2.5-flash-native-audio-dialog) — 6 live tools available (http_check, gmail_read, drive_read, set_torch, set_volume, media_control)."
             )
             serviceScope.launch {
                 startLiveCapture()
@@ -1337,9 +1432,18 @@ class JarvisForegroundService : Service() {
             interruptLivePlayback()
         }
 
-        override fun onToolCallDropped() {
-            // Session already logged LIVE_TOOLCALL_DROPPED;
-            // nothing to answer, session continues.
+        override fun onToolCall(callId: String, name: String, argsJson: String) {
+            // R3.6: dispatch through the engine (gate-checked) and
+            // answer EVERY call with a function response — even a
+            // refusal, or the model's turn stalls. Runs in the
+            // service scope; the session continues on the response.
+            serviceScope.launch {
+                val session = liveSession ?: return@launch
+                val result = runCatching {
+                    agentEngine?.executeLiveTool(name, argsJson)
+                }.getOrNull() ?: "ERROR: engine available nahi hai."
+                session.sendFunctionResponse(callId, name, result)
+            }
         }
 
         override fun onEnded(kind: GeminiLiveSession.EndKind) {

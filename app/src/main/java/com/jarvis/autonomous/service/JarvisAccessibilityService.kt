@@ -698,10 +698,15 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Captures a live compressed JPEG screenshot (Base64) on Android 11+ (API 30+)
-     * so Multimodal AI Vision (Gemini) can see photos, memes, custom game/Flutter UIs, or WebViews.
+     * R3.1: Bitmap-returning screenshot (API 30+), shared by the
+     * Base64 vision path below and by LiveScreenWatcher (ML Kit OCR
+     * needs a Bitmap, not a JPEG string). The caller OWNS the
+     * returned bitmap and must recycle() it. Max dimension 720 px —
+     * enough for OCR, small enough for a 1–2 s still cadence.
+     * Returns null on API < 30, on capture failure, or when the
+     * AccessibilityService is not the active service.
      */
-    suspend fun captureScreenshotBase64(): String? {
+    suspend fun captureScreenshotBitmap(): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         return suspendCancellableCoroutine { cont ->
             runCatching {
@@ -732,14 +737,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                                     true
                                 )
                                 if (scaled != softBitmap) softBitmap.recycle()
-
-                                val baos = ByteArrayOutputStream()
-                                scaled.compress(Bitmap.CompressFormat.JPEG, 62, baos)
-                                scaled.recycle()
-
-                                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                                JarvisStateRepository.addLog("Captured live screen vision frame (${b64.length / 1024} KB)")
-                                if (cont.isActive) cont.resume(b64)
+                                if (cont.isActive) cont.resume(scaled)
                             }.onFailure {
                                 if (cont.isActive) cont.resume(null)
                             }
@@ -754,6 +752,24 @@ class JarvisAccessibilityService : AccessibilityService() {
                 if (cont.isActive) cont.resume(null)
             }
         }
+    }
+
+    /**
+     * Captures a live compressed JPEG screenshot (Base64) on Android 11+ (API 30+)
+     * so Multimodal AI Vision (Gemini) can see photos, memes, custom game/Flutter UIs, or WebViews.
+     */
+    suspend fun captureScreenshotBase64(): String? {
+        val bitmap = captureScreenshotBitmap() ?: return null
+        return runCatching {
+            val baos = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 62, baos)
+            bitmap.recycle()
+            val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+            JarvisStateRepository.addLog("Captured live screen vision frame (${b64.length / 1024} KB)")
+            b64
+        }.onFailure {
+            runCatching { bitmap.recycle() }
+        }.getOrNull()
     }
 
     /**

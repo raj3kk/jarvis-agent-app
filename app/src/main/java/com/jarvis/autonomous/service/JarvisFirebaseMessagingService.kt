@@ -62,8 +62,14 @@ class JarvisFirebaseMessagingService : FirebaseMessagingService() {
                     NotificationChannel(CHANNEL_ID, "Jarvis", NotificationManager.IMPORTANCE_HIGH)
                 )
             }
+            // R3.9: the tap intent carries the push payload
+            // (kind + text) so MainActivity can hand it to the FGS
+            // and the Talker speaks what arrived. The kind defaults
+            // to "Push" when the payload has none.
             val intent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(MainActivity.EXTRA_FCM_KIND, payload.kind.ifBlank { "Push" })
+                putExtra(MainActivity.EXTRA_FCM_TEXT, payload.body)
             }
             val pi = PendingIntent.getActivity(
                 this,

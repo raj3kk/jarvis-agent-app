@@ -85,10 +85,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=52, previous delivered 1.16.0)"
+          echo "versionCode in tree: $VC (floor PREV_VC=53, previous delivered 1.17.0)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=52
+          PREV_VC=53
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1

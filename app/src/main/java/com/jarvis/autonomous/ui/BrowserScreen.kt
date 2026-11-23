@@ -24,7 +24,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Toast
+import wendu.dsbridge.DWebView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -43,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,6 +63,7 @@ import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import com.jarvis.autonomous.browser.JarvisBrowserFileHost
 import com.jarvis.autonomous.browser.JarvisBrowserSetup
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AutoSolveStatus
@@ -452,26 +454,121 @@ data class ForegroundCallbacks(
 /**
  * Retained, headless-capable browser engine.
  *
- * HOSTING (refinement spec): a single WebView instance owned by this
- * singleton — NOT by any Compose tab. It is created lazily with the
- * application context, survives tab switches and tab disposal, and is
- * destroyed only by an explicit [destroy] call at app shutdown. The
- * foreground tab borrows the same instance through AndroidView (and
- * returns it without destroying it in onRelease), which is exactly how
- * mode (b) shows an already-loaded page without reloading.
+ * HOSTING (refinement spec, R3.4 tabs): one DWebView instance per
+ * tab, owned by this singleton — NOT by any Compose tab. Tab
+ * WebViews are created lazily with the application context,
+ * survive tab switches and tab disposal, and are destroyed only by
+ * [closeTab] or an explicit [destroy] call at app shutdown. The
+ * foreground tab borrows the ACTIVE tab's instance through
+ * AndroidView (and returns it without destroying it in onRelease),
+ * which is exactly how mode (b) shows an already-loaded page
+ * without reloading.
  *
- * Single-instance trade-off (honest limitation, see notes §11): there
- * is only ONE page at a time. A background browse navigates the shared
- * WebView away from whatever the foreground tab is showing. The engine
- * must therefore only background-browse when the Browser tab is not
- * currently visible, or tell the user the visible page will change.
+ * Multi-tab trade-off (honest limitation, see notes §11): a
+ * background browse drives the ACTIVE tab's WebView, so it
+ * navigates the visible page away. The engine must therefore only
+ * background-browse when the Browser tab is not currently visible,
+ * or tell the user the visible page will change. Foreground jobs
+ * (JobEngine with the active tab) are the exception by design —
+ * the user watches Jarvis work live in the Browser tab.
  */
 object JarvisBackgroundBrowser {
 
     private const val PREFS_NAME = "jarvis_browser_pending"
     private const val KEY_PENDING_URL = "pending_url"
 
-    private var sharedWebView: WebView? = null
+    // -- R3.4: browser tabs (max 5) -------------------------------------
+    // Each tab owns its own DWebView (a WebView subclass — the
+    // foreground tab AND the JobEngine drive the ACTIVE tab through
+    // the same DWebView, so the user watches Jarvis work live in
+    // the Browser tab). Tabs are created on demand, destroyed on
+    // close (WebView.destroy()), and never survive app shutdown.
+    // The old single `sharedWebView` is now tab 0 of this registry;
+    // obtainWebView() still returns the ACTIVE tab's WebView, so
+    // every existing caller (browse(), recheckCaptcha(),
+    // JarvisWebView, Projects preview) keeps working unchanged.
+    // RAM note (honest): each WebView holds its own renderer
+    // process memory; the cap of 5 bounds it. Per-tab RAM is not
+    // measurable from the app — the U7 diagnostics RAM sample
+    // (whole-process) is the only number; a 5-tab session that
+    // feels heavy is a phone-test observation (O-T10).
+    data class BrowserTab(val id: String, val webView: DWebView)
+
+    const val MAX_TABS = 5
+
+    private val tabs = mutableListOf<BrowserTab>()
+    private var activeTabId: String? = null
+
+    /** Bumped on every tab add/close/switch so the tab strip recomposes. */
+    var tabsVersion by mutableStateOf(0)
+        private set
+
+    /** The ACTIVE tab's current URL (null when no tab). */
+    fun activeTabUrl(): String? =
+        tabs.firstOrNull { it.id == activeTabId }?.webView?.url
+
+    /** Snapshot of the tabs (id + live WebView; url/title read live from the WebView). */
+    fun listTabs(): List<BrowserTab> = tabs.toList()
+
+    fun activeTabId(): String? = activeTabId
+
+    /** The ACTIVE tab's DWebView (null when no tab exists yet). */
+    fun activeTabDWebView(context: Context): DWebView? {
+        if (tabs.isEmpty()) return null
+        return activeTab(context).webView
+    }
+
+    private fun activeTab(context: Context): BrowserTab {
+        val current = tabs.firstOrNull { it.id == activeTabId }
+        if (current != null) return current
+        val first = tabs.firstOrNull()
+        if (first != null) {
+            activeTabId = first.id
+            return first
+        }
+        return newTab(context)!!
+    }
+
+    /**
+     * Open a new tab (returns null at the cap of 5 — the caller
+     * shows "5 tabs max, pehle ek band karo"). The new tab becomes
+     * active. The tab starts blank (Google on first load, same as
+     * the old single-tab behaviour in JarvisWebView).
+     */
+    fun newTab(context: Context): BrowserTab? {
+        if (tabs.size >= MAX_TABS) return null
+        val tab = BrowserTab(
+            id = "tab-" + System.currentTimeMillis() + "-" + tabs.size,
+            webView = createTabWebView(context.applicationContext)
+        )
+        tabs.add(tab)
+        activeTabId = tab.id
+        tabsVersion++
+        return tab
+    }
+
+    /** Close a tab: destroy its WebView, activate a neighbour. */
+    fun closeTab(tabId: String) {
+        val idx = tabs.indexOfFirst { it.id == tabId }
+        if (idx < 0) return
+        val tab = tabs.removeAt(idx)
+        runCatching { tab.webView.stopLoading() }
+        runCatching { tab.webView.destroy() }
+        if (activeTabId == tabId) {
+            activeTabId = tabs.getOrNull((idx - 1).coerceAtLeast(0))?.id
+                ?: tabs.firstOrNull()?.id
+        }
+        tabsVersion++
+    }
+
+    /** Switch the active tab (no-op for an unknown id). */
+    fun switchTab(tabId: String) {
+        if (tabs.none { it.id == tabId }) return
+        if (activeTabId != tabId) {
+            activeTabId = tabId
+            tabsVersion++
+        }
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var foregroundCallbacks: ForegroundCallbacks? = null
     private var pendingExtraction: PendingExtraction? = null
@@ -515,6 +612,8 @@ object JarvisBackgroundBrowser {
         if(q('iframe[src*="challenges.cloudflare.com"],[class*="cf-turnstile"]'))return 'turnstile';
         if(q('iframe[src*="recaptcha"],.g-recaptcha'))return 'recaptcha';
         if(q('iframe[src*="hcaptcha"],.h-captcha'))return 'hcaptcha';
+        if(q('iframe[src*="geetest"],[class*="geetest"]'))return 'geetest';
+        if(q('[class*="slider-captcha"],[class*="slide-verify"],[class*="captcha-slider"],[id*="slider-captcha"]'))return 'slider';
         if(q('img[src*="captcha"],input[name*="captcha"],input[id*="captcha"]'))return 'text';
         if(q('[data-sitekey]'))return 'unknown';return 'none';})()
     """.trimIndent()
@@ -529,7 +628,11 @@ object JarvisBackgroundBrowser {
     private suspend fun checkCaptcha(webView: WebView, url: String): String {
         val raw = runCatching { evaluateJs(webView, CAPTCHA_CHECK_JS, url) }.getOrDefault("")
         val hit = raw.trim().lowercase()
-        return if (hit in setOf("turnstile", "recaptcha", "hcaptcha", "unknown")) hit else "none"
+        // R3.7: slider + geetest are detected (human-assist only,
+        // D3 lock — never auto-solved). 'text' is NOT in the set:
+        // a text captcha with no "captcha" marker is not detected
+        // (pre-existing gap, out of R3 scope).
+        return if (hit in setOf("turnstile", "recaptcha", "hcaptcha", "slider", "geetest", "unknown")) hit else "none"
     }
 
     /** WebView -> Base64 PNG, <=200KB (downscale until it fits, then
@@ -653,7 +756,11 @@ object JarvisBackgroundBrowser {
                 screenshotB64 = screenshotB64, receivedAtMs = System.currentTimeMillis(),
                 status = CaptchaStatus.ACTIVE, source = CaptchaSource.LOCAL_WEBVIEW, assistCount = 1,
                 autoSolveStatus = if (autoOutcome == null) AutoSolveStatus.OFF else AutoSolveStatus.FAILED,
-                autoSolveAttempts = autoOutcome?.attempts ?: 0
+                autoSolveAttempts = autoOutcome?.attempts ?: 0,
+                // R3.7: the mapped hub type flows to the card so the
+                // user sees what was detected (slider/geetest show
+                // as human-only; auto-solve never ran for them).
+                challengeType = challengeType ?: ""
             )
         )
         captchaWaiting[url] = CaptchaWait(taskId = taskId, site = site, taskName = taskName, url = url)
@@ -701,7 +808,7 @@ object JarvisBackgroundBrowser {
                 receivedAtMs = System.currentTimeMillis(),
                 status = CaptchaStatus.SOLVING, source = CaptchaSource.LOCAL_WEBVIEW,
                 assistCount = 1, autoSolveStatus = AutoSolveStatus.TRYING,
-                autoSolveAttempts = 1
+                autoSolveAttempts = 1, challengeType = challengeType
             )
         )
         val result = withTimeoutOrNull(CaptchaSolvePolicy.PHASE_BUDGET_MS) {
@@ -888,15 +995,27 @@ object JarvisBackgroundBrowser {
     }
 
     /**
-     * Returns the shared WebView, creating it (with the safe settings
-     * below) on first use. Callers must NEVER destroy this instance on
-     * tab dispose — use [destroy] only at app shutdown, on Main.
+     * Returns the ACTIVE tab's WebView, creating tab 0 on first use.
+     * Callers must NEVER destroy this instance on tab dispose — use
+     * [closeTab] for a tab and [destroy] only at app shutdown, on Main.
+     * (R3.4: was the single shared WebView; now the active tab of
+     * the registry — same contract, same callers.)
+     */
+    fun obtainWebView(context: Context): WebView {
+        return activeTab(context).webView
+    }
+
+    /**
+     * R3.4: build one tab's DWebView with the safe settings below.
+     * DWebView IS a WebView (wendu.dsbridge) — every WebView API and
+     * client works unchanged; the DSBridge is only attached when the
+     * JobEngine drives this tab (foreground jobs). No
+     * addJavascriptInterface is ever added here, so page JS cannot
+     * call into the app on its own.
      */
     @SuppressLint("SetJavaScriptEnabled")
-    fun obtainWebView(context: Context): WebView {
-        sharedWebView?.let { return it }
-        val appContext = context.applicationContext
-        val created = WebView(appContext).apply {
+    private fun createTabWebView(appContext: Context): DWebView {
+        val created = DWebView(appContext).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -938,25 +1057,24 @@ object JarvisBackgroundBrowser {
             JarvisBrowserSetup.applyDesktopMode(this)
             webViewClient = SharedWebViewClient()
             webChromeClient = SharedWebChromeClient()
-            // Downloads are disabled: tapping a download does nothing
-            // except this note — no file ever lands on the phone.
-            setDownloadListener { _, _, _, _, _ ->
-                Toast.makeText(
-                    appContext,
-                    "Download is browser me band hai.",
-                    Toast.LENGTH_SHORT
-                ).show()
+            // R3.5: downloads are handled by JarvisBrowserFileHost
+            // (DownloadManager → Downloads/Jarvis/). The listener is
+            // set per tab here so every tab downloads the same way.
+            setDownloadListener { url, userAgent, contentDisposition, mimeType, contentLength ->
+                JarvisBrowserFileHost.download(appContext, url, userAgent, contentDisposition, mimeType, contentLength)
             }
         }
-        sharedWebView = created
         return created
     }
 
     /** App-shutdown only. NEVER call from tab dispose / onRelease. */
     fun destroy() {
-        runCatching { sharedWebView?.stopLoading() }
-        runCatching { sharedWebView?.destroy() }
-        sharedWebView = null
+        for (tab in tabs.toList()) {
+            runCatching { tab.webView.stopLoading() }
+            runCatching { tab.webView.destroy() }
+        }
+        tabs.clear()
+        activeTabId = null
         foregroundCallbacks = null
         pendingExtraction = null
     }
@@ -1414,6 +1532,22 @@ object JarvisBackgroundBrowser {
             filePathCallback: ValueCallback<Array<Uri>>?,
             fileChooserParams: FileChooserParams?
         ): Boolean {
+            // R3.5: the foreground host (MainActivity) owns the
+            // system picker — a WebView on the application context
+            // cannot launch one itself.
+            val host = JarvisBrowserFileHost.fileChooserHost
+            if (host != null && host.openChooser(filePathCallback, fileChooserParams)) {
+                return true
+            }
+            // No foreground host (background/headless): fall back to
+            // a file the user pre-supplied via the bridge (Trained
+            // tab / JobEngine upload step); otherwise cancel and the
+            // user picks the file in the app instead.
+            val pending = JarvisUploadBridge.takePendingUri()
+            if (pending != null) {
+                filePathCallback?.onReceiveValue(arrayOf(pending))
+                return true
+            }
             filePathCallback?.onReceiveValue(null)
             return true
         }
@@ -1494,7 +1628,15 @@ fun JarvisWebView(
     onProgress: (Int) -> Unit = {},
     onUrlChanged: (String) -> Unit = {},
     onError: (String) -> Unit = {},
-    onWebViewReady: (WebView) -> Unit = {}
+    onWebViewReady: (WebView) -> Unit = {},
+    /**
+     * R3.4: re-key the hosted WebView when this changes (the Browser
+     * tab passes the active tab id — switching tabs disposes this
+     * AndroidView and the factory hosts the new active tab's
+     * WebView, without reloading it). Callers that share one
+     * WebView (Projects preview) leave it "".
+     */
+    tabKey: String = ""
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val holder = remember { arrayOfNulls<WebView>(1) }
@@ -1522,9 +1664,13 @@ fun JarvisWebView(
         }
     }
 
-    AndroidView(
-        factory = { ctx ->
-            val shared = JarvisBackgroundBrowser.obtainWebView(ctx)
+    // R3.4: keyed on tabKey — a tab switch disposes this AndroidView
+    // and the factory hosts the new active tab's WebView (the old
+    // tab's WebView stays alive in the registry, unloaded).
+    key(tabKey) {
+        AndroidView(
+            factory = { ctx ->
+                val shared = JarvisBackgroundBrowser.obtainWebView(ctx)
             (shared.parent as? ViewGroup)?.removeView(shared)
             // 1.4.7 (C): a truly fresh tab (no target, WebView never
             // loaded) opens on Google — the old blank tab loaded
@@ -1565,6 +1711,7 @@ fun JarvisWebView(
         },
         modifier = modifier.background(Color.White)
     )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,6 +1826,67 @@ private fun WebViewBrowserScreen(
             fontSize = 12.sp,
             color = Color(0xFF8A7A70)
         )
+
+        // R3.4: tab strip (max 5). Chip = switch to that tab; × =
+        // close it; + = new tab. The chip label is the tab's live
+        // title (or host); the active tab gets a ● prefix. The
+        // WebView below re-keys on the active tab id, so switching
+        // swaps the hosted WebView without reloading the page.
+        val tabsVersion = JarvisBackgroundBrowser.tabsVersion
+        val browserTabs = remember(tabsVersion) { JarvisBackgroundBrowser.listTabs() }
+        val activeTabId = JarvisBackgroundBrowser.activeTabId()
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            for (tab in browserTabs) {
+                val label = (tab.webView.title?.takeIf { it.isNotBlank() }
+                    ?: tab.webView.url?.let { hostOfUrl(it) }
+                    ?: "Naya tab").take(14)
+                val isActive = tab.id == activeTabId
+                OutlinedButton(
+                    onClick = {
+                        JarvisBackgroundBrowser.switchTab(tab.id)
+                        val shown = tab.webView.url
+                        if (!shown.isNullOrBlank()) {
+                            currentUrl = shown
+                            urlInput = shown
+                        }
+                    }
+                ) {
+                    Text(
+                        (if (isActive) "● " else "") + label,
+                        fontSize = 11.sp
+                    )
+                }
+                if (browserTabs.size > 1) {
+                    OutlinedButton(
+                        onClick = {
+                            JarvisBackgroundBrowser.closeTab(tab.id)
+                            val shown = JarvisBackgroundBrowser.activeTabUrl()
+                            currentUrl = shown ?: ""
+                            urlInput = shown ?: ""
+                        }
+                    ) {
+                        Text("×", fontSize = 11.sp)
+                    }
+                }
+            }
+            OutlinedButton(
+                onClick = {
+                    val created = JarvisBackgroundBrowser.newTab(context)
+                    if (created == null) {
+                        statusMessage = "5 tabs max — pehle ek tab band karo."
+                    } else {
+                        currentUrl = ""
+                        urlInput = ""
+                        statusMessage = ""
+                    }
+                }
+            ) {
+                Text("+", fontSize = 14.sp)
+            }
+        }
 
         // URL bar: editable, bare domains get https:// by default.
         Row(
@@ -1821,8 +2029,11 @@ private fun WebViewBrowserScreen(
         // mechanism for mode (b), for "Open in Browser", and for tab
         // returns. Back/forward enablement refreshes from the URL
         // callback and after each navigation button press below.
+        // R3.4: tabKey = active tab id — switching tabs re-keys the
+        // hosted WebView to the new active tab.
         JarvisWebView(
             targetUrl = currentUrl,
+            tabKey = activeTabId ?: "",
             onTitle = { pageTitle = it },
             onProgress = { progress = it },
             onUrlChanged = { arrived ->

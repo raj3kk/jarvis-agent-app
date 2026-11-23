@@ -214,4 +214,31 @@ class CaptchaSolvePolicyTest {
         assertTrue(line.contains("deadbeef"))
         assertEquals(CaptchaSolveLogFormat.MAX_ENTRIES, 100)
     }
+
+    // ---- R3.7: slider / GeeTest are DETECTED but NEVER auto-solved (D3 lock) ----
+
+    @Test
+    fun sliderAndGeetest_detectedButNeverAutoSolvable() {
+        assertEquals("slider", CaptchaSolvePolicy.challengeTypeForDetected("slider"))
+        assertEquals("geetest", CaptchaSolvePolicy.challengeTypeForDetected("geetest"))
+        assertFalse(CaptchaSolvePolicy.isAutoSolvableType("slider"))
+        assertFalse(CaptchaSolvePolicy.isAutoSolvableType("geetest"))
+        assertFalse(CaptchaSolvePolicy.isAutoSolvableType(CaptchaSolvePolicy.TYPE_SLIDER))
+        assertFalse(CaptchaSolvePolicy.isAutoSolvableType(CaptchaSolvePolicy.TYPE_GEETEST))
+    }
+
+    @Test
+    fun sliderAndGeetest_shouldAutoSolve_isAlwaysFalse() {
+        assertFalse(CaptchaSolvePolicy.shouldAutoSolve(true, "slider", 0, false))
+        assertFalse(CaptchaSolvePolicy.shouldAutoSolve(true, "geetest", 0, false))
+        assertFalse(CaptchaSolvePolicy.shouldAutoSolve(true, CaptchaSolvePolicy.TYPE_SLIDER, 0, false))
+        assertFalse(CaptchaSolvePolicy.shouldAutoSolve(true, CaptchaSolvePolicy.TYPE_GEETEST, 0, false))
+    }
+
+    @Test
+    fun turnstile_stillUnmapped_humanOnly() {
+        assertNull(CaptchaSolvePolicy.challengeTypeForDetected("turnstile"))
+        assertFalse(CaptchaSolvePolicy.isAutoSolvableType("turnstile"))
+    }
+
 }

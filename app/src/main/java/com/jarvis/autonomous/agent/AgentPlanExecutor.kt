@@ -1,6 +1,7 @@
 package com.jarvis.autonomous.agent
 
 import com.jarvis.autonomous.browser.JarvisJobEngine
+import com.jarvis.autonomous.ui.JarvisBackgroundBrowser
 import com.jarvis.autonomous.data.AgentPlan
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
@@ -984,6 +985,40 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     }
 
     /**
+     * R3.6: run ONE registry tool from Live mode (Gemini Live
+     * function call). The kind is gate-checked through ToolRegistry:
+     * only GateLevel.SAFE executes here; CONFIRM / SENSITIVE kinds
+     * are REFUSED with an error string (PARK — same as the R1
+     * no-step rule; the 5 hard gates never run from live mode).
+     * The step is synthetic (no plan, no persistence — the result
+     * goes back to the model as the function response, and the
+     * engine logs one line). Returns evidence on success, or an
+     * "ERROR: ..." string the model can speak.
+     */
+    suspend fun executeLiveTool(kind: String, detail: String): String {
+        val tool = ToolRegistry.resolve(kind)
+            ?: return "ERROR: unknown tool '$kind'"
+        if (tool.gate != ToolRegistry.GateLevel.SAFE) {
+            return "ERROR: '$kind' live mode se nahi chal sakta (gate: ${tool.gate}) — iske liye normal command do."
+        }
+        val step = PlanStep(
+            id = "live-${System.currentTimeMillis()}",
+            kind = kind, title = "live:$kind", detail = detail
+        )
+        return when (val outcome = when (kind) {
+            "HTTP_CHECK" -> executeHttpCheck(step)
+            "GMAIL_READ" -> executeGmailRead(step)
+            "DRIVE_READ" -> executeDriveRead(step)
+            else -> StepOutcome.Failed("Unknown kaam kind: $kind (T-NO-HANDLER)")
+        }) {
+            is StepOutcome.Done -> outcome.evidence
+            is StepOutcome.Failed -> "ERROR: ${outcome.reason}"
+            is StepOutcome.Blocked -> "ERROR (blocked): ${outcome.reason}"
+            is StepOutcome.Aborted -> "ERROR: aborted"
+        }
+    }
+
+    /**
      * R2.2 + R2.7: one executed step -> one trajectory line (tool +
      * outcome + verdict, no args/content) and one event-log line
      * (kind + result + verdict + short screen meaning, sanitised).
@@ -1692,7 +1727,18 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }
         return try {
             val jobEngine = JarvisJobEngine(engine.planContext())
-            val result = jobEngine.run(job)
+            // R3.4: when the Browser tab is VISIBLE, the JobEngine
+            // drives the ACTIVE tab's DWebView — the user watches
+            // Jarvis work live in the Browser tab. When the tab is
+            // NOT visible, the JobEngine stays headless (its own
+            // DWebView) so a background job never hijacks the page
+            // the user is reading (R0 no-hijack guarantee).
+            val external = if (engine.isBrowserTabVisibleNow()) {
+                JarvisBackgroundBrowser.activeTabDWebView(engine.planContext())
+            } else {
+                null
+            }
+            val result = jobEngine.run(job, externalWebView = external)
             val finalUrl = result.optString("finalUrl", "")
             val extract = result.optJSONObject("extract")?.toString()?.take(300) ?: ""
             StepOutcome.Done(

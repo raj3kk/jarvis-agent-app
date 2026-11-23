@@ -15,6 +15,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import com.jarvis.autonomous.browser.JarvisBrowserFileHost
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -171,8 +174,81 @@ private val JarvisColorScheme = lightColorScheme(
 
 class MainActivity : ComponentActivity() {
 
+    // R3.5: browser file-chooser host — the in-app WebView runs on
+    // the application context and cannot launch a picker itself, so
+    // MainActivity owns the system pickers and delivers the result
+    // to the WebView's ValueCallback. Single file (GetContent) or
+    // multiple (OpenMultipleDocuments) per the chooser params.
+    private var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    private val pickBrowserSingleFile = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        val cb = pendingFileChooserCallback
+        pendingFileChooserCallback = null
+        cb?.onReceiveValue(if (uri != null) arrayOf(uri) else null)
+    }
+
+    private val pickBrowserMultipleFiles = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        val cb = pendingFileChooserCallback
+        pendingFileChooserCallback = null
+        cb?.onReceiveValue(uris.toTypedArray())
+    }
+
+    companion object {
+        /** R3.3: overlay panel action (add_doc / add_image / add_link). */
+        const val EXTRA_OVERLAY_ACTION = "extra_overlay_action"
+        /** R3.9: FCM tap payload (kind + text) — Talker speaks it. */
+        const val EXTRA_FCM_KIND = "extra_fcm_kind"
+        const val EXTRA_FCM_TEXT = "extra_fcm_text"
+    }
+
+    /**
+     * R3.3/R3.9: handle a launch intent (onCreate + onNewIntent).
+     * Overlay action → Trained tab (9) + the overlay-action flow
+     * (the Trained tab launches the picker). FCM tap → forward the
+     * payload to the FGS, which makes the Talker speak it.
+     */
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent == null) return
+        when (intent.getStringExtra(EXTRA_OVERLAY_ACTION)) {
+            "add_doc" -> {
+                JarvisStateRepository.setOverlayAction(JarvisStateRepository.OverlayAction.ADD_DOC)
+                JarvisStateRepository.requestOpenTab(9)
+            }
+            "add_image" -> {
+                JarvisStateRepository.setOverlayAction(JarvisStateRepository.OverlayAction.ADD_IMAGE)
+                JarvisStateRepository.requestOpenTab(9)
+            }
+            "add_link" -> {
+                JarvisStateRepository.setOverlayAction(JarvisStateRepository.OverlayAction.ADD_LINK)
+                JarvisStateRepository.requestOpenTab(9)
+            }
+        }
+        val fcmText = intent.getStringExtra(EXTRA_FCM_TEXT).orEmpty()
+        if (fcmText.isNotBlank()) {
+            val fcmKind = intent.getStringExtra(EXTRA_FCM_KIND).orEmpty()
+            val speak = Intent(this, JarvisForegroundService::class.java).apply {
+                action = JarvisForegroundService.ACTION_SPEAK_FCM_PUSH
+                putExtra(JarvisForegroundService.EXTRA_FCM_KIND, fcmKind)
+                putExtra(JarvisForegroundService.EXTRA_FCM_TEXT, fcmText)
+            }
+            startServiceCompat(speak)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // R3.3/R3.9: overlay action / FCM tap on the launch intent.
+        handleLaunchIntent(intent)
         // 1.4.4 launch-bounce catcher: FIRST line — a launcher tap
         // writes this before ANY service/greeting/composition work,
         // so a bounce that kills the process mid-startup still
@@ -257,6 +333,20 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }.start()
+        // R3.5: register this Activity as the browser's file-chooser
+        // host (see the fields above). Cleared in onDestroy.
+        JarvisBrowserFileHost.fileChooserHost = JarvisBrowserFileHost.FileChooserHost { cb, params ->
+            pendingFileChooserCallback = cb
+            val multiple = params?.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+            runCatching {
+                if (multiple) {
+                    pickBrowserMultipleFiles.launch(arrayOf("*/*"))
+                } else {
+                    pickBrowserSingleFile.launch("*/*")
+                }
+                true
+            }.getOrDefault(false)
+        }
         startJarvisBackgroundService()
         // 1.4.18: startup greeting REMOVED — no greeting speak
         // and no greeting chat line; the service starts the
@@ -320,6 +410,12 @@ class MainActivity : ComponentActivity() {
             "nav", "LIFE_DESTROY",
             "MainActivity destroyed (isFinishing=$isFinishing)."
         )
+        // R3.5: the browser chooser host dies with this Activity.
+        if (JarvisBrowserFileHost.fileChooserHost != null) {
+            JarvisBrowserFileHost.fileChooserHost = null
+        }
+        pendingFileChooserCallback?.onReceiveValue(null)
+        pendingFileChooserCallback = null
         super.onDestroy()
     }
 
@@ -369,6 +465,15 @@ fun JarvisMainApp(
                 "launch", "LAUNCH_UI", "First UI composition shown."
             )
         }
+    }
+
+    // R3.3/R3.9: intent-driven tab switch (overlay action / FCM
+    // tap). One-shot: consumed + cleared here.
+    val openTabRequest by JarvisStateRepository.openTabRequest.collectAsState()
+    LaunchedEffect(openTabRequest) {
+        val tab = openTabRequest ?: return@LaunchedEffect
+        selectedTab = tab
+        JarvisStateRepository.clearOpenTabRequest()
     }
 
     // 1.4.0 wiring: ONE shared browser host for Browser + Projects tabs.
@@ -830,6 +935,32 @@ fun CommandCenterScreen(
         val uiScope = rememberCoroutineScope()
         val captchaAssist by JarvisStateRepository.captchaAssist.collectAsState()
         val docConfirm by JarvisStateRepository.docConfirm.collectAsState()
+        // R3.10: the Talker card (progress / approval / doc) sits
+        // above the captcha + doc cards — it is the Talker's live
+        // state for this turn. Approve / Reject go to the FGS,
+        // which hands the tap answer to the engine.
+        val talkerCard by JarvisStateRepository.talkerCard.collectAsState()
+        if (talkerCard != null) {
+            TalkerCardView(
+                card = talkerCard!!,
+                onApprove = {
+                    context.startService(
+                        Intent(context, JarvisForegroundService::class.java).apply {
+                            action = JarvisForegroundService.ACTION_ANSWER_BROWSER_APPROVAL
+                            putExtra(JarvisForegroundService.EXTRA_APPROVAL_GRANTED, true)
+                        }
+                    )
+                },
+                onReject = {
+                    context.startService(
+                        Intent(context, JarvisForegroundService::class.java).apply {
+                            action = JarvisForegroundService.ACTION_ANSWER_BROWSER_APPROVAL
+                            putExtra(JarvisForegroundService.EXTRA_APPROVAL_GRANTED, false)
+                        }
+                    )
+                }
+            )
+        }
         if (captchaAssist != null) {
             val captcha = captchaAssist!!
             CaptchaAssistCard(
@@ -1768,6 +1899,56 @@ fun PermissionsChecklistScreen() {
                 })
             }
         )
+
+        // R3.2: Restricted Settings onboarding (O-T7). Android 13+
+        // blocks sideloaded apps from enabling Accessibility until
+        // the user allows "restricted settings" on the app-info
+        // page — without it the Accessibility toggle is GREYED OUT
+        // and Jarvis cannot tap at all. Exact steps + a button to
+        // the app-info page (Settings → Apps → Jarvis → ⋮ →
+        // "Allow restricted settings").
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1423)),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    text = "Restricted Settings — Accessibility toggle greyed out ho to ye karo",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "1. Neeche 'App Settings kholo' dabao.\n" +
+                        "2. Upar ⋮ (teen dots) → 'Allow restricted settings' → Allow.\n" +
+                        "3. Wapas aakar upar 'Open Accessibility Settings' se Jarvis ko ON karo.\n" +
+                        "4. Agar toggle ab bhi grey hai to 'Allow restricted settings' dobara check karo — bina iske Jarvis tap nahi kar sakta.",
+                    fontSize = 12.sp,
+                    color = Color(0xFFCFD8DC)
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${context.packageName}")
+                            ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                        )
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85C38))
+                ) {
+                    Text(
+                        text = "App Settings kholo",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
 
         PermissionItemCard(
             title = "2. Floating HUD Overlay (Draw Over Apps)",

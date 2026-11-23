@@ -14,6 +14,8 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
@@ -28,17 +30,48 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
+/**
+ * Floating Jarvis overlay — pill + R3.3 panel (U21).
+ *
+ * The pill (mic toggle + live status + stop) is unchanged from
+ * 1.4.8. The panel opens from the pill's ＋ button: mic ON/OFF
+ * state + toggle, a text field (type → send as a command, or
+ * speak it aloud), add document / photo / link (Trained Jarvis
+ * ingestion — the pickers run in MainActivity, the overlay only
+ * opens the app to the Trained tab), a plain-words status line,
+ * and collapse. The panel is a launcher into the app's flows —
+ * it never ingests or executes anything itself.
+ *
+ * Window flags: collapsed = FLAG_NOT_FOCUSABLE (the pill never
+ * steals touch/keyboard from the app under it). Expanded = the
+ * flag is REMOVED so the EditText takes focus + keyboard, and
+ * restored on collapse (keyboard hidden, focus cleared).
+ */
 class FloatingJarvisOverlay(
     private val context: Context,
     private val onMicTap: () -> Unit,
-    private val onStopTap: () -> Unit
+    private val onStopTap: () -> Unit,
+    private val onTextSend: (String) -> Unit = {},
+    private val onSpeakText: (String) -> Unit = {},
+    private val onAddDoc: () -> Unit = {},
+    private val onAddImage: () -> Unit = {},
+    private val onAddLink: () -> Unit = {}
 ) {
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var rootView: LinearLayout? = null
+    private var pillRow: LinearLayout? = null
+    private var panelView: LinearLayout? = null
+    private var panelInput: EditText? = null
+    private var panelStatusTextView: TextView? = null
+    private var panelMicTextView: TextView? = null
+    private var panelMicToggleView: TextView? = null
+    private var expandButton: TextView? = null
     private var statusTextView: TextView? = null
     private var orbButton: TextView? = null
     private var stopButton: TextView? = null
     private var overlayScope: CoroutineScope? = null
+    private var layoutParams: WindowManager.LayoutParams? = null
+    private var isPanelOpen = false
 
     @SuppressLint("ClickableViewAccessibility")
     fun show() {
@@ -71,8 +104,14 @@ class FloatingJarvisOverlay(
             x = 24
             y = 180
         }
+        layoutParams = params
 
-        val container = LinearLayout(context).apply {
+        // Root: vertical — the pill row on top, the panel below it.
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val pill = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(20, 14, 24, 14)
@@ -106,6 +145,14 @@ class FloatingJarvisOverlay(
             setPadding(8, 0, 12, 0)
         }
 
+        val expandBtn = TextView(context).apply {
+            text = "＋"
+            setTextColor(Color.parseColor("#00E5FF"))
+            textSize = 16f
+            setPadding(12, 4, 8, 4)
+            setOnClickListener { setPanelOpen(!isPanelOpen) }
+        }
+
         val stopBtn = TextView(context).apply {
             text = "⏹"
             setTextColor(Color.parseColor("#FF5252"))
@@ -115,17 +162,25 @@ class FloatingJarvisOverlay(
             setOnClickListener { onStopTap() }
         }
 
-        container.addView(orb)
-        container.addView(statusLabel)
-        container.addView(stopBtn)
+        pill.addView(orb)
+        pill.addView(statusLabel)
+        pill.addView(expandBtn)
+        pill.addView(stopBtn)
 
-        // Support dragging and tapping the floating pill
+        val panel = buildPanel()
+        panel.visibility = View.GONE
+
+        root.addView(pill)
+        root.addView(panel)
+
+        // Support dragging and tapping the floating pill (the pill
+        // row only — the panel's own taps must never drag it).
         var initialX = 0
         var initialY = 0
         var initialTouchX = 0f
         var initialTouchY = 0f
 
-        container.setOnTouchListener { _, event ->
+        pill.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initialX = params.x
@@ -138,7 +193,7 @@ class FloatingJarvisOverlay(
                 MotionEvent.ACTION_MOVE -> {
                     params.x = initialX + (event.rawX - initialTouchX).toInt()
                     params.y = initialY + (event.rawY - initialTouchY).toInt()
-                    runCatching { windowManager.updateViewLayout(container, params) }
+                    runCatching { windowManager.updateViewLayout(root, params) }
                     true
                 }
 
@@ -156,10 +211,13 @@ class FloatingJarvisOverlay(
         }
 
         runCatching {
-            windowManager.addView(container, params)
-            rootView = container
+            windowManager.addView(root, params)
+            rootView = root
+            pillRow = pill
+            panelView = panel
             orbButton = orb
             statusTextView = statusLabel
+            expandButton = expandBtn
             stopButton = stopBtn
         }.onFailure {
             // B-L13: a failed addView must not leave a live status
@@ -201,6 +259,205 @@ class FloatingJarvisOverlay(
             }
         }
     }
+
+    /**
+     * R3.3 panel: mic state + toggle, text input (send / speak),
+     * add document / photo / link, plain-words status, collapse.
+     * Built once in show(); hidden until the ＋ button opens it.
+     */
+    private fun buildPanel(): LinearLayout {
+        val density = context.resources.displayMetrics.density
+        val panel = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 18, 24, 18)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 32f
+                setColor(Color.parseColor("#E6071120"))
+                setStroke(3, Color.parseColor("#00E5FF"))
+            }
+        }
+
+        // Mic state + toggle.
+        val micRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val micLabel = TextView(context).apply {
+            text = "Mic: OFF"
+            setTextColor(Color.parseColor("#E0F7FA"))
+            textSize = 13f
+            setPadding(0, 0, 16, 0)
+        }
+        val micToggle = TextView(context).apply {
+            text = "Mic ON karo"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(28, 14, 28, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener { onMicTap() }
+        }
+        micRow.addView(micLabel)
+        micRow.addView(micToggle)
+        panel.addView(micRow)
+
+        // Text input.
+        val input = EditText(context).apply {
+            hint = "Yahan likho…"
+            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.parseColor("#E0F7FA"))
+            textSize = 14f
+            maxLines = 4
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 24f
+                setColor(Color.parseColor("#FF0A2E3A"))
+                setStroke(2, Color.parseColor("#455A64"))
+            }
+            setPadding(24, 16, 24, 16)
+            layoutParams = LinearLayout.LayoutParams(
+                (260 * density).toInt(),
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        panel.addView(input)
+        panelInput = input
+
+        // Send / speak row.
+        val sendRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 14, 0, 0)
+        }
+        val sendBtn = TextView(context).apply {
+            text = "Bhejo"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(28, 14, 28, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener {
+                val text = input.text?.toString()?.trim().orEmpty()
+                if (text.isNotBlank()) {
+                    onTextSend(text)
+                    input.setText("")
+                }
+            }
+        }
+        val speakBtn = TextView(context).apply {
+            text = "🔊 Bolo"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(28, 14, 28, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener {
+                val text = input.text?.toString()?.trim().orEmpty()
+                if (text.isNotBlank()) {
+                    onSpeakText(text)
+                    input.setText("")
+                }
+            }
+        }
+        sendRow.addView(sendBtn)
+        sendRow.addView(speakBtn)
+        panel.addView(sendRow)
+
+        // Add document / photo / link row.
+        val addRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 14, 0, 0)
+        }
+        val docBtn = TextView(context).apply {
+            text = "＋ Document"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(24, 14, 24, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener { onAddDoc() }
+        }
+        val photoBtn = TextView(context).apply {
+            text = "＋ Photo"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(24, 14, 24, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener { onAddImage() }
+        }
+        val linkBtn = TextView(context).apply {
+            text = "＋ Link"
+            setTextColor(Color.parseColor("#FFFFFF"))
+            textSize = 13f
+            setPadding(24, 14, 24, 14)
+            background = panelButtonBackground("#B31E3A34")
+            setOnClickListener { onAddLink() }
+        }
+        addRow.addView(docBtn)
+        addRow.addView(photoBtn)
+        addRow.addView(linkBtn)
+        panel.addView(addRow)
+
+        // Plain-words status (same line as the pill).
+        val status = TextView(context).apply {
+            text = "JARVIS Ready"
+            setTextColor(Color.parseColor("#B0BEC5"))
+            textSize = 12f
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, 14, 0, 0)
+        }
+        panel.addView(status)
+        panelStatusTextView = status
+        panelMicTextView = micLabel
+        panelMicToggleView = micToggle
+
+        // Collapse.
+        val collapseBtn = TextView(context).apply {
+            text = "Band karo"
+            setTextColor(Color.parseColor("#B0BEC5"))
+            textSize = 12f
+            setPadding(0, 14, 0, 0)
+            setOnClickListener { setPanelOpen(false) }
+        }
+        panel.addView(collapseBtn)
+
+        return panel
+    }
+
+    private fun panelButtonBackground(colorHex: String): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 32f
+            setColor(Color.parseColor(colorHex))
+            setStroke(2, Color.parseColor("#00E5FF"))
+        }
+    }
+
+    /**
+     * Open/close the panel. Opening removes FLAG_NOT_FOCUSABLE so
+     * the EditText takes focus + keyboard; closing restores it
+     * (keyboard hidden, focus cleared) so the pill never steals
+     * touch from the app under it again.
+     */
+    fun setPanelOpen(open: Boolean) {
+        isPanelOpen = open
+        panelView?.visibility = if (open) View.VISIBLE else View.GONE
+        expandButton?.text = if (open) "－" else "＋"
+        val params = layoutParams ?: return
+        val root = rootView ?: return
+        if (open) {
+            params.flags = params.flags and
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+        } else {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(root.windowToken, 0)
+            panelInput?.clearFocus()
+        }
+        runCatching { windowManager.updateViewLayout(root, params) }
+    }
+
+    fun isPanelOpen(): Boolean = isPanelOpen
 
     private data class Quint(
         val state: AgentRunState,
@@ -255,6 +512,7 @@ class FloatingJarvisOverlay(
      * label IS the tap-to-start discoverability: the pill
      * itself tells the user the mic is off and tappable).
      * No state is invented: every branch reads a live flow.
+     * R3.3: the panel's status + mic lines follow the same label.
      */
     private fun updateHudAppearance(
         state: AgentRunState,
@@ -265,7 +523,7 @@ class FloatingJarvisOverlay(
         playback: com.jarvis.autonomous.data.PlaybackState =
             com.jarvis.autonomous.data.PlaybackState.IDLE
     ) {
-        val container = rootView ?: return
+        val container = pillRow ?: return
         val bg = container.background as? GradientDrawable
 
         // WAVE-2 (§D-8): true playback wins over agentState
@@ -302,6 +560,11 @@ class FloatingJarvisOverlay(
         statusTextView?.text = label
         stopButton?.visibility = if (showStop) View.VISIBLE else View.GONE
         bg?.setStroke(3, Color.parseColor(borderColor))
+        // R3.3: the panel mirrors the pill's truthful label + the
+        // mic state (the toggle label follows the loop, not the tap).
+        panelStatusTextView?.text = label
+        panelMicTextView?.text = if (loopOn) "Mic: ON" else "Mic: OFF"
+        panelMicToggleView?.text = if (loopOn) "Mic OFF karo" else "Mic ON karo"
     }
 
     private data class Quad(
@@ -314,9 +577,13 @@ class FloatingJarvisOverlay(
     fun hide() {
         overlayScope?.cancel()
         overlayScope = null
+        isPanelOpen = false
+        panelInput?.clearFocus()
         rootView?.let { view ->
             runCatching { windowManager.removeView(view) }
         }
         rootView = null
+        pillRow = null
+        panelView = null
     }
 }

@@ -27,6 +27,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -381,6 +382,14 @@ class HubWsClient(
                     "Memory push aaya (memories=$memoryCount, patterns=$patternCount) — pull hoga"
                 )
             }
+            "LIVE_SCREEN" -> {
+                // R3.1: a live-screen frame arriving at this socket
+                // (another connection of the same device, or the admin
+                // viewer path). Notice-only — the phone NEVER acts on
+                // a received frame; frames are produced locally by
+                // LiveScreenWatcher. Logged + ignored.
+                diag("WS_LIVE_SCREEN_RX", "LIVE_SCREEN frame mila — ignore kiya (local watcher hi source hai)")
+            }
             "PING" -> {
                 runCatching { webSocket?.send("{\"type\":\"PONG\"}") }
             }
@@ -527,6 +536,32 @@ class HubWsClient(
         }
         val sent = webSocket?.send(msg) ?: false
         diag("WS_CAPTCHA_RESOLVED", "CAPTCHA_RESOLVED bheja (solved=$solved, sent=$sent)")
+    }
+
+    /**
+     * R3.1: send one live-screen OCR frame to the hub (signed WS
+     * message, type LIVE_SCREEN — the DO forwards it to the OTHER
+     * sockets of this device, i.e. the admin viewer; never echoed
+     * to the sender, never traced, never stored). TEXT + BOXES ONLY
+     * — no pixels ever leave the phone on this path. Sensitive
+     * screens are excluded by LiveScreenWatcher BEFORE this is
+     * called (the DO drops otp/banking/password/payment kinds too).
+     * The server drops a frame with no text. If the socket is down
+     * the frame is lost — the local tap flow never waits on the hub.
+     */
+    fun sendLiveScreenEvent(text: String, boxes: JSONArray, screenKind: String) {
+        val payloadRaw = JSONObject()
+            .put("text", text)
+            .put("boxes", boxes)
+            .put("screen_kind", screenKind)
+            .put("ts", System.currentTimeMillis())
+            .toString()
+        val msg = runCatching { signedMessage("LIVE_SCREEN", payloadRaw) }.getOrNull() ?: run {
+            diag("WS_KEY_ERROR", "LIVE_SCREEN sign nahi hua")
+            return
+        }
+        val sent = webSocket?.send(msg) ?: false
+        diag("WS_LIVE_SCREEN", "LIVE_SCREEN bheja (kind=$screenKind, sent=$sent)")
     }
 
     /** 3c: 1-tap handoff — the notification opens the app to the canvas. */
