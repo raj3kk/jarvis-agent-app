@@ -284,7 +284,7 @@ fun detectPreviousBounce(): PreviousBounce? {
                 "first 1.4.4 launch; this decides agent-HOME vs OEM backgrounding)",
             detail = "Last markers: ${if (lastMarkers.isBlank()) "none" else lastMarkers}. " +
                 "NAV_EXEC HOME present = agent pressed HOME (1.4.3 wrote no " +
-                "USER_CMD markers, so task context comes from SPK/step lines, " +
+                "USER_CMD markers, so task context comes from SPK/activity lines, " +
                 "not from a USER_CMD order check). No NAV_EXEC + " +
                 "LIFE_PAUSE/DESTROY = OEM backgrounding (b). " +
                 "Crash in trail: ${if (crash != null) "YES" else "no"}.",

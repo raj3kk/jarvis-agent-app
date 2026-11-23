@@ -126,6 +126,7 @@ import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.FileDocumentStorage
 import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
+import com.jarvis.autonomous.data.LicenceKeyStore
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanView
 import com.jarvis.autonomous.voice.SwaraTtsClient
@@ -135,6 +136,7 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LaunchSession
 import com.jarvis.autonomous.data.LearnedRoutineStore
 import com.jarvis.autonomous.data.PreviousBounce
+import com.jarvis.autonomous.data.BlockRecord
 import com.jarvis.autonomous.data.SelfExtensionStore
 import com.jarvis.autonomous.data.buildBounceReportText
 import com.jarvis.autonomous.data.clearStaleBounceReport
@@ -441,7 +443,11 @@ fun JarvisMainApp(
                     Triple(4, Icons.Default.Build, "Projects"),
                     Triple(5, Icons.Default.Send, "Browser"),
                     Triple(6, Icons.Default.Security, "Licence"),
-                    Triple(7, Icons.Default.Edit, "Whiteboard")
+                    Triple(7, Icons.Default.Edit, "Whiteboard"),
+                    // R1 (TERMINAL_SUBAGENT_BROWSER_PARITY §4 #2):
+                    // in-app terminal — xterm.js UI + ProcessBuilder
+                    // "sh" backend (TerminalScreen.kt).
+                    Triple(8, Icons.Default.Terminal, "Terminal")
                 )
                 val tabListState = rememberLazyListState()
                 LaunchedEffect(selectedTab) {
@@ -544,6 +550,8 @@ fun JarvisMainApp(
                 6 -> LicenceScreen()
 
                 7 -> WhiteboardScreen()
+
+                8 -> TerminalScreen()
             }
         }
         }
@@ -1155,7 +1163,7 @@ fun CommandCenterScreen(
                     color = Color(0xFFB85C38)
                 )
                 Text(
-                    text = "Autonomous Multi-Step Mobile Agent",
+                    text = "Autonomous Mobile Agent",
                     fontSize = 12.sp,
                     color = Color(0xFF8A7A70)
                 )
@@ -1334,7 +1342,7 @@ fun CommandCenterScreen(
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Live Step Telemetry Card
+        // Live Telemetry Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF)),
@@ -1539,6 +1547,11 @@ fun CommandCenterScreen(
 // one-line evidence. Silent progress is visual only — this card
 // (plus chat lines) is where a running plan is seen.
 @Composable
+// R1 (no-step): the plan card shows plain-words status only —
+// the goal, the current activity, and the overall state. No
+// numbered list, no per-unit rows, no count, no "step" word.
+// The internal PlanStep list still exists (PlanView.steps);
+// it is never rendered here.
 fun PlanCard(plan: PlanView) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1554,34 +1567,27 @@ fun PlanCard(plan: PlanView) {
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
-            plan.steps.forEachIndexed { index, step ->
-                val (mark, markColor) = when (step.state) {
-                    PlanState.DONE -> "DONE ✓" to Color(0xFF2E7D5B)
-                    PlanState.RUNNING -> "RUNNING ▶" to Color(0xFFB85C38)
-                    PlanState.FAILED -> "FAILED ✗" to Color(0xFFB3261E)
-                    PlanState.BLOCKED -> "BLOCKED ⏸" to Color(0xFFB3261E)
-                    PlanState.SKIPPED -> "SKIPPED –" to Color.Gray
-                    PlanState.PENDING -> "PENDING …" to Color.Gray
-                    // 3c: browser step waiting on the user (captcha).
-                    PlanState.AWAITING_USER -> "WAITING ⏳" to Color(0xFFB85C38)
+            val current = plan.steps.firstOrNull { it.state == PlanState.RUNNING }
+                ?: plan.steps.firstOrNull { it.state == PlanState.BLOCKED }
+                ?: plan.steps.firstOrNull { it.state == PlanState.FAILED }
+                ?: plan.steps.firstOrNull { it.state == PlanState.AWAITING_USER }
+            if (current != null) {
+                val (line, markColor) = when (current.state) {
+                    PlanState.RUNNING -> "Abhi ${current.title} chal raha hai" to Color(0xFFB85C38)
+                    PlanState.BLOCKED -> "Abhi ${current.title} ruk gaya" to Color(0xFFB3261E)
+                    PlanState.FAILED -> "Abhi ${current.title} ruk gaya" to Color(0xFFB3261E)
+                    PlanState.AWAITING_USER -> "Abhi ${current.title} — tumhara intezaar hai" to Color(0xFFB85C38)
+                    else -> "" to Color.Gray
                 }
                 Text(
-                    text = "${index + 1}. ${step.title} — $mark",
+                    text = line,
                     fontSize = 12.sp,
-                    fontWeight = if (step.state == PlanState.RUNNING) FontWeight.Bold else FontWeight.SemiBold,
+                    fontWeight = FontWeight.SemiBold,
                     color = Color(0xFF3B2F2A)
                 )
-                val subLine = when {
-                    step.state == PlanState.DONE && step.evidence.isNotBlank() -> step.evidence
-                    step.state == PlanState.RUNNING && step.detail.isNotBlank() -> step.detail
-                    step.state == PlanState.FAILED && step.evidence.isNotBlank() -> step.evidence
-                    step.state == PlanState.BLOCKED && step.evidence.isNotBlank() -> step.evidence
-                    step.state == PlanState.AWAITING_USER && step.evidence.isNotBlank() -> step.evidence
-                    else -> ""
-                }
-                if (subLine.isNotBlank()) {
+                if (current.evidence.isNotBlank() && current.state != PlanState.RUNNING) {
                     Text(
-                        text = subLine,
+                        text = current.evidence,
                         fontSize = 11.sp,
                         color = markColor,
                         maxLines = 2,
@@ -1899,7 +1905,7 @@ fun AiBrainSettingsScreen(
     var liveGateMessage by remember { mutableStateOf("") }
     var visionMode by remember { mutableStateOf(prefs.visionModeEnabled) }
     var autoAnnounceNotifs by remember { mutableStateOf(prefs.autoAnnounceNotifications) }
-    var maxSteps by remember { mutableFloatStateOf(prefs.maxAutonomousSteps.toFloat()) }
+    // R1: no max-steps state — the loop is budget-gated now.
     var stepDelay by remember { mutableFloatStateOf(prefs.stepDelayMs.toFloat()) }
     var saveBanner by remember { mutableStateOf("") }
     // Captured at composition level for use inside onClick handlers
@@ -2046,7 +2052,7 @@ fun AiBrainSettingsScreen(
                     Text(
                         text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Gemma 3 270M Q8, ~304 MB, ek baar download). " +
                             "Casual baat-cheet isse tez aur bina internet ke hogi. " +
-                            "Ye gated model hai — download ke liye owner ka token app me hi hota hai, tumhe koi token daalne ki zaroorat nahi hai. Agar tum apna token daalna chaho to neeche wala field optional hai (tumhara token owner wale se pehle use hoga). Phone ke steps/kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-step JSON reliably nahi de sakta.",
+                            "Ye gated model hai — download ke liye owner ka token app me hi hota hai, tumhe koi token daalne ki zaroorat nahi hai. Agar tum apna token daalna chaho to neeche wala field optional hai (tumhara token owner wale se pehle use hoga). Phone ke kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-part JSON reliably nahi de sakta.",
                         fontSize = 12.sp
                     )
                     Text(
@@ -2364,7 +2370,7 @@ fun AiBrainSettingsScreen(
                 )
                 SettingToggleRow(
                     title = "Floating HUD Overlay Pill",
-                    subtitle = "Show live step indicator & mic bubble over all apps",
+                    subtitle = "Show live activity indicator & mic bubble over all apps",
                     checked = overlayEnabled,
                     onCheckedChange = { overlayEnabled = it }
                 )
@@ -2423,27 +2429,21 @@ fun AiBrainSettingsScreen(
                     Text(liveGateMessage, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
                 SettingToggleRow(
-                    title = "Speak Every Step (slower)",
-                    subtitle = "OFF = fast: only final answers & questions are spoken, steps show in chat",
+                    title = "Speak Every Update (slower)",
+                    subtitle = "OFF = fast: only final answers & questions are spoken, updates show in chat",
                     checked = speakIntermediate,
                     onCheckedChange = { speakIntermediate = it }
                 )
             }
         }
 
-        // Sliders for Autonomous Loop
+        // R1 (no-step): the Max Steps slider is GONE — the loop is
+        // budget-gated (TaskBudget: 10 work units / 20 LLM calls /
+        // 15-min watchdog, plan defaults — see JarvisPreferences).
+        // Only the pacing slider stays, reworded (it is a delay,
+        // not a step count).
         Text(
-            text = "Max Autonomous Steps per Command: ${maxSteps.toInt()} steps",
-            fontSize = 13.sp
-        )
-        Slider(
-            value = maxSteps,
-            onValueChange = { maxSteps = it },
-            valueRange = 5f..80f
-        )
-
-        Text(
-            text = "Step Wait Delay (UI Load Time): ${stepDelay.toInt()} ms",
+            text = "Kaam ke beech rukawat (UI Load Time): ${stepDelay.toInt()} ms",
             fontSize = 13.sp
         )
         Slider(
@@ -2479,7 +2479,6 @@ fun AiBrainSettingsScreen(
                 prefs.speakIntermediateSteps = speakIntermediate
                 prefs.swaraEnabled = swaraOn
                 prefs.liveModeEnabled = liveOn
-                prefs.maxAutonomousSteps = maxSteps.toInt()
                 prefs.stepDelayMs = stepDelay.toLong()
                 onSettingsUpdated()
                 // 1.4.5 (item 6): the OFF card reads this flow —
@@ -2590,8 +2589,10 @@ fun AiBrainSettingsScreen(
             }
         }
 
-        // 1.4.21 Agent Mode — Connected accounts: GitHub PAT,
-        // Supabase PAT + project ref, Vercel token. Tokens live in
+        // 1.4.21 Agent Mode — Connected accounts: Supabase PAT +
+        // project ref, Vercel token. R1: GitHub PAT is GONE — GitHub
+        // goes through the hub (POST /api/github/*, device-signed);
+        // the phone holds no GitHub token. Tokens live in
         // EncryptedSharedPreferences ("jarvis_agent_secrets") —
         // NEVER in plain prefs, never in the APK, never logged.
         // Fields are local remember state until THIS section's own
@@ -2603,15 +2604,6 @@ fun AiBrainSettingsScreen(
         run {
             val agentContext = LocalContext.current
             val agentScope = rememberCoroutineScope()
-            var githubPat by remember {
-                mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_GITHUB_PAT) }.getOrDefault(""))
-            }
-            var showGithubPat by remember { mutableStateOf(false) }
-            var githubSaved by remember {
-                mutableStateOf(runCatching { AgentSecrets.has(agentContext, AgentSecrets.KEY_GITHUB_PAT) }.getOrDefault(false))
-            }
-            var githubTest by remember { mutableStateOf("") }
-            var githubBusy by remember { mutableStateOf(false) }
             var supabasePat by remember {
                 mutableStateOf(runCatching { AgentSecrets.get(agentContext, AgentSecrets.KEY_SUPABASE_PAT) }.getOrDefault(""))
             }
@@ -2645,52 +2637,11 @@ fun AiBrainSettingsScreen(
                     Text("Agent Mode — Connected accounts", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Text(
                         text = "Agent Mode (website → GitHub → Supabase → Vercel) ke liye tokens yahan daalo. " +
-                            "Tokens encrypted save hote hain, kabhi dikhaye ya log nahi hote. " +
-                            "Koi step bina token ke nahi chalega — pehle yahan Save karo.",
+                            "GitHub ke liye phone par koi token nahi chahiye — GitHub hub ke through chalta hai " +
+                            "(admin hub me token lagata hai). Tokens encrypted save hote hain, kabhi dikhaye ya log nahi hote. " +
+                            "Bina token ke kaam nahi chalega — pehle yahan Save karo.",
                         fontSize = 12.sp
                     )
-                    // GitHub PAT
-                    Text("GitHub PAT", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    Text(
-                        text = "Kahan se milega: GitHub Settings → Developer settings → Personal access tokens (fine-grained) — Contents read+write, sirf un repos par jo tum naam doge.",
-                        fontSize = 11.sp,
-                        color = Color(0xFF8A7A70)
-                    )
-                    OutlinedTextField(
-                        value = githubPat,
-                        onValueChange = { githubPat = it },
-                        label = { Text("GitHub Personal Access Token", fontSize = 12.sp) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        visualTransformation = if (showGithubPat) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { showGithubPat = !showGithubPat }) {
-                                Text(if (showGithubPat) "Hide" else "Show", fontSize = 11.sp)
-                            }
-                        }
-                    )
-                    Text(
-                        text = "Saved: ${if (githubSaved) "yes" else "NO — token daalo aur SAVE dabao"}",
-                        fontSize = 12.sp
-                    )
-                    Button(
-                        enabled = !githubBusy,
-                        onClick = {
-                            githubBusy = true
-                            githubTest = "Testing…"
-                            agentScope.launch(Dispatchers.IO) {
-                                githubTest = AgentSecrets.testGithub(agentContext)
-                                githubBusy = false
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
-                    ) {
-                        Text("Test GitHub", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-                    if (githubTest.isNotBlank()) {
-                        Text(githubTest, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    }
                     // Supabase PAT + project ref
                     Text("Supabase PAT + project ref", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     Text(
@@ -2785,11 +2736,9 @@ fun AiBrainSettingsScreen(
                     Button(
                         onClick = {
                             runCatching {
-                                AgentSecrets.put(agentContext, AgentSecrets.KEY_GITHUB_PAT, githubPat)
                                 AgentSecrets.put(agentContext, AgentSecrets.KEY_SUPABASE_PAT, supabasePat)
                                 AgentSecrets.put(agentContext, AgentSecrets.KEY_SUPABASE_PROJECT_REF, supabaseRef)
                                 AgentSecrets.put(agentContext, AgentSecrets.KEY_VERCEL_TOKEN, vercelToken)
-                                githubSaved = githubPat.isNotBlank()
                                 supabaseSaved = supabasePat.isNotBlank()
                                 supabaseRefSaved = supabaseRef.isNotBlank()
                                 vercelSaved = vercelToken.isNotBlank()
@@ -2869,12 +2818,21 @@ fun MemoryRoutinesLogsScreen(
     val skillContext = LocalContext.current
     val skillStore = remember { LearnedRoutineStore(skillContext) }
     var skills by remember { mutableStateOf(skillStore.loadSkillManifests()) }
-    // 1.11.0-PRO (self-extension): quarantined CODE proposals
-    // (read-only rows below — no enable button, no install).
+    // 1.11.0-PRO (self-extension): quarantined CODE proposals.
+    // U8 (R1 audit follow-up, B3): the rows below now carry
+    // Approve / Reject — the user can answer on the phone instead
+    // of waiting for server/admin only. Approve records the USER's
+    // yes locally (status "user_approved"); it installs NOTHING and
+    // enables NOTHING — the skill stays quarantined server-side
+    // until an admin approves it via /api/skills/review (clean
+    // re-scan + Ed25519 sign), and CODE enters the app only through
+    // the next APK build. Reject records "user_rejected" + a block,
+    // so the loop never re-proposes it (24 h cooldown).
     val selfExtStore = remember {
         SelfExtensionStore(File(skillContext.filesDir, "device-memory/self-extension"))
     }
     var proposals by remember { mutableStateOf(selfExtStore.loadProposals()) }
+    var proposalNote by remember { mutableStateOf("") }
 
     val logs by JarvisStateRepository.executionLogs.collectAsState()
 
@@ -2970,6 +2928,20 @@ fun MemoryRoutinesLogsScreen(
                         ) {
                             Text("Clear", color = Color.White, fontSize = 12.sp)
                         }
+                        // U7 (R1 audit follow-up, A7): one cheap RAM
+                        // sample (total/avail/heap/low-memory) as a
+                        // RAM_SAMPLE diagnostics entry — on demand
+                        // only, no background sampling. The entry
+                        // shows in the list below via the mirror.
+                        Button(
+                            onClick = {
+                                JarvisDiagnosticsFile.recordMemorySample(diagContext)
+                                copiedNote = "RAM sample record ho gaya — neeche diagnostics me dekho."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                        ) {
+                            Text("RAM check", color = Color.White, fontSize = 12.sp)
+                        }
                     }
                     if (copiedNote.isNotBlank()) {
                         Text(copiedNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
@@ -2992,7 +2964,7 @@ fun MemoryRoutinesLogsScreen(
             colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
         ) {
             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Custom Voice Routines (1-Command Multi-Step Macros)", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D5B))
+                Text("Custom Voice Routines (1-Command Macros)", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D5B))
                 routines.forEach { routine ->
                     Row(
                         modifier = Modifier
@@ -3028,7 +3000,7 @@ fun MemoryRoutinesLogsScreen(
                 OutlinedTextField(
                     value = newRoutinePrompt,
                     onValueChange = { newRoutinePrompt = it },
-                    label = { Text("Multi-Step Instruction for Jarvis") },
+                    label = { Text("Instruction for Jarvis") },
                     modifier = Modifier.fillMaxWidth()
                 )
                 Button(
@@ -3063,7 +3035,7 @@ fun MemoryRoutinesLogsScreen(
                 )
                 if (skills.isEmpty()) {
                     Text(
-                        "Abhi koi skill seekhi nahi — koi multi-step kaam dobara karne par Jarvis use seekh lega.",
+                        "Abhi koi skill seekhi nahi — koi kaam dobara karne par Jarvis use seekh lega.",
                         fontSize = 12.sp, color = Color(0xFF8A7A70)
                     )
                 }
@@ -3104,22 +3076,81 @@ fun MemoryRoutinesLogsScreen(
                     }
                 }
                 // 1.11.0-PRO (self-extension, §6): quarantined CODE
-                // proposals — read-only "pending approval" rows, no
-                // enable button, nothing installed from here.
+                // proposals — U8 (R1): Approve / Reject card, not a
+                // read-only row any more. Approve = the user's yes,
+                // recorded locally; the scan + sign gates still sit
+                // server-side (admin review), nothing installs or
+                // enables from this card. Reject = local "no" + a
+                // 24 h block so the loop never re-proposes it.
                 proposals.forEach { proposal ->
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
                             .background(Color(0xFFF3E5F5))
                             .padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Proposal: ${proposal.capability}", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF6A1B9A))
-                            Text("pending approval · ${proposal.status} · Licence: ${proposal.licence}", fontSize = 11.sp, color = Color(0xFF8A7A70))
+                        Text("Proposal: ${proposal.capability}", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF6A1B9A))
+                        Text(
+                            when (proposal.status) {
+                                "quarantined" -> "pending approval · Licence: ${proposal.licence}"
+                                "user_approved" -> "tumne approve kiya — admin review + scan baaki · Licence: ${proposal.licence}"
+                                "user_rejected" -> "tumne reject kiya · Licence: ${proposal.licence}"
+                                else -> "${proposal.status} · Licence: ${proposal.licence}"
+                            },
+                            fontSize = 11.sp,
+                            color = Color(0xFF8A7A70)
+                        )
+                        if (proposal.status == "quarantined") {
+                            Text(
+                                "Approve karne par bhi kuch install nahi hoga — skill tabhi aayegi jab admin review + scan pass hoga. Reject karne par ye proposal dobara nahi aayega.",
+                                fontSize = 11.sp,
+                                color = Color(0xFF8A7A70)
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        selfExtStore.updateProposalStatus(proposal.id, "user_approved")
+                                        proposals = selfExtStore.loadProposals()
+                                        proposalNote = "Approve kar diya — tumhari pasand record hui. Ab admin review + scan ka intezaar hai; kuch install nahi hua."
+                                        JarvisStateRepository.addDiagnostic(
+                                            "self-extension", "PROPOSAL_USER_APPROVED",
+                                            "capability=${proposal.capability}"
+                                        )
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
+                                ) {
+                                    Text("Approve", color = Color.White, fontSize = 12.sp)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        selfExtStore.updateProposalStatus(proposal.id, "user_rejected")
+                                        selfExtStore.recordBlock(
+                                            BlockRecord(
+                                                proposal.signature,
+                                                proposal.capability,
+                                                "user_rejected",
+                                                "user rejected on phone",
+                                                System.currentTimeMillis()
+                                            )
+                                        )
+                                        proposals = selfExtStore.loadProposals()
+                                        proposalNote = "Reject kar diya — ye proposal dobara nahi aayega (24 ghante ka block lag gaya)."
+                                        JarvisStateRepository.addDiagnostic(
+                                            "self-extension", "PROPOSAL_USER_REJECTED",
+                                            "capability=${proposal.capability}"
+                                        )
+                                    }
+                                ) {
+                                    Text("Reject", fontSize = 12.sp)
+                                }
+                            }
                         }
                     }
+                }
+                if (proposalNote.isNotBlank()) {
+                    Text(proposalNote, fontSize = 12.sp, color = Color(0xFF2E7D5B))
                 }
             }
         }
@@ -3179,7 +3210,7 @@ fun MemoryRoutinesLogsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Live Step & Accessibility Telemetry Logs", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
+                    Text("Live Activity & Accessibility Telemetry Logs", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFFB85C38))
                     Text(
                         text = "CLEAR",
                         fontSize = 11.sp,
@@ -3259,7 +3290,12 @@ private fun buildDiagnosticsReport(
             "last failure=${lastOverlayFailure?.let { "${it.code}: ${it.message}" } ?: "none"}"
     )
     val licencePrefs = context.getSharedPreferences("jarvis_agent_prefs", Context.MODE_PRIVATE)
-    val rawKey = licencePrefs.getString("licence_key", "").orEmpty()
+    // U10 (R1): the key is read from the encrypted store now
+    // (LicenceKeyStore) — the plain "licence_key" value is gone
+    // after the one-time migration, so a plain read here would
+    // wrongly report "none saved". Only the masked form is ever
+    // shown (first 4 + last 4 chars, never the full key).
+    val rawKey = runCatching { LicenceKeyStore.get(context) }.getOrDefault("")
     val activated = licencePrefs.getBoolean("licence_activated", false)
     val maskedKey = when {
         rawKey.isBlank() -> "none saved"

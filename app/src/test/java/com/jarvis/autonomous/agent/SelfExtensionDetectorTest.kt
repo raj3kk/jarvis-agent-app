@@ -85,7 +85,7 @@ class SelfExtensionDetectorTest {
     @Test
     fun detectorTriggerUnknownStep() {
         val detection = SelfExtensionDetector.detect(
-            failure("Unknown step kind: FAKE_KIND_X (T-NO-HANDLER)", stepKind = "FAKE_KIND_X", action = "FAKE_KIND_X")
+            failure("Unknown kaam kind: FAKE_KIND_X (T-NO-HANDLER)", stepKind = "FAKE_KIND_X", action = "FAKE_KIND_X")
         )
         val missing = detection as? Detection.MissingCapability
         assertTrue(missing != null)
@@ -140,7 +140,7 @@ class SelfExtensionDetectorTest {
     fun detectorExclusionBeatsTrigger() {
         // A login-flavoured unknown step is still an exclusion:
         // exclusions are checked FIRST, in §2.2 order.
-        assertExclusion("Unknown step kind: LOGIN_STEP — login required", "X-LOGIN", stepKind = "LOGIN_STEP", action = "LOGIN_STEP")
+        assertExclusion("Unknown kaam kind: LOGIN_STEP — login required", "X-LOGIN", stepKind = "LOGIN_STEP", action = "LOGIN_STEP")
     }
 
     @Test
@@ -155,7 +155,7 @@ class SelfExtensionDetectorTest {
             ExecutorFailure(
                 stepKind = "BUILD",
                 action = "BUILD",
-                reason = "Unknown step kind: FAKE_KIND_X",
+                reason = "Unknown kaam kind: FAKE_KIND_X",
                 goalText = "email $secretEmail phone $secretPhone password $secretPassword"
             )
         )
@@ -180,7 +180,7 @@ class SelfExtensionDetectorTest {
 
     @Test
     fun detectorSignatureStable() {
-        val f = failure("Unknown step kind: FAKE_KIND_X", stepKind = "FAKE_KIND_X", action = "FAKE_KIND_X")
+        val f = failure("Unknown kaam kind: FAKE_KIND_X", stepKind = "FAKE_KIND_X", action = "FAKE_KIND_X")
         assertEquals(
             SelfExtensionDetector.sha256Hex("fake-kind-x|FAKE_KIND_X|FAKE_KIND_X"),
             SelfExtensionDetector.signature(SelfExtensionDetector.capabilityFor("FAKE_KIND_X", "FAKE_KIND_X"), f)

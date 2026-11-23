@@ -96,6 +96,16 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
     var editorDirty by remember { mutableStateOf(false) }
     // B-L6: a switch the user has not confirmed yet (project, file).
     var pendingSwitch by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // U6 (R1 audit follow-up, A3): deleteProject gate — the old
+    // Delete button deleted on ONE tap, no confirm, no undo
+    // (irreversible-only-confirmation rule). Now Delete only ARMS
+    // the confirm row (pendingDelete); the real delete runs from
+    // "Haan, delete karo", and the deleted files are snapshotted
+    // in memory first so Undo can bring the project back.
+    var pendingDelete by remember { mutableStateOf<String?>(null) }
+    // (project name, file name -> content) of the last deleted
+    // project. In-memory only: leaving this tab loses the undo.
+    var deletedBackup by remember { mutableStateOf<Pair<String, Map<String, String>>?>(null) }
     val scope = rememberCoroutineScope()
 
     // Full preview URL: the ?v= nonce busts the WebView cache on
@@ -162,6 +172,86 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
         previewError = null
         previewMode = false
         loadFile(clean, "index.html")
+    }
+
+    /**
+     * U6 (R1): snapshot a project's files (name -> content) BEFORE
+     * a delete, so Undo can restore them. Missing/empty files are
+     * skipped — writeFileDetailed refuses blank content anyway, and
+     * createProject recreates the template files for them.
+     */
+    fun snapshotProject(name: String): Map<String, String> {
+        val files = projects.firstOrNull { it.name == name }?.files ?: emptyList()
+        val out = LinkedHashMap<String, String>()
+        for (file in files) {
+            when (val read = ProjectStore.readFileStatus(context, name, file)) {
+                is ProjectStore.FileRead.Ok -> out[file] = read.content
+                else -> Unit
+            }
+        }
+        return out
+    }
+
+    /**
+     * U6 (R1): the CONFIRMED delete — runs only from the confirm
+     * row ("Haan, delete karo"), never from a single Delete tap.
+     * Same B-M6 / B-L5 behaviour as the old inline delete (Boolean
+     * respected, preview stopped only for the deleted project),
+     * plus the pre-delete snapshot that powers Undo.
+     */
+    fun deleteConfirmed(name: String) {
+        pendingDelete = null
+        val backup = snapshotProject(name)
+        // B-M6: deleteProject's Boolean is respected — a failed
+        // delete must not claim success, and the Documents copy
+        // is left alone by the store in that case. Preview state
+        // clears only for the project actually deleted (B-L5).
+        val deleted = ProjectStore.deleteProject(context, name)
+        if (!deleted) {
+            status = "Delete NAHI hua: $name — dobara try karo."
+        } else {
+            deletedBackup = name to backup
+            if (selected == name) {
+                selected = null
+            }
+            if (previewProject == name) {
+                // 1.4.8 (G8 F1): deleting the previewed project
+                // stops its server too — serving deleted files
+                // from a held port is worse than useless.
+                ProjectPreviewServer.stopInstance()
+                previewBaseUrl = null
+                previewProject = null
+                previewError = null
+                previewMode = false
+            }
+            refresh()
+            status = "Project delete ho gaya: $name — galti se hua ho to neeche Undo dabao."
+        }
+    }
+
+    /**
+     * U6 (R1): restores the last deleted project from the
+     * in-memory snapshot (working copy + Documents export, via
+     * the same write path as Save). Refuses when a project with
+     * the same name was recreated meanwhile — overwriting it
+     * would be a second accidental delete.
+     */
+    fun undoDelete() {
+        val backup = deletedBackup ?: return
+        val (name, files) = backup
+        if (ProjectStore.projectExists(context, name)) {
+            deletedBackup = null
+            status = "Undo nahi hua — '$name' naam se naya project ban gaya hai."
+            return
+        }
+        ProjectStore.createProject(context, name, null)
+        for ((file, content) in files) {
+            if (content.isBlank()) continue
+            ProjectStore.writeFileDetailed(context, name, file, content)
+        }
+        deletedBackup = null
+        refresh()
+        status = "Project wapas aa gaya: $name"
     }
 
     /** B-L7: one detail string for every validation failure mode —
@@ -455,38 +545,51 @@ fun ProjectsScreen(browserHost: BrowserHostState? = null) {
                         OutlinedButton(onClick = { openInBrowser(project.name) }) { Text("Browser me kholo", fontSize = 12.sp) }
                         OutlinedButton(
                             onClick = {
-                                // B-M6: deleteProject's Boolean is
-                                // respected — a failed delete must not
-                                // claim success, and the Documents copy
-                                // is left alone by the store in that
-                                // case. Preview state clears only for
-                                // the project actually deleted (B-L5).
-                                val deleted = ProjectStore.deleteProject(context, project.name)
-                                if (!deleted) {
-                                    status = "Delete NAHI hua: ${project.name} — dobara try karo."
-                                } else {
-                                    if (selected == project.name) {
-                                        selected = null
-                                    }
-                                    if (previewProject == project.name) {
-                                        // 1.4.8 (G8 F1): deleting the
-                                        // previewed project stops its
-                                        // server too — serving deleted
-                                        // files from a held port is
-                                        // worse than useless.
-                                        ProjectPreviewServer.stopInstance()
-                                        previewBaseUrl = null
-                                        previewProject = null
-                                        previewError = null
-                                        previewMode = false
-                                    }
-                                    refresh()
-                                    status = "Project delete ho gaya: ${project.name}"
-                                }
+                                // U6 (R1): Delete only ARMS the
+                                // confirm row below — nothing is
+                                // deleted by this tap. The real
+                                // delete runs from "Haan, delete
+                                // karo" (deleteConfirmed).
+                                pendingDelete = project.name
                             }
                         ) { Text("Delete", fontSize = 12.sp) }
                     }
+                    // U6 (R1): delete confirm row — only for the
+                    // project whose Delete was tapped. Same banner
+                    // pattern as the B-L6 unsaved-edit confirm.
+                    if (pendingDelete == project.name) {
+                        Text(
+                            "Pakka delete karna hai? '${project.name}' hamesha ke liye khatam ho jayega (phone + Documents dono se).",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFB3261E)
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { deleteConfirmed(project.name) }
+                            ) { Text("Haan, delete karo", fontSize = 12.sp) }
+                            OutlinedButton(
+                                onClick = { pendingDelete = null }
+                            ) { Text("Cancel", fontSize = 12.sp) }
+                        }
+                    }
                 }
+            }
+        }
+
+        // U6 (R1): Undo — restores the last deleted project from
+        // the in-memory snapshot. Visible until used, or until a
+        // new delete replaces the backup. Leaving this tab loses it.
+        val backup = deletedBackup
+        if (backup != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Delete hua: ${backup.first} — galti se hua ho to wapas lao.",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { undoDelete() }) { Text("Undo", fontSize = 12.sp) }
             }
         }
 

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<!--
+  R1 (1.16.0-PRO) — in-app terminal page.
+  xterm.js 6.0.0 (MIT) + xterm.css, bundled as app assets
+  (app/src/main/assets/terminal/) — NEVER fetched from the
+  network, never "latest". Licence: LICENSE-xtermjs.txt next door.
+  Backend: TerminalSession (ProcessBuilder "sh", app storage only).
+  Bridge (Kotlin, addJavascriptInterface "JarvisTerminal"):
+    - onReady()        — page loaded, xterm ready
+    - onInput(data)    — user typed (incl. Enter) — sent to sh
+    - onInterrupt()    — Ctrl-C button (JS calls it; Kotlin sends ETX)
+  Kotlin -> JS: window.writeOutput(text) — shell output to xterm.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis Terminal</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1a1a1a; }
+  #terminal { height: 100%; width: 100%; padding: 8px; box-sizing: border-box; }
+  .xterm { height: 100%; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="xterm.js"></script>
+<script>
+(function () {
+  var term;
+  try {
+    term = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: 'monospace',
+      theme: { background: '#1a1a1a', foreground: '#e8e8e8' },
+      scrollback: 1000,
+      convertEol: true
+    });
+  } catch (e) {
+    document.getElementById('terminal').innerText =
+      'Terminal UI load nahi hui (xterm.js missing): ' + e;
+    return;
+  }
+  term.open(document.getElementById('terminal'));
+  term.writeln('Jarvis Terminal — phone shell (app storage only, no root, no git).');
+  term.writeln('Commands: ls, cat, grep, echo — filesDir ke andar hi.');
+  term.write('$ ');
+
+  var line = '';
+  term.onData(function (data) {
+    for (var i = 0; i < data.length; i++) {
+      var ch = data[i];
+      var code = data.charCodeAt(i);
+      if (code === 13) {           // Enter
+        term.write('\r\n');
+        if (window.JarvisTerminal) window.JarvisTerminal.onInput(line);
+        line = '';
+        term.write('$ ');
+      } else if (code === 127) {   // Backspace
+        if (line.length > 0) {
+          line = line.slice(0, -1);
+          term.write('\b \b');
+        }
+      } else if (code === 3) {     // Ctrl-C
+        if (window.JarvisTerminal) window.JarvisTerminal.onInterrupt();
+        line = '';
+        term.write('^C\r\n$ ');
+      } else if (code >= 32) {
+        line += ch;
+        term.write(ch);
+      }
+    }
+  });
+
+  window.writeOutput = function (text) {
+    try { term.write(text); } catch (e) { /* terminal gone */ }
+  };
+
+  window.clearTerminal = function () {
+    try { term.clear(); term.write('$ '); } catch (e) { /* terminal gone */ }
+  };
+
+  if (window.JarvisTerminal) {
+    try { window.JarvisTerminal.onReady(); } catch (e) { /* no bridge */ }
+  }
+})();
+</script>
+</body>
+</html>

@@ -48,13 +48,13 @@ class TalkerReplyPolicyTest {
         val fresh = TalkerReplyPolicy.statusLine(cmd, null, 20_000L)
         assertTrue(fresh.contains("dukaan ki website"))
         assertTrue(fresh.contains("abhi-abhi shuru hua hai"))
-        val older = TalkerReplyPolicy.statusLine(cmd, "Step 2 chal raha hai", 150_000L)
+        val older = TalkerReplyPolicy.statusLine(cmd, "GitHub push chal raha hai", 150_000L)
         assertTrue(older.contains("2 minute se chal raha hai"))
-        assertTrue(older.contains("Step 2 chal raha hai"))
+        assertTrue(older.contains("GitHub push chal raha hai"))
     }
 
     @Test
-    fun statusLineNeverInventsAStep() {
+    fun statusLineNeverInventsAnActivity() {
         val cmd = command()
         val line = TalkerReplyPolicy.statusLine(cmd, "   ", 65_000L)
         assertFalse(line.contains("Step"))
@@ -153,11 +153,14 @@ class TalkerReplyPolicyTest {
     )
 
     @Test
-    fun statusLineWithProgressNamesPlanStepAndEta() {
+    fun statusLineWithProgressNamesActivityAndEta() {
         val line = TalkerReplyPolicy.statusLine(
             command(), planProgress(), 120_000L, stalled = false, nowMs = 60_000L
         )
-        assertTrue(line.contains("Step 2/5: GitHub push"))
+        // R1 (no-step): the label is named in plain words — never a
+        // "Step N/M" count.
+        assertTrue(line.contains("GitHub push"))
+        assertFalse(line.contains("Step "))
         assertTrue(line.contains("lagbhag 1 minute aur"))
         assertTrue(line.contains("2 minute se chal raha hai"))
     }
@@ -171,7 +174,7 @@ class TalkerReplyPolicyTest {
         assertFalse(line.contains("lagbhag"))
         assertFalse(line.contains("Step "))
         val progress = TalkerReplyPolicy.progressLine(loopProgress(), "Kuch aur")
-        assertFalse("loops never invent a next step", progress.contains("aage:"))
+        assertFalse("loops never invent a next activity", progress.contains("aage:"))
         assertEquals("⏳ $progress", TalkerReplyPolicy.progressChatLine(loopProgress(), "Kuch aur"))
     }
 
@@ -181,9 +184,9 @@ class TalkerReplyPolicyTest {
         val line = TalkerReplyPolicy.statusLine(
             command(), stale, 600_000L, stalled = true, nowMs = 600_000L
         )
-        assertFalse("stale step label must not be quoted", line.contains("GitHub push"))
+        assertFalse("stale activity label must not be quoted", line.contains("GitHub push"))
         assertTrue(line.contains("10 minute se chal raha hai"))
-        assertTrue(line.contains("Pichle 5 minute se koi naya step nahi dikh raha"))
+        assertTrue(line.contains("Pichle 5 minute se koi nayi halchal nahi dikh rahi"))
     }
 
     @Test
@@ -200,8 +203,8 @@ class TalkerReplyPolicyTest {
         assertTrue(TalkerReplyPolicy.progressLine(start, "Supabase tables").contains("aage: Supabase tables"))
         val done = planProgress().copy(phase = "DONE", stepIndex = 5)
         val doneLine = TalkerReplyPolicy.progressLine(done, "")
-        // A step "ho gaya" is fine — only a terminal DONE may claim
-        // the whole task; the last step names no next step.
+        // An activity "ho gaya" is fine — only a terminal DONE may
+        // claim the whole task; the last unit names no next activity.
         assertTrue(doneLine.contains("ho gaya"))
         assertTrue(doneLine.contains("bas, khatm hone wala hai"))
         val mid = planProgress().copy(phase = "")

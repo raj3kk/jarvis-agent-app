@@ -11,6 +11,7 @@ import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.FilePatternStorage
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.LicenceKeyStore
 import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.DocumentSearch
@@ -477,7 +478,7 @@ class JarvisAgentEngine(
             "WHATSAPP_SEND" -> "${d.contact} ko ye message bhejna hai: ${d.text}. Bhej dun?"
             "REPLY_NOTIFICATION" -> "${d.contact} ko ye jawab bhejna hai: ${d.text}. Bhej dun?"
             "CALL" -> "${d.contact} ko call lagau?"
-            else -> "Ye payment/send wala step hai, kar dun?"
+            else -> "Ye payment/send wala kaam hai, kar dun?"
         }
         val reply = askUserVoice(question) ?: return GateOutcome.PAUSE_TASK to "question not spoken"
         if (isAffirmativeReply(reply.lowercase()) || isYesReply(reply)) {
@@ -772,7 +773,7 @@ class JarvisAgentEngine(
         }
         return when {
             ref.value != "ok" -> TalkerVerificationPolicy.RefCheckResult(
-                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "skill test step fail hua"
+                refId, TalkerVerificationPolicy.RefOutcome.FAILED, "skill test fail hua"
             )
             !verified -> TalkerVerificationPolicy.RefCheckResult(
                 refId, TalkerVerificationPolicy.RefOutcome.FAILED, "skill verified nahi mila"
@@ -1358,7 +1359,7 @@ class JarvisAgentEngine(
             learnedPatternStore.findInstructions(keywords, workKind.wire, goal)
         }.getOrDefault(emptyList())
         val patternHint = pattern?.let { p ->
-            "${p.title}. Steps: ${p.steps.joinToString(", ") { it.label }}"
+            "${p.title}. Kaam: ${p.steps.joinToString(", ") { it.label }}"
         } ?: ""
         val instructionHint = instructions.joinToString("; ") { it.text }
         val noteLines = ArrayList<String>()
@@ -1674,9 +1675,7 @@ class JarvisAgentEngine(
                         // satisfies the safety net by itself.
                         "no terminal result delivered" +
                             (talkerBus.lastProgress(cmd.id)?.let { progress ->
-                                "; last progress: Step ${progress.stepIndex}" +
-                                    (if (progress.stepTotal > 0) "/${progress.stepTotal}" else "") +
-                                    " ${progress.stepLabel}"
+                                "; last progress: ${progress.stepLabel}"
                             } ?: "")
                     )
                 cause != null ->
@@ -3238,14 +3237,14 @@ class JarvisAgentEngine(
     private fun tryLearnedReplay(trimmed: String): Boolean {
         val routine = learnedRoutineStore.findRoutine(trimmed) ?: return false
         if (routine.steps.isEmpty()) return false
-        JarvisStateRepository.addLog("Learned routine matched: '${routine.trigger}' (${routine.steps.size} steps)")
+        JarvisStateRepository.addLog("Learned routine matched: '${routine.trigger}' (${routine.steps.size} kaam)")
         activeTaskJob?.cancel()
         clearTaskScopedState()
         activeTaskJob = scope.launch {
             val acc = JarvisAccessibilityService.instance
             for (step in routine.steps) {
                 if (!isOnline() && learnedRoutineStore.isNetworkDependent(step.action)) {
-                    speak("Internet nahi hai — is step ke liye network chahiye, isliye replay yahin rok raha hoon. Net nahi hai, isliye yahin ruk raha hoon — jo steps ho gaye hain wo upar dikh rahe hain, baaki net aane par dobara bolo.")
+                    speak("Internet nahi hai — is kaam ke liye network chahiye, isliye replay yahin rok raha hoon. Net nahi hai, isliye yahin ruk raha hoon — jo kaam ho gaye hain wo upar dikh rahe hain, baaki net aane par dobara bolo.")
                     clearTaskScopedState()
                     JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Replay stopped offline")
                     return@launch
@@ -3256,9 +3255,9 @@ class JarvisAgentEngine(
                     // A-C5: an explicit decline ABORTS the task
                     // entirely — it must NOT fall back to the LLM
                     // loop (only a step-mismatch may re-plan).
-                    val reply = askUserVoice("Ye step sensitive hai (${step.action}). Kar dun?")
+                    val reply = askUserVoice("Ye kaam sensitive hai (${step.action}). Kar dun?")
                     if (reply == null || !isAffirmativeReply(reply.lowercase())) {
-                        JarvisStateRepository.addLog("Learned replay: sensitive step declined — aborting task")
+                        JarvisStateRepository.addLog("Learned replay: sensitive kaam declined — aborting task")
                         speak("Theek hai, kaam rok diya.")
                         clearTaskScopedState()
                         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
@@ -3401,7 +3400,9 @@ class JarvisAgentEngine(
                 val activated = lp.getBoolean(LicencePrefs.KEY_ACTIVATED, false)
                 val optOut = lp.getBoolean(LicencePrefs.KEY_OPT_OUT, false)
                 if (!activated || optOut) return@launch
-                val licenceKey = lp.getString(LicencePrefs.KEY_LICENCE, "") ?: ""
+                // U10 (R1): licence key comes from the encrypted
+                // store now (LicenceKeyStore) — never plain prefs.
+                val licenceKey = LicenceKeyStore.get(context)
                 if (licenceKey.isBlank()) {
                     JarvisStateRepository.addLog("Global-learning upload skipped: licence key blank.")
                     return@launch
@@ -3425,7 +3426,7 @@ class JarvisAgentEngine(
                     mapped.addAll(mapLearnedStepToServer(step.action))
                 }
                 if (mapped.isEmpty()) {
-                    JarvisStateRepository.addLog("Global-learning upload skipped: no server-mappable steps.")
+                    JarvisStateRepository.addLog("Global-learning upload skipped: no server-mappable kaam.")
                     return@launch
                 }
                 val stepsJson = JSONArray()
@@ -3490,7 +3491,7 @@ class JarvisAgentEngine(
                     }
                     val upMsg = when (code) {
                         400 -> "Upload rejected (400 validation): $detail — template not saved."
-                        409 -> "Upload conflict (409 same-hash-different-steps): template already exists with different steps — not overwritten."
+                        409 -> "Upload conflict (409 same-hash-different-content): template already exists with different kaam — not overwritten."
                         else -> "Upload failed (HTTP $code): $detail"
                     }
                     JarvisStateRepository.addDiagnostic("patterns", upCode, upMsg)
@@ -3659,7 +3660,16 @@ class JarvisAgentEngine(
         JarvisStateRepository.setCurrentGoal(currentGoal)
 
         val previousActions = mutableListOf<String>()
-        val maxSteps = prefs.maxAutonomousSteps
+        // R1 (N3): the loop is budget-gated, not step-counted. The
+        // budget is per-run and in-memory (a LOOP task has no
+        // persisted plan file — only PLAN tasks record budget in
+        // agent_plan.json). Every decideNextStep call is one LLM
+        // call (20 default / 40 hard); the watchdog is the time
+        // bound. The loop runs until DONE (verified) or budget
+        // exhausted or watchdog — never after N steps. The hub's
+        // 5-calls/turn cap does NOT apply here: LlmClient calls
+        // Gemini/Groq directly (BYOK).
+        val budget = TaskBudget()
         var step = 1
         var lastScreenHash = 0
         var consecutiveSameScreenCount = 0
@@ -3671,7 +3681,33 @@ class JarvisAgentEngine(
         var failedEvidenceRetries = 0
 
         try {
-            while (step <= maxSteps) {
+            while (true) {
+                // R1 (N3): watchdog — the 15-min stop. The task ends
+                // (FAILED, plain words), never silently, never late.
+                if (budget.watchdogExpired()) {
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.FAILED,
+                        "15 minute ho gaye — kaam samay par poora nahi ho paya. Dobara bolo to phir se koshish karunga.",
+                        "watchdog", speakResult = false
+                    )
+                    clearTaskScopedState()
+                    JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Time khatm — kaam ruk gaya")
+                    JarvisStateRepository.setCurrentGoal("")
+                    return
+                }
+                // R1 (N3): hard LLM budget — the decideNextStep call
+                // below is the call this check pays for.
+                if (!budget.noteLlmCall()) {
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.FAILED,
+                        "Kaam ka budget khatam ho gaya — kaam poora nahi ho paya. Dobara bolo to phir se koshish karunga.",
+                        "llm budget exhausted", speakResult = false
+                    )
+                    clearTaskScopedState()
+                    JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Budget khatm — kaam ruk gaya")
+                    JarvisStateRepository.setCurrentGoal("")
+                    return
+                }
                 // A-M7: per-step connectivity re-check — offline
                 // mid-task = pause (warn, do not complete, do not
                 // persist a routine), not a faked continuation.
@@ -3688,9 +3724,12 @@ class JarvisAgentEngine(
                     JarvisStateRepository.setCurrentGoal("")
                     return
                 }
+                // R1 (no-step): plain-words status only — no count,
+                // no "step" word. The telemetry card + overlay pill
+                // show this line verbatim.
                 JarvisStateRepository.setAgentState(
                     AgentRunState.THINKING,
-                    "Step $step/$maxSteps: Observing screen & thinking..."
+                    "Soch raha hoon — screen dekh raha hoon…"
                 )
 
                 val accService = JarvisAccessibilityService.instance
@@ -3764,12 +3803,13 @@ class JarvisAgentEngine(
                     screenTree = snapshot.formattedTree,
                     hasSensitivePaymentScreen = snapshot.hasSensitivePaymentPrompt,
                     isStuckWarning = isStuck,
-                    screenImageBase64 = visionBase64
+                    screenImageBase64 = visionBase64,
+                    budgetLine = budget.summaryForPrompt()
                 )
                 val llmMs = System.currentTimeMillis() - llmStartMs
 
                 JarvisStateRepository.addLog(
-                    "Step $step Decision: action=${decision.action}, thought=${decision.thought}, kind=${decision.decisionKind}, llmMs=$llmMs"
+                    "Turn $step Decision: action=${decision.action}, thought=${decision.thought}, kind=${decision.decisionKind}, llmMs=$llmMs"
                 )
 
                 // A-C6 / A-M1 / A-M2: error kinds NEVER complete,
@@ -3840,7 +3880,6 @@ class JarvisAgentEngine(
                 // would present the LLM's word as Jarvis's claim before
                 // any check. A question (askUser) and a pure chat turn
                 // (NONE) are not completion claims and speak as before.
-                var replyWasSpoken = false
                 var deferredCompletionReply: String? = null
                 val isCompletionClaim = decision.isCompleted &&
                     decision.action != "NONE" && !decision.askUser
@@ -3857,17 +3896,16 @@ class JarvisAgentEngine(
                                 AgentRunState.SPEAKING,
                                 "Speaking: ${decision.reply}"
                             )
-                            replyWasSpoken = speak(decision.reply, alreadyPostedToChat = true)
+                            speak(decision.reply, alreadyPostedToChat = true)
                         }
                     }
                 } else if ((decision.isCompleted || decision.askUser) && !isCompletionClaim) {
                     // 1.4.3: a FINAL answer / question that arrives
                     // BLANK must not pass in silence (the old
                     // guard-only path). Speak a fixed fallback line
-                    // as an audible marker. replyWasSpoken stays
-                    // false on purpose: the fallback is NOT the
-                    // (blank) question, so no answer is waited for
-                    // — the existing pause path below still runs.
+                    // as an audible marker. R1: the fallback is NOT
+                    // the (blank) question, so no answer is waited
+                    // for — the park path below still runs.
                     JarvisStateRepository.addLog(
                         "Blank final reply — speaking fallback line instead of silence."
                     )
@@ -3878,61 +3916,27 @@ class JarvisAgentEngine(
                     speak("Samajh gaya, aage badh raha hoon.")
                 }
 
-                // If Jarvis needs to ask the user a mid-task question, listen for reply and continue
+                // R1 (no-step): a mid-task question from the model
+                // is a PARK, never a voice-wait — the question is
+                // already in chat (and spoken above). The Executor
+                // stops here; the Talker tells the user the task is
+                // waiting, and the answer arrives as a new command
+                // (answeredClarifications carry it forward). The
+                // ONLY mid-task stops are the 5 hard gates + the
+                // watchdog — this is a park, not a gate.
                 if (decision.askUser) {
+                    clearTaskScopedState()
                     JarvisStateRepository.setAgentState(
-                        AgentRunState.WAITING_USER_REPLY,
-                        "Waiting for your voice answer..."
+                        AgentRunState.IDLE,
+                        "Paused — sawal ka jawab chahiye"
                     )
-                    // B-M8: never wait for an answer to an unspoken
-                    // question — the chat prompt above is the fallback.
-                    val userAnswer = if (replyWasSpoken) onRequestUserVoiceReply() else null
-                    if (!userAnswer.isNullOrBlank()) {
-                        // A-C5: an explicit decline ABORTS the task
-                        // entirely — it is not a clarification.
-                        if (isDeclineReply(userAnswer)) {
-                            speak("Theek hai, kaam rok diya.")
-                            // 1.8.0: DECLINED, chat-only — the line above was spoken.
-                            reportExecutorOutcome(
-                                ExecutorResultStatus.DECLINED,
-                                "User ne kaam rok diya.",
-                                "askUser decline", speakResult = false
-                            )
-                            clearTaskScopedState()
-                            JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Declined — task stopped")
-                            JarvisStateRepository.setCurrentGoal("")
-                            return
-                        }
-                        JarvisStateRepository.addChatMessage("You", userAnswer)
-                        persistChat()
-                        currentGoal = "$currentGoal (User clarified: $userAnswer)"
-                        previousActions.add("Asked user: '${decision.reply}' -> User answered: '$userAnswer'")
-                        // 1.4.18: record the answered clarification
-                        // for the ALREADY ANSWERED section (capped
-                        // last 12, engine-lifetime).
-                        answeredClarifications.add("Q: ${decision.reply} -> A: $userAnswer")
-                        while (answeredClarifications.size > 12) {
-                            answeredClarifications.removeAt(0)
-                        }
-                        step++
-                        continue
-                    } else {
-                        // A-C7: ask-user timeout clears the buffer.
-                        // 1.8.0: BLOCKED, fully announced — nothing
-                        // was spoken for this pause, so the Talker
-                        // must tell the user what is needed.
-                        reportExecutorOutcome(
-                            ExecutorResultStatus.BLOCKED,
-                            "Sawal ka jawab nahi aaya — jawab do to aage badhaun.",
-                            "askUser no reply"
-                        )
-                        clearTaskScopedState()
-                        JarvisStateRepository.setAgentState(
-                            AgentRunState.IDLE,
-                            "Paused — No voice reply received."
-                        )
-                        return
-                    }
+                    JarvisStateRepository.setCurrentGoal("")
+                    reportExecutorOutcome(
+                        ExecutorResultStatus.BLOCKED,
+                        decision.reply.ifBlank { "Sawal ka jawab chahiye." }.take(300),
+                        "askUser parked"
+                    )
+                    return
                 }
 
                 // A-C2 hard gate, before ANY execution.
@@ -3982,9 +3986,10 @@ class JarvisAgentEngine(
                 // action (ok=false) must never be exited as DONE.
                 var stepResult: ActionResult? = null
                 if (decision.action != "NONE") {
+                    // R1 (no-step): plain-words status only.
                     JarvisStateRepository.setAgentState(
                         AgentRunState.EXECUTING_STEP,
-                        "Step $step: Executing ${decision.action}..."
+                        "Abhi ${loopActionLabel(decision)} kar raha hoon…"
                     )
                     val actionResult = executeDecisionAction(decision, accService)
                     stepResult = actionResult
@@ -4015,7 +4020,7 @@ class JarvisAgentEngine(
                             retryOriginal = null
                         )
                         previousActions.add(
-                            "Step $step self-extension: ${extOutcome::class.simpleName}"
+                            "Turn $step self-extension: ${extOutcome::class.simpleName}"
                         )
                     }
                     // 1.4.25-PRO Step 2A (H4): record only ok steps.
@@ -4194,7 +4199,7 @@ class JarvisAgentEngine(
                                         secondClaim?.let { claim ->
                                             JarvisStateRepository.addChatMessage(
                                                 "Jarvis",
-                                                "Note: dusra daava ($claim) is step me verify nahi hua — dobara check karke bataunga."
+                                                "Note: dusra daava ($claim) is baar verify nahi hua — dobara check karke bataunga."
                                             )
                                             persistChat()
                                         }
@@ -4213,7 +4218,7 @@ class JarvisAgentEngine(
                                     secondClaim?.let { claim ->
                                         JarvisStateRepository.addChatMessage(
                                             "Jarvis",
-                                            "Note: dusra daava ($claim) is step me verify nahi hua — dobara check karke bataunga."
+                                            "Note: dusra daava ($claim) is baar verify nahi hua — dobara check karke bataunga."
                                         )
                                         persistChat()
                                     }
@@ -4295,7 +4300,7 @@ class JarvisAgentEngine(
                             // routine persisted, no memory indexed, no
                             // "Task Completed" wording anywhere. The
                             // detail goes to chat only, never spoken.
-                            val detail = "Step $step: ${stepResult?.summary ?: decision.action} — evidence fail"
+                            val detail = "${decision.action} — evidence fail"
                             JarvisStateRepository.addChatMessage(
                                 "Jarvis",
                                 "Bhai, kaam poora nahi ho paya — dobara batao to phir se koshish karunga. ($detail)"
@@ -4345,18 +4350,21 @@ class JarvisAgentEngine(
             clearTaskScopedState()
             JarvisStateRepository.setAgentState(
                 AgentRunState.IDLE,
-                "Reached max steps ($maxSteps). Ready."
+                "Budget khatm — kaam ruk gaya. Ready."
             )
             // 1.8.0: FAILED, chat-only — the line below was spoken.
+            // R1 (N3): the loop ends on budget/watchdog now, never
+            // on a step count — this line is reached only if the
+            // while(true) loop ever exits without a return above.
             reportExecutorOutcome(
                 ExecutorResultStatus.FAILED,
-                "Kaam $maxSteps steps me poora nahi ho paya.",
-                "max steps reached", speakResult = false
+                "Kaam budget ke andar poora nahi ho paya.",
+                "budget exhausted", speakResult = false
             )
             // 1.4.23-PRO Item 2 (C5): the old line claimed the steps
             // were "complete" for a task that did NOT complete. The
             // replacement states the non-completion, no success claim.
-            speak("Bhai, kaam $maxSteps steps me poora nahi ho paya — dobara batao to phir se koshish karunga.")
+            speak("Bhai, kaam budget ke andar poora nahi ho paya — dobara batao to phir se koshish karunga.")
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {

@@ -1,6 +1,5 @@
 package com.jarvis.autonomous.ui
 
-import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.data.LicenceKeyStore
 import com.jarvis.autonomous.data.PairingManager
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -83,9 +83,7 @@ fun PairingCard(prefs: JarvisPreferences) {
             val kind = runCatching { PairingManager.keyStoreKind(cardContext) }.getOrNull()
             val pub = runCatching { PairingManager.publicKeyB64(cardContext) }.getOrNull()
             val test = runCatching { PairingManager.selfTestSign(cardContext) }.getOrDefault(false)
-            val lic = cardContext.getSharedPreferences(
-                LicencePrefs.PREFS_NAME, Context.MODE_PRIVATE
-            ).getString(LicencePrefs.KEY_LICENCE, "") ?: ""
+            val lic = LicenceKeyStore.get(cardContext)
             val pend = runCatching { PairingManager.pendingToken(cardContext) }.getOrNull()
             LoadedPairingInfo(kind, pub, test, lic.isNotBlank(), pend)
         }
@@ -213,10 +211,11 @@ fun PairingCard(prefs: JarvisPreferences) {
                             busy = true
                             message = ""
                             val deviceId = PairingManager.deviceId(cardContext)
-                            val lic = cardContext.getSharedPreferences(
-                                LicencePrefs.PREFS_NAME, Context.MODE_PRIVATE
-                            ).getString(LicencePrefs.KEY_LICENCE, "") ?: ""
+                            // U10 (R1): licence key read from the
+                            // encrypted store, inside the IO block
+                            // (never plain prefs any more).
                             val result = withContext(Dispatchers.IO) {
+                                val lic = LicenceKeyStore.get(cardContext)
                                 PairingManager.initPairing(cardContext, deviceId, lic)
                             }
                             busy = false
@@ -315,6 +314,8 @@ private fun pairingErrorText(kind: PairingManager.PairingError): String {
             "Server abhi licence check nahi kar paya — dobara try karo."
         PairingManager.PairingError.LICENCE_INVALID ->
             "Licence active nahi hai — Licence tab check karo."
+        PairingManager.PairingError.DEVICE_MISMATCH ->
+            "Ye licence kisi aur device se bound hai — pehle us device se Release karo (Licence tab), phir dobara Pair karo."
         PairingManager.PairingError.RATE_LIMITED ->
             "Bahut jaldi try kar rahe ho — 1 minute ruk kar dobara try karo."
         PairingManager.PairingError.TOKEN_INVALID ->

@@ -21,6 +21,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +38,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jarvis.autonomous.data.LicenceKeyStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -109,6 +111,12 @@ import org.json.JSONObject
 object LicencePrefs {
     const val PREFS_NAME = "jarvis_agent_prefs"
     const val KEY_OPT_OUT = "global_learning_opt_out"
+    // U10 (R1): KEY_LICENCE is now the MIGRATION-ONLY plain-prefs
+    // key name. New reads/writes go through LicenceKeyStore
+    // (EncryptedSharedPreferences); this constant is kept so the
+    // one-time migration in LicenceKeyStore.get() finds the 1.14.0
+    // value. Nothing in this file reads/writes the key in plain
+    // prefs any more.
     const val KEY_LICENCE = "licence_key"
     const val KEY_ACTIVATED = "licence_activated"
 }
@@ -177,8 +185,13 @@ fun LicenceScreen() {
     }
     val scope = rememberCoroutineScope()
 
-    var licenceKey by remember {
-        mutableStateOf(prefs.getString(LicencePrefs.KEY_LICENCE, "") ?: "")
+    var licenceKey by remember { mutableStateOf("") }
+    // U10 (R1): the key lives encrypted now (LicenceKeyStore).
+    // Loaded once on IO — the first load also runs the one-time
+    // migration of a 1.14.0 plain-prefs value, so an
+    // already-activated user never re-activates.
+    LaunchedEffect(Unit) {
+        licenceKey = withContext(Dispatchers.IO) { LicenceKeyStore.get(context) }
     }
     var sessionToken by remember { mutableStateOf("") }
     // 1.4.5 (item 8): licence-key field masked by default (the
@@ -313,7 +326,7 @@ fun LicenceScreen() {
                     fontSize = 13.sp
                 )
                 Text(
-                    text = "Steps: 1. Neeche Release section se purani binding release karo. " +
+                    text = "Kaise karein: 1. Neeche Release section se purani binding release karo. " +
                         "2. Is app me wahi licence key se dobara Activate karo.",
                     fontSize = 13.sp
                 )
@@ -385,13 +398,16 @@ fun LicenceScreen() {
                                 // anyway. Now the key + flag are read
                                 // back and confirmed on IO first, and
                                 // a save failure is shown as a failure.
+                                // U10 (R1): the key is saved ENCRYPTED
+                                // (LicenceKeyStore); only the activated
+                                // flag stays in plain prefs.
                                 val saved = withContext(Dispatchers.IO) {
-                                    val ok = prefs.edit()
-                                        .putString(LicencePrefs.KEY_LICENCE, key)
+                                    val keyOk = LicenceKeyStore.put(context, key)
+                                    val flagOk = prefs.edit()
                                         .putBoolean(LicencePrefs.KEY_ACTIVATED, true)
                                         .commit()
-                                    ok &&
-                                        prefs.getString(LicencePrefs.KEY_LICENCE, "") == key &&
+                                    keyOk && flagOk &&
+                                        LicenceKeyStore.get(context) == key &&
                                         prefs.getBoolean(LicencePrefs.KEY_ACTIVATED, false)
                                 }
                                 if (saved) {
@@ -623,7 +639,7 @@ fun LicenceScreen() {
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = "OFF (default) = uploads allowed ONLY as anonymized templates " +
-                        "(sirf action + target-kind steps — koi baat-cheet, message, contact, " +
+                        "(sirf action + target-kind kaam — koi baat-cheet, message, contact, " +
                         "URL ya file content kabhi upload nahi hota). " +
                         "ON = is device se koi pattern upload nahi hota.",
                     fontSize = 12.sp,

@@ -28,11 +28,19 @@ import java.util.concurrent.TimeUnit
  * the user's utterance beyond the goal itself.
  *
  * Secrets file: EncryptedSharedPreferences "jarvis_agent_secrets"
- * (MasterKey AES256_GCM). Keys exactly: github_pat,
- * supabase_pat, supabase_project_ref, vercel_token. Tokens are
+ * (MasterKey AES256_GCM). Keys exactly: supabase_pat,
+ * supabase_project_ref, vercel_token. Tokens are
  * sent ONLY as Authorization: Bearer headers, never as URL query
  * params, and never appear in a log, chat line, plan JSON, or
  * returned status string.
+ *
+ * R1 (1.16.0-PRO, REDESIGN_PLAN.md §4.1): the GitHub PAT is GONE —
+ * no github_pat key, no GitHub field in AI Brain, no direct GitHub
+ * call from the phone. GitHub goes through the hub
+ * (HubGithubClient: POST /api/github/fetch, /api/github/pr-request,
+ * /api/escalate, device-signed; admin token lives in the hub Worker
+ * secret). Supabase/Vercel tokens STAY — they are the user's own
+ * projects; only GitHub moved server-side.
  */
 enum class PlanState {
     PENDING, RUNNING, DONE, FAILED, BLOCKED, SKIPPED,
@@ -88,7 +96,8 @@ data class PlanStep(
     }
 }
 
-/** UI-facing snapshot of one step (read by the plan card). */
+/** Internal work-unit snapshot (never rendered — the plan card shows
+ *  only plain-words status, never a unit list). */
 data class PlanStepView(
     val id: String,
     val kind: String,
@@ -98,7 +107,9 @@ data class PlanStepView(
     val evidence: String
 )
 
-/** UI-facing snapshot of a plan (read by the plan card + FGS notification). */
+/** Snapshot of a plan (read by the plan card + FGS notification).
+ *  R1: the card renders only the goal + current activity in plain
+ *  words — the unit list stays internal, never shown. */
 data class PlanView(
     val planId: String,
     val goal: String,
@@ -117,7 +128,11 @@ data class AgentPlan(
     /** Terminal record: every step DONE, or terminally BLOCKED/FAILED
      *  after asking, or user-declined. A completed plan is NEVER
      *  auto-resumed; a new plan overwrites the file. */
-    val completed: Boolean = false
+    val completed: Boolean = false,
+    /** R1 (N3, §9.3): persisted task-budget state (LLM calls used,
+     *  work units done, fix attempts, started-at). Absent on old
+     *  plans — fromJson treats that as a fresh budget. */
+    val budget: com.jarvis.autonomous.agent.TaskBudgetState? = null
 ) {
     fun toView(): PlanView = PlanView(
         planId = planId,
@@ -137,6 +152,7 @@ data class AgentPlan(
         put("answeredClarifications", JSONArray(answeredClarifications))
         put("steps", JSONArray(steps.map { it.toJson() }))
         put("completed", completed)
+        if (budget != null) put("budget", budget.toJson())
     }
 
     companion object {
@@ -168,7 +184,8 @@ data class AgentPlan(
                     currentStepId = if (obj.isNull("currentStepId")) null else obj.optString("currentStepId", "").takeIf { it.isNotBlank() },
                     answeredClarifications = clarifications,
                     steps = steps,
-                    completed = obj.optBoolean("completed", false)
+                    completed = obj.optBoolean("completed", false),
+                    budget = com.jarvis.autonomous.agent.TaskBudgetState.fromJson(obj.optJSONObject("budget"))
                 )
             } catch (e: Exception) {
                 null
@@ -284,7 +301,10 @@ object AgentPlanStore {
  */
 object AgentSecrets {
     const val FILE_NAME = "jarvis_agent_secrets"
-    const val KEY_GITHUB_PAT = "github_pat"
+    // R1: KEY_GITHUB_PAT REMOVED (REDESIGN_PLAN.md §4.1) — GitHub
+    // goes through the hub (HubGithubClient); the phone holds no
+    // GitHub token any more. A stale github_pat value left in the
+    // encrypted store from 1.14.0 is simply never read.
     const val KEY_SUPABASE_PAT = "supabase_pat"
     const val KEY_SUPABASE_PROJECT_REF = "supabase_project_ref"
     const val KEY_VERCEL_TOKEN = "vercel_token"
@@ -335,24 +355,6 @@ object AgentSecrets {
         httpClient.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             return resp.code to body
-        }
-    }
-
-    /** GitHub: one cheap GET /user — returns the login name on
-     *  success, HTTP code + body message otherwise. */
-    suspend fun testGithub(context: Context): String = withContext(Dispatchers.IO) {
-        val token = get(context, KEY_GITHUB_PAT)
-        if (token.isBlank()) return@withContext "GitHub PAT saved nahi hai — pehle token daalo aur SAVE dabao."
-        try {
-            val (code, body) = getJson("https://api.github.com/user", token)
-            if (code == 200) {
-                val login = runCatching { JSONObject(body).optString("login", "") }.getOrDefault("")
-                "OK (HTTP 200) — GitHub login: ${login.ifBlank { "unknown" }}"
-            } else {
-                "HTTP $code: ${body.take(200)}"
-            }
-        } catch (e: Exception) {
-            "Network error: ${(e.message ?: "unknown").take(200)}"
         }
     }
 

@@ -1,0 +1,33 @@
+xterm.js — bundled copy, version 6.0.0 (released 2025-12-22)
+Source: https://github.com/xtermjs/xterm.js (npm @xterm/xterm@6.0.0)
+Files: xterm.js (488,663 bytes), xterm.css (7,112 bytes)
+SHA-256: xterm.js 14903579ff54664cd72f8e8699e6961a6272c21863ec1c3b118cdc8af5d4a972
+         xterm.css 854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6
+Licence: MIT (full text below — also in the header of xterm.css).
+Pinned version, bundled as an app asset — never fetched from the
+network, never "latest". No addons bundled (Fit/WebLinks not used).
+
+MIT License
+
+Copyright (c) 2017-2018, The xterm.js authors
+Copyright (c) 2014-2017, SourceLair, Private Company (www.sourcelair.com)
+Copyright (c) 2012-2013, Christopher Jeffrey (MIT License)
+https://github.com/chjj/term.js
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

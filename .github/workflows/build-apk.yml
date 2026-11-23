@@ -11,6 +11,50 @@ permissions:
   contents: read
 
 jobs:
+  # R1 (1.16.0-PRO): ktlint presence check — CI-only, $0, never
+  # embedded in the APK. Pinned ktlint 1.5.0 (never "latest").
+  # SOFT gate by design: it REPORTS style violations as an
+  # artifact and fails ONLY when ktlint itself cannot run
+  # (download failure / crash) — it must NOT fail on pre-existing
+  # style violations in this tree. Runs as its own job so a lint
+  # hiccup never blocks the APK build.
+  lint-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Download pinned ktlint 1.5.0
+        run: |
+          set -e
+          curl -fsSL -o ktlint https://github.com/pinterest/ktlint/releases/download/1.5.0/ktlint
+          chmod +x ktlint
+          ./ktlint --version
+
+      - name: Run ktlint (report only — violations never fail this job)
+        run: |
+          set +e
+          ./ktlint --reporter=plain,output=ktlint-report.txt app/src/main/java app/src/test app/src/androidTest
+          CODE=$?
+          echo "ktlint exit code: $CODE (0 = clean, 1 = violations found — report only)"
+          test -s ktlint-report.txt || echo "(no violations — clean)" > ktlint-report.txt
+          wc -l ktlint-report.txt
+          exit 0
+
+      - name: Upload ktlint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ktlint-report
+          path: ktlint-report.txt
+          retention-days: 30
+
   build-apk:
     runs-on: ubuntu-latest
     steps:
@@ -32,7 +76,7 @@ jobs:
 
       # 1.4.5 (item 7): versionCode MUST exceed the previous
       # delivered versionCode, or the build fails. Floor is the
-      # last delivered vc (50 = 1.14.0) — BUMP THIS FLOOR ON
+      # last delivered vc (51 = 1.15.0) — BUMP THIS FLOOR ON
       # EVERY RELEASE (it is not read from any API: releases are
       # artifacts, not GitHub Releases, so no releases-API check
       # is available). A same-or-lower vc would install as "not
@@ -41,10 +85,10 @@ jobs:
         run: |
           set -e
           VC=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          echo "versionCode in tree: $VC (floor PREV_VC=50, previous delivered 1.14.0)"
+          echo "versionCode in tree: $VC (floor PREV_VC=51, previous delivered 1.15.0)"
           test -n "$VC"
           # NOTE: bump PREV_VC below on every release.
-          PREV_VC=50
+          PREV_VC=51
           if [ "$VC" -le "$PREV_VC" ]; then
             echo "FAIL: versionCode $VC is not greater than previous delivered $PREV_VC — bump versionCode first."
             exit 1

@@ -49,8 +49,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 51
-        versionName = "1.15.0-PRO"
+        versionCode = 52
+        versionName = "1.16.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI

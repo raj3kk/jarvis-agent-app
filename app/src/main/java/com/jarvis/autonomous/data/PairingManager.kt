@@ -84,7 +84,11 @@ object PairingManager {
 
     enum class PairingError {
         CONFIG_MISSING, LICENCE_INVALID, RATE_LIMITED, TOKEN_INVALID,
-        BAD_REQUEST, NETWORK, SERVER, NO_PENDING, NO_LICENCE, KEY_ERROR
+        BAD_REQUEST, NETWORK, SERVER, NO_PENDING, NO_LICENCE, KEY_ERROR,
+        // U10 (R1): 409 device_mismatch — the licence is bound to a
+        // DIFFERENT device. Same Licence-screen wording as the
+        // verify 409 (LicenceScreen.kt), not a generic server error.
+        DEVICE_MISMATCH
     }
 
     sealed interface InitResult {
@@ -355,6 +359,14 @@ object PairingManager {
                     InitResult.Ok(code, expiresAt)
                 }
                 403 -> InitResult.Err(PairingError.LICENCE_INVALID)
+                // U10 (R1): 409 device_mismatch — the licence is
+                // bound to another device. The hub init route does
+                // NOT emit 409 today (hub.ts init: 400/403/429 only;
+                // verifyLicenceKey returns a boolean), so this is a
+                // defensive branch like the 503 below: if a future
+                // device-binding check answers 409, the UI names it
+                // instead of showing a generic "Server error".
+                409 -> InitResult.Err(PairingError.DEVICE_MISMATCH)
                 429 -> InitResult.Err(PairingError.RATE_LIMITED)
                 503 -> InitResult.Err(PairingError.CONFIG_MISSING)
                 400 -> InitResult.Err(PairingError.BAD_REQUEST)
@@ -405,6 +417,14 @@ object PairingManager {
                     clearPendingToken(context)
                     RegisterResult.Err(PairingError.TOKEN_INVALID)
                 }
+                // U10 (R1): 409 device_mismatch — same defensive
+                // branch as init (the hub register route does not
+                // emit 409 today: 400/403 only). The pending token
+                // is NOT cleared here — unlike a spent/invalid
+                // token, a device mismatch says nothing about the
+                // token, so the user can retry after releasing the
+                // old binding instead of starting pairing over.
+                409 -> RegisterResult.Err(PairingError.DEVICE_MISMATCH)
                 429 -> RegisterResult.Err(PairingError.RATE_LIMITED)
                 400 -> RegisterResult.Err(PairingError.BAD_REQUEST)
                 else -> RegisterResult.Err(PairingError.SERVER)

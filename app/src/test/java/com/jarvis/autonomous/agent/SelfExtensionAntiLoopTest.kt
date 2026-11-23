@@ -116,7 +116,7 @@ class SelfExtensionAntiLoopTest {
         val failure = ExecutorFailure(
             stepKind = "BUILD",
             action = "BUILD",
-            reason = "Unknown step kind: FAKE_KIND_X",
+            reason = "Unknown kaam kind: FAKE_KIND_X",
             goalText = "my key is $secret, email someone@example.com"
         )
         val detection = SelfExtensionDetector.detect(failure)

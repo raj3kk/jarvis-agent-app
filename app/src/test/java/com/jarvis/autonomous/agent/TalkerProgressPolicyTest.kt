@@ -11,7 +11,7 @@ import org.junit.Test
  */
 class TalkerProgressPolicyTest {
 
-    private fun progress(label: String = "Step A", emittedAtMs: Long = 0L) =
+    private fun progress(label: String = "Kaam A", emittedAtMs: Long = 0L) =
         ExecutorProgress(
             commandId = "c", stepIndex = 1, stepTotal = 3, stepLabel = label,
             isMilestone = true, emittedAtMs = emittedAtMs
@@ -45,12 +45,12 @@ class TalkerProgressPolicyTest {
 
     @Test
     fun speakBlockedForSameLabelWithinSixtySeconds() {
-        assertFalse(speak(nowMs = 59_999L, lastSpokenLabel = "Step A", lastSpokenLabelAtMs = 0L))
+        assertFalse(speak(nowMs = 59_999L, lastSpokenLabel = "Kaam A", lastSpokenLabelAtMs = 0L))
         // Exactly at the 60 s boundary the dedupe window has elapsed.
-        assertTrue(speak(nowMs = 60_000L, lastSpokenLabel = "Step A", lastSpokenLabelAtMs = 0L))
-        assertTrue(speak(nowMs = 60_001L, lastSpokenLabel = "Step A", lastSpokenLabelAtMs = 0L))
+        assertTrue(speak(nowMs = 60_000L, lastSpokenLabel = "Kaam A", lastSpokenLabelAtMs = 0L))
+        assertTrue(speak(nowMs = 60_001L, lastSpokenLabel = "Kaam A", lastSpokenLabelAtMs = 0L))
         // A different label is not a dedupe repeat.
-        assertTrue(speak(progress("Step B"), nowMs = 60_000L, lastSpokenLabel = "Step A", lastSpokenLabelAtMs = 0L))
+        assertTrue(speak(progress("Kaam B"), nowMs = 60_000L, lastSpokenLabel = "Kaam A", lastSpokenLabelAtMs = 0L))
     }
 
     @Test
@@ -81,11 +81,11 @@ class TalkerProgressPolicyTest {
         assertTrue(TalkerProgressPolicy.shouldPostToChat(p, 5_000L, 0L, null, -1.0))
         assertFalse(TalkerProgressPolicy.shouldPostToChat(p, 4_999L, 0L, null, -1.0))
         // Same label AND same fraction → no re-post.
-        assertFalse(TalkerProgressPolicy.shouldPostToChat(p, 60_000L, 0L, "Step A", -1.0))
+        assertFalse(TalkerProgressPolicy.shouldPostToChat(p, 60_000L, 0L, "Kaam A", -1.0))
         // Same label but a new fraction → post.
         assertTrue(
             TalkerProgressPolicy.shouldPostToChat(
-                p.copy(progressFraction = 0.5), 60_000L, 0L, "Step A", -1.0
+                p.copy(progressFraction = 0.5), 60_000L, 0L, "Kaam A", -1.0
             )
         )
     }

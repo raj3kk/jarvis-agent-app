@@ -45,6 +45,17 @@ import kotlinx.coroutines.launch
  * from the server (cron_cap 403) and are shown verbatim. All calls
  * are device-signed (PairingManager); no tokens on the phone, no
  * new Android permission.
+ *
+ * U9 (R1 audit follow-up, B6): EDIT — the same create flow with
+ * prefill (command + the job's cron expression; a new NL time can
+ * be parsed over it). There is NO server update route (hub
+ * /api/billing/cron-jobs has create/list/enable/disable/delete
+ * only), so an edit is create-then-delete: the NEW job is created
+ * first and the old one deleted only after that succeeds, so a
+ * failed edit never loses the running job. LAST RUN is shown per
+ * job ("Pichla run") — the server returns last_run_at in the list
+ * (hub.ts SELECT), and a never-run job says so explicitly instead
+ * of showing nothing.
  */
 @Composable
 fun CronManagerCard() {
@@ -58,6 +69,10 @@ fun CronManagerCard() {
     var parsedExpr by remember { mutableStateOf<String?>(null) }
     var parsedNextRun by remember { mutableStateOf<Long?>(null) }
     var confirmDeleteId by remember { mutableStateOf<String?>(null) }
+    // U9 (R1): the job being edited, if any. Edit prefills the
+    // create form below (command + the job's cron expression);
+    // saving creates the new job FIRST, then deletes this one.
+    var editingJobId by remember { mutableStateOf<String?>(null) }
 
     fun refresh() {
         scope.launch(Dispatchers.IO) {
@@ -108,9 +123,36 @@ fun CronManagerCard() {
                         Text("Agla run: ${CronJobClient.formatNextRun(job.nextRunAt)}", fontSize = 12.sp)
                         if (job.lastRunAt != null) {
                             Text("Pichla run: ${CronJobClient.formatNextRun(job.lastRunAt)}", fontSize = 12.sp)
+                        } else {
+                            // U9 (R1): a never-run job says so
+                            // explicitly — a missing line looked like
+                            // a missing feature, it is a real state.
+                            Text("Pichla run: abhi tak nahi chala", fontSize = 12.sp)
                         }
                         Text(if (job.enabled) "Status: Chalu" else "Status: Band", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = !busy,
+                                onClick = {
+                                    // U9 (R1): edit = the create flow
+                                    // with prefill. Command + the
+                                    // job's cron expression are loaded
+                                    // into the form below; typing a new
+                                    // time + "Time samjho" replaces the
+                                    // expression, otherwise the old
+                                    // time is kept as-is.
+                                    editingJobId = job.id
+                                    commandText = job.command
+                                    parsedExpr = job.cronExpr
+                                    parsedNextRun = job.nextRunAt
+                                    nlText = ""
+                                    statusText = "Edit kar rahe ho: ${job.command} — purana time ${job.cronExpr} rakha hai. Naya time likh kar 'Time samjho' dabao, ya waise hi 'Save edit' dabao."
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                            ) {
+                                Text("Edit", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
                             Button(
                                 enabled = !busy,
                                 onClick = {
@@ -169,8 +211,12 @@ fun CronManagerCard() {
                 }
             }
 
-            // ---- Add a job ----
-            Text("Naya schedule", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            // ---- Add a job (U9: doubles as the edit form when editingJobId != null) ----
+            Text(
+                if (editingJobId != null) "Edit job — neeche badlo aur Save edit dabao" else "Naya schedule",
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp
+            )
             OutlinedTextField(
                 value = nlText,
                 onValueChange = { nlText = it },
@@ -221,15 +267,35 @@ fun CronManagerCard() {
                 onClick = {
                     val expr = parsedExpr ?: return@Button
                     busy = true
-                    statusText = "Job schedule ho raha hai…"
+                    statusText = if (editingJobId != null) "Job edit ho raha hai…" else "Job schedule ho raha hai…"
                     scope.launch(Dispatchers.IO) {
                         when (val r = CronJobClient.createJob(context, expr, commandText.trim())) {
                             is CronJobClient.CreateResult.Ok -> {
+                                // U9 (R1): edit = create FIRST, then
+                                // delete the old job. A failed create
+                                // leaves the old job untouched (the
+                                // branches below never reach the
+                                // delete); a failed delete after a
+                                // good create is reported honestly
+                                // instead of claiming the edit worked.
+                                val oldId = editingJobId
                                 nlText = ""
                                 commandText = ""
                                 parsedExpr = null
                                 parsedNextRun = null
-                                statusText = "Job schedule ho gaya — agla run ${CronJobClient.formatNextRun(r.nextRunAt)}."
+                                editingJobId = null
+                                if (oldId != null) {
+                                    when (val del = CronJobClient.deleteJob(context, oldId)) {
+                                        is CronJobClient.OpResult.Ok -> {
+                                            statusText = "Job edit ho gaya — agla run ${CronJobClient.formatNextRun(r.nextRunAt)}."
+                                        }
+                                        is CronJobClient.OpResult.Err -> {
+                                            statusText = "Naya job ban gaya (agla run ${CronJobClient.formatNextRun(r.nextRunAt)}), par purana job delete nahi hua — use list se haath se delete karo: ${del.message}"
+                                        }
+                                    }
+                                } else {
+                                    statusText = "Job schedule ho gaya — agla run ${CronJobClient.formatNextRun(r.nextRunAt)}."
+                                }
                                 refresh()
                             }
                             is CronJobClient.CreateResult.Cap -> {
@@ -245,7 +311,29 @@ fun CronManagerCard() {
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D5B))
             ) {
-                Text("Schedule karo", color = Color.White, fontWeight = FontWeight.Bold)
+                Text(
+                    if (editingJobId != null) "Save edit" else "Schedule karo",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            // U9 (R1): cancel an edit without touching the job.
+            if (editingJobId != null) {
+                Button(
+                    enabled = !busy,
+                    onClick = {
+                        editingJobId = null
+                        nlText = ""
+                        commandText = ""
+                        parsedExpr = null
+                        parsedNextRun = null
+                        statusText = "Edit cancel — job waisa ka waisa hai."
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A7A70))
+                ) {
+                    Text("Edit cancel karo", color = Color.White, fontWeight = FontWeight.Bold)
+                }
             }
             Button(
                 enabled = !busy,

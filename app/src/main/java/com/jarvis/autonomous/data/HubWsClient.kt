@@ -380,7 +380,7 @@ class HubWsClient(
         val kind = step.optString("kind", "")
         val jobId = step.optString("job_id", "").ifBlank { "unknown" }
         if (kind != "CRON_COMMAND") {
-            sendStepResult(jobId, false, "Unknown step kind: $kind")
+            sendStepResult(jobId, false, "Unknown kaam kind: $kind")
             return
         }
         val command = step.optString("command", "")

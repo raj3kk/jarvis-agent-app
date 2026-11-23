@@ -40,7 +40,7 @@ class TalkerExecutorProgressTest {
 
     @Test
     fun stepProgressRoundTripWithoutOptionalFields() {
-        val p = ExecutorProgress(commandId = "c", stepIndex = 1, stepTotal = 0, stepLabel = "Step")
+        val p = ExecutorProgress(commandId = "c", stepIndex = 1, stepTotal = 0, stepLabel = "Kaam")
         val parsed = ExecutorProgress.fromJson(p.toJson())
         assertEquals(p, parsed)
         assertEquals(-1.0, parsed!!.progressFraction, 0.0001)

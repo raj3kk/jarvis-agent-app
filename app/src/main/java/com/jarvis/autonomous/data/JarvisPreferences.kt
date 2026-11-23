@@ -2,6 +2,7 @@ package com.jarvis.autonomous.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.jarvis.autonomous.agent.TaskBudgetDefaults
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -247,10 +248,11 @@ class JarvisPreferences(context: Context) {
         }
         set(value) = prefs.edit().putString("persona_prompt", value).apply()
 
-    // Fast mode: intermediate multi-step voice updates are OFF by default.
-    // Speaking every step aloud serialises TTS (seconds per step) in front
-    // of the next action; the chat feed still shows every step live, and
-    // the final answer / question is always spoken.
+    // Fast mode: intermediate voice updates are OFF by default.
+    // Speaking every activity aloud serialises TTS (seconds per
+    // turn) in front of the next action; the chat feed still shows
+    // every activity live, and the final answer / question is
+    // always spoken.
     var speakIntermediateSteps: Boolean
         get() = prefs.getBoolean("speak_intermediate_steps", false)
         set(value) = prefs.edit().putBoolean("speak_intermediate_steps", value).apply()
@@ -279,10 +281,53 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getBoolean("auto_start_on_boot", true)
         set(value) = prefs.edit().putBoolean("auto_start_on_boot", value).apply()
 
+    // R1 (1.16.0-PRO, N3 budgets — REDESIGN_PLAN.md §9.3):
+    // the loop runs until DONE or budget/watchdog, NEVER after N
+    // steps. ⚠️ NEEDS THE USER'S WORD — the numbers below are PLAN
+    // DEFAULTS, not user-confirmed values (flagged here, in
+    // TaskBudget.kt, and in APP_NOTES.md).
+    /** Work units per task (default 10 / hard 20). */
+    var workUnitsPerTask: Int
+        get() = prefs.getInt("work_units_per_task", TaskBudgetDefaults.WORK_UNITS_DEFAULT)
+        set(value) = prefs.edit().putInt(
+            "work_units_per_task",
+            value.coerceIn(1, TaskBudgetDefaults.WORK_UNITS_HARD)
+        ).apply()
+    /** LLM calls per task (default 20 / hard 40). */
+    var llmCallsPerTask: Int
+        get() = prefs.getInt("llm_calls_per_task", TaskBudgetDefaults.LLM_CALLS_DEFAULT)
+        set(value) = prefs.edit().putInt(
+            "llm_calls_per_task",
+            value.coerceIn(1, TaskBudgetDefaults.LLM_CALLS_HARD)
+        ).apply()
+    /** Watchdog minutes per task (default 15). */
+    var taskWatchdogMinutes: Int
+        get() = prefs.getInt("task_watchdog_minutes", TaskBudgetDefaults.WATCHDOG_MINUTES)
+        set(value) = prefs.edit().putInt(
+            "task_watchdog_minutes", value.coerceIn(1, 60)
+        ).apply()
+    /** Fix attempts per work unit (default 2). */
+    var fixAttemptsPerUnit: Int
+        get() = prefs.getInt("fix_attempts_per_unit", TaskBudgetDefaults.FIX_ATTEMPTS_PER_UNIT)
+        set(value) = prefs.edit().putInt(
+            "fix_attempts_per_unit", value.coerceIn(0, 5)
+        ).apply()
+
+    /**
+     * DEPRECATED in R1 — kept only so an old stored value never
+     * breaks a read. Nothing in 1.16.0 reads this: the loop is
+     * budget-gated (TaskBudget), never step-counted. The "max_steps"
+     * key stays in storage unread; the Settings slider that wrote
+     * it is removed in MainActivity.
+     */
+    @Deprecated("R1: step-count stopping is gone — use TaskBudget via workUnitsPerTask / llmCallsPerTask")
     var maxAutonomousSteps: Int
         get() = prefs.getInt("max_steps", 25)
         set(value) = prefs.edit().putInt("max_steps", value.coerceIn(5, 100)).apply()
 
+    // Internal pacing between turns — NOT a step count. The key
+    // stays "step_delay_ms" for storage compat; the Settings label
+    // is reworded ("Kaam ke beech rukawat").
     var stepDelayMs: Long
         get() {
             val v = prefs.getLong("step_delay_ms", 650L)

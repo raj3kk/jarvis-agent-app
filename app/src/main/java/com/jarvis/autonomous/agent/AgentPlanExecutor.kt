@@ -5,6 +5,7 @@ import com.jarvis.autonomous.data.AgentPlan
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
+import com.jarvis.autonomous.data.HubGithubClient
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.GoogleClient
@@ -37,14 +38,43 @@ import java.util.concurrent.TimeUnit
  * WorkManager, no second service, no new background component.
  * Pehle-Jaanch §3 is the design authority.
  *
- * Rules enforced here (not in prompts): a step is DONE only when
+ * Rules enforced here (not in prompts): a unit is DONE only when
  * its §3d evidence check passes — the LLM's word alone is never
  * evidence; isCompleted from a decision NEVER ends a plan; a plan
- * ends only when every step is DONE, or terminally BLOCKED/FAILED
+ * ends only when every unit is DONE, or terminally BLOCKED/FAILED
  * after asking. Silent progress (§3e): NO speaks for progress —
  * speaks ONLY for the final completion summary, ask-user
  * questions, and plan-ending failures. Chat lines only for
  * completions, failures, asks. AgentRunState is NOT extended.
+ *
+ * R1 (1.16.0-PRO) — NO-STEP REWIRE (REDESIGN_PLAN.md §9.1, user
+ * re-confirmed 2026-11-23): the user NEVER sees a step — no lists,
+ * no counts, no per-unit confirmations, no "step" word in any chat
+ * line, spoken line, state label, or card. Internal work units
+ * stay internal (the PlanStep model keeps its name — it never
+ * surfaces). The ONLY mid-task stops are the 5 hard gates
+ * (otp / login / payment / biometric / destructive_confirm) + the
+ * 15-min watchdog. Every other mid-task clarification becomes a
+ * PARK: the task stops, the Talker tells the user plainly what is
+ * needed, the Executor waits — never a mid-task ask-stop. The
+ * Executor NEVER speaks to the user directly; results go only via
+ * the bus to the Talker.
+ *
+ * R1 — N3 BUDGET (REDESIGN_PLAN.md §9.3): per-task budget replaces
+ * step-count stopping. TaskBudget: 10 work units default / 20 hard,
+ * max 2 fix attempts per unit, 15-min watchdog, 20 LLM calls
+ * default / 40 hard — PLAN DEFAULTS, NEEDS THE USER'S WORD (see
+ * TaskBudget.kt). The loop runs until DONE (verified) or budget
+ * exhausted or watchdog — never after N steps. The hub's
+ * 5-calls/turn cap does NOT apply to the phone path (LlmClient
+ * calls Gemini/Groq directly, BYOK).
+ *
+ * R1 — GITHUB VIA HUB (REDESIGN_PLAN.md §4.1): pushToGithub and
+ * every direct api.github.com call are GONE. GitHub goes through
+ * HubGithubClient (device-signed hub routes, admin token on the
+ * hub). github_not_configured / 503 parks with a plain-words
+ * message, never a crash. Supabase/Vercel direct calls STAY
+ * (user's own projects).
  */
 class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
@@ -67,6 +97,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     // (learn only from VERIFIED DONE). Set in finishPlan only.
     internal var lastFinishedPlan: AgentPlan? = null
         private set
+
+    // R1 (N3): the running task's budget — created in startNewPlan
+    // (or restored from the persisted plan on resume), snapshotted
+    // into agent_plan.json on every saveAndPublish.
+    private var taskBudget: TaskBudget? = null
 
     // ---- Outcomes ----
 
@@ -97,13 +132,8 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         data class Block(val reason: String) : GateResult
     }
 
-    private data class GithubPushResult(
-        val sha: String,
-        val owner: String,
-        val repo: String,
-        val repoId: Long,
-        val defaultBranch: String
-    )
+    // R1: direct GitHub push is GONE (hub proxy now) — the result
+    // type lived here only for pushToGithub. Deleted with it.
 
     // ---- Entry points ----
 
@@ -128,6 +158,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         docContext: String = ""
     ) {
         val context = engine.planContext()
+        // R1 (N3): fresh per-task budget — the planNext call below
+        // is this task's first LLM call.
+        taskBudget = TaskBudget()
         // Q10: a new agent-mode task overwrites agent_plan.json —
         // one chat line warning if replacing an unfinished plan,
         // no speak.
@@ -188,6 +221,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 JarvisStateRepository.setCurrentGoal("")
             }
             is LlmClient.PlanResult.Planned -> {
+                // R1 (N3): the planner call counts against the task
+                // LLM budget (1 of 20 default / 40 hard).
+                taskBudget?.noteLlmCall()
                 val now = System.currentTimeMillis()
                 val steps = result.steps.mapIndexed { i, draft ->
                     PlanStep(
@@ -205,13 +241,16 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     updatedAtMs = now,
                     currentStepId = null,
                     answeredClarifications = engine.planAnsweredClarifications().toList(),
-                    steps = steps
+                    steps = steps,
+                    budget = taskBudget?.snapshot()
                 )
                 AgentPlanStore.save(context, plan)
                 publish(plan)
+                // R1 (no-step): NO unit list, NO count in chat —
+                // the user hears plain words only.
                 JarvisStateRepository.addChatMessage(
                     "Jarvis",
-                    "Plan ban gaya — ${steps.size} steps: ${steps.joinToString(", ") { it.title }}."
+                    "Plan ban gaya — ab kaam shuru kar raha hoon."
                 )
                 engine.planPersistChat()
                 runPlan(plan)
@@ -235,6 +274,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         // answeredClarifications are restored into the engine list
         // (capped 12, as today) so the resumed plan never re-asks.
         engine.planRestoreClarifications(loaded.answeredClarifications)
+        // R1 (N3): restore the task budget from the persisted plan
+        // — counters continue, the deadline does NOT reset.
+        taskBudget = loaded.budget?.let { TaskBudget.restore(it) } ?: TaskBudget(
+            startedAtMs = loaded.createdAtMs
+        )
         // A RUNNING (or captcha-waiting AWAITING_USER) step is
         // demoted to PENDING with attempts preserved and evidence
         // appended — never blindly re-run.
@@ -265,11 +309,18 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun runPlan(plan: AgentPlan) {
         var current = plan
-        // Steps that already had one ask-driven re-run in this run.
-        val retriedAfterAsk = mutableSetOf<String>()
-        // 1.11.0-PRO (self-extension): steps already retried once
+        // R1 (N3): budget for this run — restored on resume, fresh
+        // on a new plan. The loop runs until DONE (verified) or
+        // budget exhausted or watchdog — never after N steps.
+        if (taskBudget == null) {
+            taskBudget = plan.budget?.let { TaskBudget.restore(it) } ?: TaskBudget()
+        }
+        val budget = taskBudget!!
+        // 1.11.0-PRO (self-extension): units already retried once
         // via the self-extension loop — the loop never retries the
-        // original step more than once (DESIGN §2.5).
+        // original unit more than once (DESIGN §2.5). R1: the
+        // retry itself is now counted in the budget (max 2 fix
+        // attempts per unit), the set only guards the extension.
         val extendedAfterExtension = mutableSetOf<String>()
         // 1.9.0 (v2, DESIGN §4.2): typed evidence refs collected
         // from DONE steps — finishPlan attaches them to the DONE
@@ -283,6 +334,26 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             publish(current)
             var idx = 0
             while (idx < current.steps.size) {
+                // R1 (N3): watchdog — the 15-min stop. The task ends
+                // (FAILED, plain words), never silently, never late.
+                if (budget.watchdogExpired()) {
+                    current = updateStep(current, current.steps[idx].id) {
+                        it.copy(
+                            state = PlanState.FAILED,
+                            evidence = "15 minute ho gaye — kaam samay par poora nahi ho paya."
+                        )
+                    }
+                    saveAndPublish(current)
+                    finishPlan(current, allDone = false)
+                    return
+                }
+                // R1 (N3): hard work-unit budget — a plan longer
+                // than 20 units cannot exist (planner caps at 8),
+                // so this fires only on pathological re-runs.
+                if (budget.workUnitsDone >= TaskBudgetDefaults.WORK_UNITS_HARD) {
+                    finishPlan(current, allDone = false)
+                    return
+                }
                 val step = current.steps[idx]
                 when (step.state) {
                     PlanState.DONE, PlanState.SKIPPED -> {
@@ -300,9 +371,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         return
                     }
                     PlanState.BLOCKED -> {
-                        // Resume path: re-ask the stored question ONCE.
+                        // Resume path: the PARKED question is asked
+                        // ONCE — only because the user re-engaged
+                        // (new command / service recreation), never
+                        // mid-task. A mid-task clarification PARKS;
+                        // it is never asked while the task runs.
                         val question = blockedQuestion(step)
-                        when (val ans = askStepQuestion(question)) {
+                        when (val ans = askUserOnce(question)) {
                             is AskResult.Answered -> {
                                 if (engine.planIsDecline(ans.answer)) {
                                     abortPlan(current, step, "user declined")
@@ -355,9 +430,12 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     it.copy(state = PlanState.RUNNING, attempts = it.attempts + 1)
                 }.copy(currentStepId = step.id)
                 saveAndPublish(current)
+                // R1 (no-step): plain-words status only — no count,
+                // no "step" word. The Talker speaks this at most
+                // once per 30 s (progress policy).
                 JarvisStateRepository.setAgentState(
                     AgentRunState.EXECUTING_STEP,
-                    "Plan ${idx + 1}/${current.steps.size}: ${step.title}…"
+                    "Abhi ${step.title} kar raha hoon…"
                 )
                 // Gate: needsGate steps through the existing
                 // checkExecutionGate (see gateStep).
@@ -382,7 +460,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 }
                 JarvisStateRepository.setAgentState(
                     AgentRunState.EXECUTING_STEP,
-                    "Plan ${idx + 1}/${current.steps.size}: ${step.title}…"
+                    "Abhi ${step.title} kar raha hoon…"
                 )
                 // 1.9.0 (v2, DESIGN §3.2): plan step START milestone
                 // (best-effort — a dropped line is invisible, a
@@ -396,6 +474,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 when (val outcome = executeStep(current.steps[idx], current)) {
                     is StepOutcome.Done -> {
                         stepDurationsMs.add(System.currentTimeMillis() - stepStartMs)
+                        // R1 (N3): one finished work unit against
+                        // the task budget.
+                        budget.noteWorkUnitDone()
                         current = updateStep(current, step.id) {
                             it.copy(state = PlanState.DONE, evidence = outcome.evidence)
                         }
@@ -406,7 +487,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         )
                         engine.planPersistChat()
                         JarvisStateRepository.addLog(
-                            "Plan step ${idx + 1} ${step.kind} DONE ${outcome.evidence.take(120)}"
+                            "Plan unit ${idx + 1} ${step.kind} DONE ${outcome.evidence.take(120)}"
                         )
                         collectedRefs.addAll(outcome.refs)
                         // 1.9.0 (v2): step DONE milestone.
@@ -417,17 +498,8 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         idx++
                     }
                     is StepOutcome.Failed -> {
-                        if (step.id in retriedAfterAsk) {
-                            // Same step failed twice — terminal.
-                            current = updateStep(current, step.id) {
-                                it.copy(state = PlanState.FAILED, evidence = outcome.reason)
-                            }
-                            saveAndPublish(current)
-                            finishPlan(current, allDone = false)
-                            return
-                        }
                         // 1.11.0-PRO (self-extension, DESIGN §1 trigger
-                        // point): after a step Failed — BEFORE
+                        // point): after a unit Failed — BEFORE
                         // parkBlocked/finishPlan decides — try the
                         // loop once for a missing capability. The
                         // loop runs inside this same job, under the
@@ -435,7 +507,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         // scope. Goal text is NEVER passed (S8): the
                         // detector works from step kind/action/reason
                         // only, so goalText stays "".
-                        if (step.id !in extendedAfterExtension) {
+                        // R1 (N3): the extension attempt IS fix
+                        // attempt 1 for this unit (max 2 per unit).
+                        if (step.id !in extendedAfterExtension && budget.noteFixAttempt(step.id)) {
                             var retryOutcome: StepOutcome? = null
                             val extOutcome = engine.planMaybeExtend(
                                 failure = ExecutorFailure(
@@ -505,33 +579,27 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                                 is SelfExtensionLoop.LoopOutcome.GiveUp -> Unit
                             }
                         }
-                        when (val ans = askStepQuestion(
-                            "Step '${step.title}' fail ho gaya: ${outcome.reason.take(150)}. Dobara koshish karun ya chhod dun?"
-                        )) {
-                            is AskResult.Answered -> {
-                                if (engine.planIsDecline(ans.answer)) {
-                                    abortPlan(current, step, "user declined after failure")
-                                    return
-                                }
-                                engine.planRecordClarification(
-                                    "Q: Step '${step.title}' fail — dobara? -> A: ${ans.answer}"
-                                )
-                                retriedAfterAsk.add(step.id)
-                                current = updateStep(current, step.id) { it.copy(state = PlanState.PENDING) }
-                                saveAndPublish(current)
-                                // Same idx — one re-run.
-                            }
-                            is AskResult.Declined -> {
-                                abortPlan(current, step, "user declined after failure")
-                                return
-                            }
-                            is AskResult.NoReply -> {
-                                parkBlocked(
-                                    current, step,
-                                    "Step fail hua, user se poocha — jawab nahi aaya: ${outcome.reason.take(150)}"
-                                )
-                                return
-                            }
+                        // R1 (no-step): NO "dobara koshish karun?"
+                        // ask — a mid-task ask is a stop, and
+                        // mid-task stops are gone. CFD: one more fix
+                        // attempt (max 2 per unit), else PARK +
+                        // escalate to Main (§4.3).
+                        if (budget.noteFixAttempt(step.id)) {
+                            current = updateStep(current, step.id) { it.copy(state = PlanState.PENDING) }
+                            saveAndPublish(current)
+                            // Same idx — one re-run.
+                        } else {
+                            escalateToMain(
+                                plan = current,
+                                triedKinds = listOf(step.kind),
+                                error = outcome.reason,
+                                need = "'${step.title}' 2 baar fix nahi ho paya — is kaam ke liye code/capability chahiye."
+                            )
+                            parkBlocked(
+                                current, step,
+                                "'${step.title}' nahi ho paya (${outcome.reason.take(150)}). Main ko bhej diya hai — fix banega to bataunga."
+                            )
+                            return
                         }
                     }
                     is StepOutcome.Blocked -> {
@@ -639,7 +707,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 append("Plan ruk gaya — ")
                 failed.forEach { append("${it.title} nahi hua (${it.evidence.take(120)}). ") }
                 if (done.isNotEmpty()) append("Ho gaya: ${done.joinToString(", ") { it.title }}. ")
-                append("Jo step ruka hai uske liye upar wali detail dekho, phir dobara bolo.")
+                append("Jo kaam ruka hai uske liye upar wali detail dekho, phir dobara bolo.")
             }
         }
         JarvisStateRepository.addChatMessage("Jarvis", summary)
@@ -653,7 +721,8 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val completedPlan = plan.copy(
             completed = true,
             currentStepId = null,
-            updatedAtMs = System.currentTimeMillis()
+            updatedAtMs = System.currentTimeMillis(),
+            budget = taskBudget?.snapshot()
         )
         AgentPlanStore.save(context, completedPlan)
         publish(completedPlan)
@@ -705,7 +774,8 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             },
             completed = true,
             currentStepId = null,
-            updatedAtMs = now
+            updatedAtMs = now,
+            budget = taskBudget?.snapshot()
         )
         AgentPlanStore.save(context, p)
         publish(p)
@@ -731,7 +801,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val context = engine.planContext()
         val p = updateStep(plan, step.id) {
             it.copy(state = PlanState.BLOCKED, evidence = "Blocked: ${reason.take(300)}")
-        }.copy(currentStepId = null, updatedAtMs = System.currentTimeMillis())
+        }.copy(
+            currentStepId = null,
+            updatedAtMs = System.currentTimeMillis(),
+            budget = taskBudget?.snapshot()
+        )
         AgentPlanStore.save(context, p)
         publish(p)
         // 1.8.0: BLOCKED, fully announced — nothing was spoken for
@@ -745,6 +819,34 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         JarvisStateRepository.setAgentState(AgentRunState.IDLE, "Plan blocked — ${reason.take(80)}")
         JarvisStateRepository.setCurrentGoal("")
         engine.planClearTaskState()
+    }
+
+    /** R1 (§4.3): best-effort escalation to the Main Executor.
+     *  Never throws, never blocks the park — a failed escalate is
+     *  just a diagnostic; the PARK itself is the user-visible
+     *  outcome. Packet carries goal + tried kinds + error only —
+     *  never the user's personal content. */
+    private suspend fun escalateToMain(
+        plan: AgentPlan,
+        triedKinds: List<String>,
+        error: String,
+        need: String
+    ) {
+        runCatching {
+            val result = HubGithubClient.escalate(
+                engine.planContext(),
+                goal = plan.goal,
+                tried = triedKinds,
+                error = error,
+                need = need
+            )
+            if (result is HubGithubClient.EscalateResult.Err) {
+                JarvisStateRepository.addDiagnostic(
+                    "plan", "ESCALATE_FAIL",
+                    "Main ko escalate nahi ho paya: ${result.message.take(120)}"
+                )
+            }
+        }
     }
 
     /** Cancellation demotion: RUNNING -> PENDING (attempts kept).
@@ -768,10 +870,15 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     // ---- Ask / gate ----
 
-    /** One spoken question via askUserVoice (B-M8: never wait on
-     *  an unspoken question). Sets WAITING_USER_REPLY while
-     *  asking. */
-    private suspend fun askStepQuestion(question: String): AskResult {
+    /** R1 (no-step): the ONLY voice-ask primitive left in the
+     *  executor. Called ONLY from (a) a hard gate (gateStep /
+     *  destructive overwrite confirm) and (b) the PARK-resume path
+     *  after the user re-engages. NEVER called mid-task for a
+     *  clarification — those PARK (Blocked + Talker tells the
+     *  user) instead of asking. One spoken question via askUserVoice
+     *  (B-M8: never wait on an unspoken question). Sets
+     *  WAITING_USER_REPLY while asking. */
+    private suspend fun askUserOnce(question: String): AskResult {
         JarvisStateRepository.setAgentState(
             AgentRunState.WAITING_USER_REPLY,
             "Waiting for your voice answer..."
@@ -804,7 +911,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         }
         val synthetic = AgentDecision(
             reply = "",
-            thought = "plan step gate",
+            thought = "plan gate",
             action = if (payLike) "TYPE_TEXT" else "NONE",
             text = step.detail.ifBlank { step.title }
         )
@@ -812,16 +919,16 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         when (outcome) {
             JarvisAgentEngine.GateOutcome.ABORT_TASK -> return GateResult.Abort
             JarvisAgentEngine.GateOutcome.PAUSE_TASK -> return GateResult.Pause("gate question nahi boli ja saki: $reason")
-            JarvisAgentEngine.GateOutcome.BLOCK_STEP -> return GateResult.Block("Gate ne step block kiya: $reason")
+            JarvisAgentEngine.GateOutcome.BLOCK_STEP -> return GateResult.Block("Gate ne kaam block kiya: $reason")
             JarvisAgentEngine.GateOutcome.ALLOW -> Unit
         }
         if (step.needsGate) {
-            return when (val ans = askStepQuestion(
-                "Plan step '${step.title}' sensitive hai — ${step.detail.take(120)}. Kar dun?"
+            return when (val ans = askUserOnce(
+                "'${step.title}' sensitive hai — ${step.detail.take(120)}. Kar dun?"
             )) {
                 is AskResult.Answered -> if (engine.planIsDecline(ans.answer)) GateResult.Abort else GateResult.Allow
                 is AskResult.Declined -> GateResult.Abort
-                is AskResult.NoReply -> GateResult.Pause("sensitive step ka sawal poocha, jawab nahi aaya")
+                is AskResult.NoReply -> GateResult.Pause("sensitive kaam ka sawal poocha, jawab nahi aaya")
             }
         }
         return GateResult.Allow
@@ -847,9 +954,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             // park as BLOCKED (user help needed), everything else Failed.
             "BROWSER_JOB" -> executeBrowserJob(step)
             // 1.11.0-PRO (self-extension): the T-NO-HANDLER marker
-            // names the trigger for the detector (§2.2) while keeping
-            // the v1 "Unknown step kind:" wording intact.
-            else -> StepOutcome.Failed("Unknown step kind: ${step.kind} (T-NO-HANDLER)")
+            // names the trigger for the detector (§2.2). R1: the
+            // wording is now "Unknown kaam kind:" — the detector
+            // matches on that exact phrase (SelfExtensionDetector
+            // T-UNKNOWN-STEP); keep the two in sync.
+            else -> StepOutcome.Failed("Unknown kaam kind: ${step.kind} (T-NO-HANDLER)")
         }
     }
 
@@ -858,36 +967,23 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     private suspend fun executeBuild(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
         // MINOR-2: "?" is the planner's unknown-name sentinel, not a
-        // name — treat it as missing so the user is asked.
+        // name — treat it as missing. R1 (no-step): a missing name
+        // is a PARK, never a mid-task ask — the Talker tells the
+        // user, the Executor waits for the name.
         var projectName = parseDetailValue(step.detail, "project")?.takeUnless { it == "?" }
         if (projectName.isNullOrBlank()) projectName = engine.planLastBuildProject().takeIf { it.isNotBlank() }
         if (projectName.isNullOrBlank()) {
-            when (val ans = askStepQuestion("Website kis naam se banau? Project ka naam bolo.")) {
-                is AskResult.Answered -> {
-                    // A "?" answer is still "missing" — park so the
-                    // resume path re-asks, never invent a default.
-                    if (ans.answer.trim() == "?") {
-                        return StepOutcome.Blocked("Project naam nahi mila — '?' naam nahi ho sakta.")
-                    }
-                    projectName = ProjectStore.sanitizeProjectName(ans.answer)
-                    engine.planRecordClarification("Q: project naam? -> A: $projectName")
-                }
-                // MINOR-1: decline aborts the whole plan (§3g), it
-                // must not park as BLOCKED and be re-asked on resume.
-                is AskResult.Declined -> {
-                    abortPlan(plan, step, "User ne project naam dene se mana kar diya.")
-                    return StepOutcome.Aborted
-                }
-                is AskResult.NoReply -> return StepOutcome.Blocked("Project naam nahi mila — user se poocha, jawab nahi aaya.")
-            }
+            return StepOutcome.Blocked("Website ka naam chahiye — naam bolo to aage badhaunga.")
         }
         projectName = ProjectStore.sanitizeProjectName(projectName!!)
         // Garbar rule (§3g.2): building into an existing non-empty
         // project overwrites index.html by design, so the executor
         // asks first even if the planner forgot needsGate.
+        // R1: this ask STAYS — overwriting is a destructive_confirm
+        // hard gate, one of the 5 allowed stops.
         val existingProject = ProjectStore.listProjects(context).firstOrNull { it.name == projectName }
         if (existingProject != null && existingProject.files.isNotEmpty()) {
-            when (val ans = askStepQuestion(
+            when (val ans = askUserOnce(
                 "Project '$projectName' pehle se hai (${existingProject.files.size} files). Upar se dobara banau?"
             )) {
                 is AskResult.Answered -> {
@@ -914,11 +1010,22 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         var repairUsed = false
         var parseRetries = 0
         var rateLimitRetries = 0
-        val maxSteps = engine.planPrefs().maxAutonomousSteps
+        // R1 (N3): the build loop is budget-gated, not step-counted.
+        // Every decideNextStep call is one LLM call against the task
+        // budget (20 default / 40 hard); the watchdog is the time
+        // bound. The loop runs until DONE (verified) or budget
+        // exhausted — never "N steps me complete nahi hua".
+        val budget = taskBudget ?: TaskBudget()
         var stepNo = 1
         var goal = "${plan.goal} (Project: $projectName — ${step.detail})"
-        while (stepNo <= maxSteps) {
+        while (true) {
             if (!engine.planIsOnline()) return StepOutcome.Failed("Internet chala gaya — build ruk gaya.")
+            if (budget.watchdogExpired()) {
+                return StepOutcome.Failed("15 minute ho gaye — build samay par poora nahi ho paya.")
+            }
+            if (!budget.noteLlmCall()) {
+                return StepOutcome.Failed("Kaam ka budget khatam ho gaya — build poora nahi ho paya. Dobara bolo to phir se koshish karunga.")
+            }
             val decision = engine.planLlm().decideNextStep(
                 userGoal = goal,
                 stepNumber = stepNo,
@@ -948,30 +1055,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                     return StepOutcome.Failed("Rate limit baar-baar lag gaya.")
                 }
             }
+            // R1 (no-step): a mid-task question from the builder is
+            // a PARK, never a voice-wait — the Talker tells the user
+            // the question, the Executor waits for the answer.
             if (decision.askUser) {
-                when (val ans = askStepQuestion(
-                    decision.reply.ifBlank { "Build ke liye ek sawal hai — batao?" }
-                )) {
-                    is AskResult.Answered -> {
-                        if (engine.planIsDecline(ans.answer)) {
-                            // MINOR-1: decline aborts the plan (§3g).
-                            abortPlan(plan, step, "User ne build ke sawal par mana kar diya.")
-                            return StepOutcome.Aborted
-                        }
-                        engine.planRecordClarification("Q: ${decision.reply} -> A: ${ans.answer}")
-                        goal = "$goal (User clarified: ${ans.answer})"
-                        previousActions.add("Asked user: '${decision.reply}' -> User answered: '${ans.answer}'")
-                        stepNo++
-                        continue
-                    }
-                    is AskResult.Declined -> {
-                        abortPlan(plan, step, "User ne build ke sawal par mana kar diya.")
-                        return StepOutcome.Aborted
-                    }
-                    is AskResult.NoReply -> return StepOutcome.Blocked(
-                        "Build ke sawal ka jawab nahi aaya: ${decision.reply.take(120)}"
-                    )
-                }
+                return StepOutcome.Blocked(
+                    "Build ke liye ek sawal hai: ${decision.reply.ifBlank { "batao?" }.take(200)} — batao to aage badhaunga."
+                )
             }
             if (decision.action != "NONE") {
                 val (gateOutcome, gateReason) = engine.planCheckGate(decision)
@@ -981,10 +1071,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                         // declining the gate confirmation — abort the
                         // plan, never Failed (which would re-ask
                         // "dobara koshish karun?").
-                        abortPlan(plan, step, "Build step gate ne roka: $gateReason")
+                        abortPlan(plan, step, "Build gate ne roka: $gateReason")
                         return StepOutcome.Aborted
                     }
-                    return StepOutcome.Failed("Build step gate ne roka: $gateReason")
+                    return StepOutcome.Failed("Build gate ne roka: $gateReason")
                 }
                 engine.planExecuteDecision(decision)
                 previousActions.add("Step $stepNo: ${decision.action}")
@@ -1020,7 +1110,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             delay(engine.planPrefs().stepDelayMs)
             stepNo++
         }
-        return StepOutcome.Failed("Build $maxSteps steps me complete nahi hua.")
+        // Unreachable in practice (the loop exits only via the
+        // returns above) — kept so the function always returns.
+        return StepOutcome.Failed("Build poora nahi ho paya.")
     }
 
     /** BUILD evidence: validation OK + written + preview GET 200. */
@@ -1056,243 +1148,63 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         )
     }
 
-    // ---- GITHUB_PUSH (trees API + GraphQL updateRef) ----
+    // ---- GITHUB_PUSH (via hub proxy — NO direct GitHub call) ----
+    //
+    // R1 (1.16.0-PRO, REDESIGN_PLAN.md §4.1): the phone holds no
+    // GitHub token and calls api.github.com NEVER. The push goes
+    // through HubGithubClient (POST /api/github/pr-request,
+    // device-signed); the hub pushes with the ADMIN token. The hub
+    // creates the repo when missing (private, user-given name only
+    // — never invented). github_not_configured / 503 PARKS with a
+    // plain-words message — never a crash, never a silent fail.
 
     private suspend fun executeGithubPush(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
         // MINOR-2: "repo=?" is the planner's unknown-name sentinel,
-        // not a name — fall through to the ask below.
+        // not a name. R1 (no-step): a missing name is a PARK, never
+        // a mid-task ask — the Talker tells the user, the Executor
+        // waits for the name.
         var repo = parseDetailValue(step.detail, "repo")?.takeUnless { it == "?" }
         if (repo.isNullOrBlank()) repo = resolveRepoFromClarifications(plan)
         if (repo.isNullOrBlank()) {
-            when (val ans = askStepQuestion("GitHub repo ka naam kya rakhu? (naya repo banega to wahi naam use hoga)")) {
-                is AskResult.Answered -> {
-                    if (ans.answer.trim() == "?") {
-                        return StepOutcome.Blocked("Repo naam nahi mila — '?' naam nahi ho sakta.")
-                    }
-                    repo = sanitizeRepoName(ans.answer)
-                    engine.planRecordClarification("Q: GitHub repo naam? -> A: $repo")
-                }
-                // MINOR-1: decline aborts the whole plan (§3g).
-                is AskResult.Declined -> {
-                    abortPlan(plan, step, "User ne repo naam dene se mana kar diya.")
-                    return StepOutcome.Aborted
-                }
-                is AskResult.NoReply -> return StepOutcome.Blocked("Repo naam nahi mila — user se poocha, jawab nahi aaya.")
-            }
+            return StepOutcome.Blocked("GitHub repo ka naam chahiye — naam bolo to aage badhaunga. (Naya repo banega to wahi naam use hoga.)")
         }
         repo = sanitizeRepoName(repo!!)
         // MINOR-2: blank-after-sanitize is still "missing" — park so
         // the resume path re-asks, never Failed("Repo naam khaali hai.").
         if (repo.isBlank()) return StepOutcome.Blocked("Repo naam khaali hai — naam batao to phir se koshish karunga.")
         val projectName = resolveProjectName(step, plan)
-            ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD step complete hona chahiye.")
+            ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD kaam complete hona chahiye.")
         val project = ProjectStore.listProjects(context).firstOrNull { it.name == projectName }
             ?: return StepOutcome.Failed("Project '$projectName' phone par nahi mila.")
         val files = project.files.filter { ProjectStore.readFile(context, projectName, it).isNotBlank() }
         if (files.isEmpty()) return StepOutcome.Failed("Project '$projectName' me koi file nahi mili.")
         return withContext(Dispatchers.IO) {
-            // 1.4.22 (item 5b): token read is blocking keystore /
-            // disk I/O — it happens on IO, never on Main.
-            val token = AgentSecrets.get(context, AgentSecrets.KEY_GITHUB_PAT)
-            if (token.isBlank()) {
-                return@withContext StepOutcome.Blocked(
-                    "GitHub PAT saved nahi hai — AI Brain > Agent Mode — Connected accounts me GitHub PAT daalo (fine-grained, Contents read+write)."
-                )
-            }
-            try {
-                val result = pushToGithub(token, repo, projectName, files, context)
-                // Full SHA in evidence (verify-before-re-run needs
-                // it for the tree GET); display sites truncate.
-                // 1.9.0 (v2): typed GITHUB_COMMIT ref for the Talker.
-                StepOutcome.Done(
-                    "commit ${result.sha}; repo https://github.com/${result.owner}/${result.repo}; branch ${result.defaultBranch}",
-                    refs = listOf(
-                        EvidenceRef(
-                            EvidenceKind.GITHUB_COMMIT,
-                            "github:${result.owner}/${result.repo}",
-                            "commit_in_tree",
-                            result.sha
+            val contents = files.associateWith { ProjectStore.readFile(context, projectName, it) }
+            when (val result = HubGithubClient.pushProject(context, repo, projectName, contents)) {
+                is HubGithubClient.PushResult.Ok -> {
+                    // Full SHA in evidence (verify-before-re-run needs
+                    // it for the tree fetch); display sites truncate.
+                    // 1.9.0 (v2): typed GITHUB_COMMIT ref for the Talker.
+                    StepOutcome.Done(
+                        "commit ${result.sha}; repo https://github.com/${result.owner}/${result.repo}; branch ${result.branch}",
+                        refs = listOf(
+                            EvidenceRef(
+                                EvidenceKind.GITHUB_COMMIT,
+                                "github:${result.owner}/${result.repo}",
+                                "commit_in_tree",
+                                result.sha
+                            )
                         )
                     )
-                )
-            } catch (e: IllegalStateException) {
-                StepOutcome.Failed("GitHub ${e.message?.take(200)}")
-            } catch (e: IOException) {
-                StepOutcome.Failed("GitHub network error: ${(e.message ?: "").take(150)}")
-            } catch (e: Exception) {
-                StepOutcome.Failed("GitHub push fail: ${(e.message ?: "").take(150)}")
-            }
-        }
-    }
-
-    /** Trees API + GraphQL updateRef (same pattern as the
-     *  jarvis-push helper; no expectedOldOid). One retry on
-     *  network failure / 5xx only — a 4xx is the true answer and
-     *  is never retried. */
-    private fun pushToGithub(
-        token: String,
-        repo: String,
-        projectName: String,
-        files: List<String>,
-        context: android.content.Context
-    ): GithubPushResult {
-        return withOneRetryOnNetworkOr5xx {
-            val ghHeaders = mapOf(
-                "Authorization" to "Bearer $token",
-                "Accept" to "application/vnd.github+json"
-            )
-            val (userCode, userBody) = httpGet("https://api.github.com/user", ghHeaders)
-            val owner = JSONObject(requireOk(userCode, userBody, "GitHub /user"))
-                .optString("login", "")
-            if (owner.isBlank()) throw IllegalStateException("GitHub /user se login nahi mila")
-            val (repoCode, repoBody) = httpGet("https://api.github.com/repos/$owner/$repo", ghHeaders)
-            var defaultBranch = "main"
-            var repoId = 0L
-            if (repoCode == 200) {
-                val repoJson = JSONObject(repoBody)
-                defaultBranch = repoJson.optString("default_branch", "main").ifBlank { "main" }
-                repoId = repoJson.optLong("id", 0)
-            } else if (repoCode == 404) {
-                // Q4: create ONLY after a user-given name (the repo
-                // name came from the user or an ask, never invented).
-                val createPayload = JSONObject().apply {
-                    put("name", repo)
-                    put("private", true)
-                    put("description", "Built with Jarvis Agent Mode")
-                }.toString()
-                val (createCode, createBody) = httpPostJson(
-                    "https://api.github.com/user/repos", token, createPayload,
-                    "application/vnd.github+json"
-                )
-                val created = JSONObject(requireOk(createCode, createBody, "GitHub create repo"))
-                defaultBranch = created.optString("default_branch", "main").ifBlank { "main" }
-                repoId = created.optLong("id", 0)
-            } else {
-                requireOk(repoCode, repoBody, "GitHub repo check")
-            }
-            var tipSha: String? = null
-            var baseTreeSha: String? = null
-            val (refCode, refBody) = httpGet(
-                "https://api.github.com/repos/$owner/$repo/git/ref/heads/$defaultBranch", ghHeaders
-            )
-            if (refCode == 200) {
-                tipSha = JSONObject(refBody).optJSONObject("object")
-                    ?.optString("sha", "")?.takeIf { it.isNotBlank() }
-                if (tipSha != null) {
-                    val (commitCode, commitBody) = httpGet(
-                        "https://api.github.com/repos/$owner/$repo/git/commits/$tipSha", ghHeaders
-                    )
-                    baseTreeSha = JSONObject(requireOk(commitCode, commitBody, "GitHub tip commit"))
-                        .optJSONObject("tree")?.optString("sha", "")
                 }
-            } else if (refCode != 404) {
-                requireOk(refCode, refBody, "GitHub ref check")
-            }
-            val treeEntries = JSONArray()
-            for (file in files) {
-                val content = ProjectStore.readFile(context, projectName, file)
-                val blobPayload = JSONObject().apply {
-                    put("content", content)
-                    put("encoding", "utf-8")
-                }.toString()
-                val (blobCode, blobBody) = httpPostJson(
-                    "https://api.github.com/repos/$owner/$repo/git/blobs", token, blobPayload,
-                    "application/vnd.github+json"
+                is HubGithubClient.PushResult.NotConfigured -> StepOutcome.Blocked(
+                    "GitHub hub par set nahi hai — admin ko hub me GitHub token lagana hoga. Tab tak GitHub push nahi ho payega."
                 )
-                val blobSha = JSONObject(requireOk(blobCode, blobBody, "GitHub blob $file"))
-                    .optString("sha", "")
-                treeEntries.put(JSONObject().apply {
-                    put("path", file)
-                    put("mode", "100644")
-                    put("type", "blob")
-                    put("sha", blobSha)
-                })
-            }
-            val treePayload = JSONObject().apply {
-                if (baseTreeSha != null) put("base_tree", baseTreeSha)
-                put("tree", treeEntries)
-            }.toString()
-            val (treeCode, treeBody) = httpPostJson(
-                "https://api.github.com/repos/$owner/$repo/git/trees", token, treePayload,
-                "application/vnd.github+json"
-            )
-            val treeSha = JSONObject(requireOk(treeCode, treeBody, "GitHub tree")).optString("sha", "")
-            val commitPayload = JSONObject().apply {
-                put("message", "Jarvis Agent Mode: push $projectName website")
-                put("tree", treeSha)
-                put("parents", JSONArray().apply { if (tipSha != null) put(tipSha) })
-            }.toString()
-            val (commitCode, commitBody) = httpPostJson(
-                "https://api.github.com/repos/$owner/$repo/git/commits", token, commitPayload,
-                "application/vnd.github+json"
-            )
-            val commitSha = JSONObject(requireOk(commitCode, commitBody, "GitHub commit"))
-                .optString("sha", "")
-            if (tipSha != null) {
-                val refQuery = JSONObject().apply {
-                    put(
-                        "query",
-                        "{ repository(owner:\"$owner\", name:\"$repo\") { ref(qualifiedName:\"refs/heads/$defaultBranch\") { id } } }"
-                    )
-                }.toString()
-                val (gqlCode, gqlBody) = httpPostJson(
-                    "https://api.github.com/graphql", token, refQuery, "application/json"
-                )
-                val refId = JSONObject(requireOk(gqlCode, gqlBody, "GitHub GraphQL ref"))
-                    .optJSONObject("data")?.optJSONObject("repository")
-                    ?.optJSONObject("ref")?.optString("id", "")
-                if (refId.isNullOrBlank()) throw IllegalStateException("GitHub GraphQL se ref id nahi mila")
-                val mutation = JSONObject().apply {
-                    put(
-                        "query",
-                        "mutation(\$refId:ID!,\$oid:GitObjectID!){updateRef(input:{refId:\$refId,oid:\$oid}){ref{target{oid}}}}"
-                    )
-                    put("variables", JSONObject().apply {
-                        put("refId", refId)
-                        put("oid", commitSha)
-                    })
-                }.toString()
-                val (mutCode, mutBody) = httpPostJson(
-                    "https://api.github.com/graphql", token, mutation, "application/json"
-                )
-                requireOk(mutCode, mutBody, "GitHub GraphQL updateRef")
-            } else {
-                val refPayload = JSONObject().apply {
-                    put("ref", "refs/heads/$defaultBranch")
-                    put("sha", commitSha)
-                }.toString()
-                val (refCreateCode, refCreateBody) = httpPostJson(
-                    "https://api.github.com/repos/$owner/$repo/git/refs", token, refPayload,
-                    "application/vnd.github+json"
-                )
-                requireOk(refCreateCode, refCreateBody, "GitHub create ref")
-            }
-            // Verify: follow-up GET confirms the expected files
-            // exist at that SHA — a 200 without this check is not
-            // evidence.
-            val (verifyCode, verifyBody) = httpGet(
-                "https://api.github.com/repos/$owner/$repo/git/trees/$commitSha?recursive=1", ghHeaders
-            )
-            val treeJson = JSONObject(requireOk(verifyCode, verifyBody, "GitHub verify tree"))
-            val present = mutableSetOf<String>()
-            val treeArr = treeJson.optJSONArray("tree")
-            if (treeArr != null) {
-                for (i in 0 until treeArr.length()) {
-                    treeArr.optJSONObject(i)?.optString("path", "")
-                        ?.takeIf { it.isNotBlank() }?.let { present.add(it) }
-                }
-            }
-            val missing = files.filter { it !in present }
-            if (missing.isNotEmpty()) {
-                throw IllegalStateException(
-                    "Push verify fail: files missing at commit: ${missing.joinToString(", ")}"
+                is HubGithubClient.PushResult.Err -> StepOutcome.Failed(
+                    "GitHub push fail: ${result.message.take(200)}"
                 )
             }
-            GithubPushResult(
-                sha = commitSha, owner = owner, repo = repo,
-                repoId = repoId, defaultBranch = defaultBranch
-            )
         }
     }
 
@@ -1301,10 +1213,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     private suspend fun executeSupabaseTables(step: PlanStep, plan: AgentPlan): StepOutcome {
         val context = engine.planContext()
         val projectName = resolveProjectName(step, plan)
-            ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD step complete hona chahiye.")
+            ?: return StepOutcome.Blocked("Project naam nahi mila — pehle BUILD kaam complete hona chahiye.")
         val schema = ProjectStore.readFile(context, projectName, "backend/schema.sql")
         if (schema.isBlank()) {
-            return StepOutcome.Failed("backend/schema.sql nahi mila — BUILD step me backend files bane hone chahiye.")
+            return StepOutcome.Failed("backend/schema.sql nahi mila — BUILD kaam me backend files bane hone chahiye.")
         }
         // 1.4.22 (item 5a): expected schema is table -> columns,
         // not just table names — verification compares column sets.
@@ -1460,7 +1372,7 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             return StepOutcome.Failed("GitHub push pehle complete hona chahiye — Vercel deploy uske bina nahi ho sakta.")
         }
         val (owner, repo) = parseGithubRepo(pushStep)
-            ?: return StepOutcome.Failed("GitHub push ka repo nahi mila — push step ki evidence check karo.")
+            ?: return StepOutcome.Failed("GitHub push ka repo nahi mila — push ki evidence check karo.")
         val branch = parseEvidenceValue(pushStep.evidence, "branch") ?: "main"
         val projectName = resolveProjectName(step, plan) ?: repo
         val vercelName = sanitizeVercelName(projectName)
@@ -1500,21 +1412,24 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
                 } else {
                     requireOk(createCode, createBody, "Vercel create project")
                 }
-                // 2. GitHub repo id (needed for gitSource).
-                val githubToken = AgentSecrets.get(context, AgentSecrets.KEY_GITHUB_PAT)
-                if (githubToken.isBlank()) {
-                    return@withContext StepOutcome.Failed(
-                        "Vercel deploy ke liye GitHub repo id chahiye — GitHub PAT saved nahi hai."
-                    )
+                // 2. GitHub repo id (needed for gitSource) — R1:
+                // via the hub proxy, never a direct GitHub call and
+                // never a phone-side token.
+                val repoId = when (val fetch = HubGithubClient.fetch(
+                    context, owner, repo, "repos/$owner/$repo"
+                )) {
+                    is HubGithubClient.FetchResult.Ok -> fetch.body.optLong("id", 0)
+                    is HubGithubClient.FetchResult.NotConfigured -> {
+                        return@withContext StepOutcome.Failed(
+                            "GitHub hub par set nahi hai — admin ko hub me GitHub token lagana hoga. Tab tak Vercel deploy nahi ho payega."
+                        )
+                    }
+                    is HubGithubClient.FetchResult.Err -> {
+                        return@withContext StepOutcome.Failed(
+                            "GitHub repo id nahi mila (hub: ${fetch.message.take(150)})."
+                        )
+                    }
                 }
-                val (repoCode, repoBody) = httpGet(
-                    "https://api.github.com/repos/$owner/$repo",
-                    mapOf(
-                        "Authorization" to "Bearer $githubToken",
-                        "Accept" to "application/vnd.github+json"
-                    )
-                )
-                val repoId = JSONObject(requireOk(repoCode, repoBody, "GitHub repo")).optLong("id", 0)
                 if (repoId == 0L) {
                     return@withContext StepOutcome.Failed("GitHub repo id nahi mila.")
                 }
@@ -1801,20 +1716,25 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     private suspend fun verifyGithubPush(step: PlanStep, plan: AgentPlan): StepOutcome? {
         return withContext(Dispatchers.IO) {
             try {
-                val token = AgentSecrets.get(engine.planContext(), AgentSecrets.KEY_GITHUB_PAT)
-                if (token.isBlank()) return@withContext null
+                // R1: verify via the hub proxy — no phone-side token,
+                // no direct GitHub call. NotConfigured / Err = cannot
+                // verify (null) — the caller then executes the push,
+                // which parks with the plain-words message.
                 val sha = parseEvidenceValue(step.evidence, "commit") ?: return@withContext null
                 val (owner, repo) = parseGithubRepo(step) ?: return@withContext null
                 val projectName = resolveProjectName(step, plan) ?: return@withContext null
                 val expected = ProjectStore.listProjects(engine.planContext())
                     .firstOrNull { it.name == projectName }?.files ?: return@withContext null
-                val (code, body) = httpGet(
-                    "https://api.github.com/repos/$owner/$repo/git/trees/$sha?recursive=1",
-                    mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json")
+                val fetch = HubGithubClient.fetch(
+                    engine.planContext(), owner, repo,
+                    "repos/$owner/$repo/git/trees/$sha?recursive=1"
                 )
-                if (code !in 200..299) return@withContext null
+                val body = when (fetch) {
+                    is HubGithubClient.FetchResult.Ok -> fetch.body
+                    else -> return@withContext null
+                }
                 val present = mutableSetOf<String>()
-                val treeArr = JSONObject(body).optJSONArray("tree")
+                val treeArr = body.optJSONArray("tree")
                 if (treeArr != null) {
                     for (i in 0 until treeArr.length()) {
                         treeArr.optJSONObject(i)?.optString("path", "")
@@ -1973,10 +1893,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     }
 
     /**
-     * Typed GitHub re-read (DESIGN §4.3): the same live tree GET
+     * Typed GitHub re-read (DESIGN §4.3): the same live tree fetch
      * `verifyGithubPush` performs, driven by typed ref fields
-     * instead of regex-parsed free text. The regex path stays for
-     * the kill-resume flow.
+     * instead of regex-parsed free text. R1: via the hub proxy —
+     * no phone-side token, no direct GitHub call. The regex path
+     * stays for the kill-resume flow.
      */
     internal suspend fun verifyGithubCommitTyped(
         owner: String,
@@ -1986,17 +1907,24 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     ): TalkerVerificationPolicy.RefOutcome {
         return withContext(Dispatchers.IO) {
             try {
-                val token = AgentSecrets.get(engine.planContext(), AgentSecrets.KEY_GITHUB_PAT)
-                if (token.isBlank()) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
-                val (code, body) = httpGet(
-                    "https://api.github.com/repos/$owner/$repo/git/trees/$sha?recursive=1",
-                    mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json")
+                val fetch = HubGithubClient.fetch(
+                    engine.planContext(), owner, repo,
+                    "repos/$owner/$repo/git/trees/$sha?recursive=1"
                 )
-                if (code == 404) return@withContext TalkerVerificationPolicy.RefOutcome.FAILED
-                if (code !in 200..299) return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                if (fetch is HubGithubClient.FetchResult.NotConfigured) {
+                    return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                }
+                if (fetch is HubGithubClient.FetchResult.Err) {
+                    return@withContext TalkerVerificationPolicy.RefOutcome.UNCHECKABLE
+                }
+                fetch as HubGithubClient.FetchResult.Ok
+                if (fetch.status == 404) {
+                    return@withContext TalkerVerificationPolicy.RefOutcome.FAILED
+                }
                 if (expectedFiles.isEmpty()) return@withContext TalkerVerificationPolicy.RefOutcome.PASSED
+                val body = fetch.body
                 val present = mutableSetOf<String>()
-                val treeArr = JSONObject(body).optJSONArray("tree")
+                val treeArr = body.optJSONArray("tree")
                 if (treeArr != null) {
                     for (i in 0 until treeArr.length()) {
                         treeArr.optJSONObject(i)?.optString("path", "")
@@ -2102,9 +2030,9 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         val ev = step.evidence.trim()
         if (ev.startsWith("Blocked:")) {
             return ev.removePrefix("Blocked:").trim()
-                .takeIf { it.isNotBlank() } ?: "Plan step '${step.title}' ruka hua hai — aage badhau?"
+                .takeIf { it.isNotBlank() } ?: "'${step.title}' ruka hua hai — aage badhau?"
         }
-        return "Plan step '${step.title}' ruka hua hai — aage badhau?"
+        return "'${step.title}' ruka hua hai — aage badhau?"
     }
 
     /** Project name: this step's detail, else the plan's BUILD
@@ -2328,8 +2256,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
     }
 
     private fun saveAndPublish(plan: AgentPlan) {
-        AgentPlanStore.save(engine.planContext(), plan)
-        publish(plan)
+        // R1 (N3): every save carries the current budget snapshot
+        // so agent_plan.json always holds the live budget state.
+        val withBudget = taskBudget?.let { plan.copy(budget = it.snapshot()) } ?: plan
+        AgentPlanStore.save(engine.planContext(), withBudget)
+        publish(withBudget)
     }
 
     private fun updateStep(plan: AgentPlan, stepId: String, transform: (PlanStep) -> PlanStep): AgentPlan {

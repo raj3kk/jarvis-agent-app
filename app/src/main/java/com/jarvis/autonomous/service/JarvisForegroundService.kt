@@ -1124,7 +1124,7 @@ class JarvisForegroundService : Service() {
                 "JARVIS Background Autonomous Core",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Keeps JARVIS active in background for voice commands & multi-step tasks"
+                description = "Keeps JARVIS active in background for voice commands & multi-part tasks"
             }
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
@@ -1747,20 +1747,20 @@ class JarvisForegroundService : Service() {
 
     private fun buildNotification(statusText: String): Notification {
         // 1.4.21 Agent Mode: while a plan runs, the notification
-        // shows the current plan step instead of the generic
+        // shows the current activity instead of the generic
         // listening line (visual only, no sound/vibration change).
+        // R1 (no-step): plain words only — no count, no "Plan N/M".
         // The text is derived from the repository plan flow at
         // build time, so every re-issue of the notification picks
-        // up the latest step; a completed plan falls back to the
-        // passed-in status text.
+        // up the latest activity; a completed plan falls back to
+        // the passed-in status text.
         val planView = JarvisStateRepository.planState.value
         val effectiveStatusText = if (planView != null && !planView.completed) {
             val current = planView.steps.firstOrNull { it.state == PlanState.RUNNING }
                 ?: planView.steps.firstOrNull { it.state == PlanState.BLOCKED }
                 ?: planView.steps.firstOrNull { it.state == PlanState.PENDING }
             if (current != null) {
-                val idx = planView.steps.indexOf(current) + 1
-                "Jarvis — Plan $idx/${planView.steps.size}: ${current.title}"
+                "Jarvis — Abhi ${current.title} kar raha hoon"
             } else {
                 statusText
             }

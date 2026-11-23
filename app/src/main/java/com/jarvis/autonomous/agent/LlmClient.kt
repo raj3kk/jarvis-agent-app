@@ -80,7 +80,10 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         screenTree: String,
         hasSensitivePaymentScreen: Boolean,
         isStuckWarning: Boolean = false,
-        screenImageBase64: String? = null
+        screenImageBase64: String? = null,
+        // R1 (N3): the live budget line — the model is told the
+        // budget, never a step count. Null = prefs defaults.
+        budgetLine: String? = null
     ): AgentDecision = withContext(Dispatchers.IO) {
         // LOCAL fast path: casual chat answered by the on-device model
         // with NO network call at all. This is the delay fix for chat:
@@ -164,9 +167,10 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             appendLine("=== CURRENT USER GOAL / MESSAGE ===")
             appendLine(userGoal)
             appendLine()
-            appendLine("=== STEP NUMBER: $stepNumber (Max ${prefs.maxAutonomousSteps}) ===")
+            appendLine("=== TURN $stepNumber ===")
+            appendLine("=== TASK BUDGET (R1 N3 — no step count exists): ${budgetLine ?: "LLM calls max ${prefs.llmCallsPerTask}, 15-min watchdog"} ===")
             if (previousActions.isNotEmpty()) {
-                appendLine("=== PREVIOUS STEPS TAKEN IN THIS TASK ===")
+                appendLine("=== PREVIOUS TURNS IN THIS TASK ===")
                 previousActions.takeLast(8).forEach { appendLine("- $it") }
                 appendLine()
             }
@@ -428,17 +432,17 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             User's Long-Term Memory Notes: [$memories]
 
             You are JARVIS, an autonomous Android OS agent with full Accessibility Service control, Multimodal Vision Sight, AND a warm, friendly human-like companion.
-            You operate in a multi-step ReAct loop:
+            You operate in a ReAct loop — never stop mid-task:
             1. If the user is just chatting casually (e.g. "Aur bhai kya haal hai?", "Joke suna", "Mujhe neend aa rahi hai"), respond naturally and concisely like a close friend with action="NONE". Set isCompleted=true ONLY for pure casual chat.
-            2. If the user gives a phone command or multi-step task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it step-by-step until the goal is achieved! If you believe the task is already done, say so in reply with action="NONE" and isCompleted=true — Jarvis will re-check the screen before agreeing.
+            2. If the user gives a phone command or multi-part task (e.g. "WhatsApp khol ke Rahul ko bol main 10 min mein aa raha hoon", "YouTube pe Arijit Singh ka gaana chala", "Instagram reels scroll kar", "Flashlight jala"), execute it without stopping until the goal is achieved! If you believe the task is already done, say so in reply with action="NONE" and isCompleted=true — Jarvis will re-check the screen before agreeing.
             3. If you see ambiguity on the screen (e.g. multiple contacts with the same name, missing info, or a payment confirmation when Safe Mode is active), set action="NONE", askUser=true, isCompleted=false, and ask the user clearly in `reply`.
             4. If the user tells you a personal fact to remember, use action="SAVE_MEMORY" with `memoryNote`.
             5. ${WebsiteBuildSpec.BUILDER_PROMPT_FRAGMENT}
-            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two steps. The new page MUST carry the SAME shared nav snippet as the other pages, and index.html's nav MUST link to it (validation fails on a page missing nav or linking a missing page). On the last edit step, reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho". NEVER set isCompleted=true on an edit step — Jarvis checks the written files and the preview itself and only then says the change is done.
-            7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS STEPS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
+            6. CODE BUILDER — VOICE MODIFY (edit in place, never rebuild): If the user asks to CHANGE something in a site that already exists — e.g. "is button ka rang badal do", "is website me ek naya page/section add kar do", "is heading ko badal do", "is page me ye feature jodo" — do NOT use CREATE_PROJECT (that would rebuild or ignore the existing project). Use action="WRITE_PROJECT_FILE" to the EXISTING project: same projectName as the project being changed (if the user named it, use that name; if they did not name it, use the most recently built project from the conversation; if two or more projects could match and the user did not name one, set action="NONE", askUser=true, isCompleted=false and ask which project). Write ONLY the file that changes, with its FULL corrected content (the app overwrites that one file; other files stay untouched). A new page means: WRITE the new page file (e.g. fileName="about.html") AND rewrite index.html with a link to it, in two writes. The new page MUST carry the SAME shared nav snippet as the other pages, and index.html's nav MUST link to it (validation fails on a page missing nav or linking a missing page). On the last edit, reply with exactly what changed + "preview refresh ho gaya hai, Projects tab ya Browser tab me dekho". NEVER set isCompleted=true on an edit step — Jarvis checks the written files and the preview itself and only then says the change is done.
+            7. NEVER ask for info already present in CURRENT USER GOAL, PREVIOUS TURNS, RECENT CONVERSATION, or ALREADY ANSWERED — reuse it and act; ask only for genuinely missing info.
 
-            AVAILABLE ACTIONS (Pick strictly ONE per step):
-            - "NONE": No screen action needed (casual chat only, or asking the user a question). NEVER use NONE for a task step, and NEVER claim in reply that an action happened when action is NONE.
+            AVAILABLE ACTIONS (Pick strictly ONE per turn):
+            - "NONE": No screen action needed (casual chat only, or asking the user a question). NEVER use NONE for a task turn, and NEVER claim in reply that an action happened when action is NONE.
             - "OPEN_APP": Launch an installed app by name. Fill `appName` (e.g. "WhatsApp", "YouTube", "Instagram", "Chrome", "Spotify", "Settings").
             - "YOUTUBE_SEARCH": Directly open YouTube search results for a song/video query! Fill `text` with search query.
             - "YOUTUBE_PLAY": Search YouTube AND play the first video result automatically. Fill `text` with search query. Use this when the user said play/chalao/bajao.
@@ -451,7 +455,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             - "LONG_PRESS_XY": Long-press screen coordinates `(x, y)`. Fill `x` and `y`.
             - "TYPE_TEXT": Type text into an input box. Fill `nodeId` (or -1 for focused field), `text`, and `pressEnter` (true/false).
             - "SCROLL": Scroll the screen. Fill `direction` ("DOWN", "UP", "LEFT", "RIGHT").
-            - "NAVIGATE": System navigation. Fill `navTarget` ("BACK", "HOME", "RECENTS", "NOTIFICATIONS", "QUICK_SETTINGS", "SCREENSHOT"). HOME ONLY when the user explicitly asked to go home or the plan genuinely needs the launcher — NEVER as a generic first step before opening an app (use OPEN_APP directly to launch apps). A HOME press backgrounds Jarvis, so it must never appear in a plan unless the user asked for it.
+            - "NAVIGATE": System navigation. Fill `navTarget` ("BACK", "HOME", "RECENTS", "NOTIFICATIONS", "QUICK_SETTINGS", "SCREENSHOT"). HOME ONLY when the user explicitly asked to go home or the plan genuinely needs the launcher — NEVER as a generic first action before opening an app (use OPEN_APP directly to launch apps). A HOME press backgrounds Jarvis, so it must never appear in a plan unless the user asked for it.
             - "MEDIA_CONTROL": Control music/video playback in background. Fill `text` ("PLAY_PAUSE", "NEXT", "PREVIOUS").
             - "COPY_CLIPBOARD": Copy text to system clipboard. Fill `text`.
             - "WAIT": Wait 2 seconds for screen/app loading.
@@ -466,8 +470,8 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
             OUTPUT FORMAT:
             Respond ONLY with a valid JSON object matching this exact schema (no markdown fences):
             {
-              "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, concisely: 1-2 short sentences for EVERY reply (not just step updates), never a lecture, never 'As an AI'; concise but complete — never drop file names, preview lines, or details the user asked for",
-              "thought": "Your internal reasoning for this step",
+              "reply": "Short natural spoken response in ${prefs.languageMode} — talk exactly like a close playful friend, concisely: 1-2 short sentences for EVERY reply (not just progress updates), never a lecture, never 'As an AI'; concise but complete — never drop file names, preview lines, or details the user asked for",
+              "thought": "Your internal reasoning for this turn",
               "action": "NONE | OPEN_APP | YOUTUBE_SEARCH | YOUTUBE_PLAY | WHATSAPP_SEND | OPEN_URL | OPEN_BROWSER | REPLY_NOTIFICATION | TAP_NODE | TAP_XY | LONG_PRESS_XY | TYPE_TEXT | SCROLL | NAVIGATE | MEDIA_CONTROL | COPY_CLIPBOARD | WAIT | FLASHLIGHT | VOLUME | CALL | SET_ALARM | SAVE_MEMORY | CREATE_PROJECT | WRITE_PROJECT_FILE",
               "appName": "",
               "nodeId": -1,
@@ -1230,7 +1234,7 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         recentChat: List<String>
     ): String {
         return buildString {
-            appendLine("USER GOAL (Agent Mode — multi-step plan banao):")
+            appendLine("USER GOAL (Agent Mode — plan banao):")
             appendLine(goal)
             appendLine()
             if (answeredClarifications.isNotEmpty()) {
@@ -1243,20 +1247,20 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
                 recentChat.takeLast(6).forEach { appendLine("- $it") }
                 appendLine()
             }
-            appendLine("WEBSITE BUILD CHECKLIST (BUILD step ke liye — har website build par ye checklist lagti hai, user dobara details nahi dega):")
+            appendLine("WEBSITE BUILD CHECKLIST (BUILD ke liye — har website build par ye checklist lagti hai, user dobara details nahi dega):")
             appendLine(WebsiteBuildSpec.CHECKLIST_TEXT)
             appendLine()
             appendLine("PLAN RULES (strict — inhe todna plan reject kar dega):")
             appendLine("1. Output SIRF ek JSON object ho, is schema me (no prose, no fences):")
             appendLine("{ \"planTitle\": \"short title\", \"steps\": [ { \"kind\": \"BUILD|GITHUB_PUSH|SUPABASE_TABLES|VERCEL_DEPLOY|HTTP_CHECK|BROWSER_JOB\", \"title\": \"short\", \"detail\": \"...\", \"needsGate\": false } ] }")
-            appendLine("2. Steps 1 se 8 ke beech — zyada steps ho to plan ko chhota rakho, silently truncate mat karo.")
-            appendLine("3. Step kinds sirf ye 6 allowed hain: BUILD (website banao — existing builder checklist ke saath), GITHUB_PUSH (code GitHub repo me push karo), SUPABASE_TABLES (built backend/schema.sql se tables banao), VERCEL_DEPLOY (GitHub repo se Vercel deploy karo), HTTP_CHECK (ek URL check karo), BROWSER_JOB (headless WebView se kisi website par kaam karo — kholo, click karo, type karo, text nikalo, screenshot lo; step language: goto/click_text/type/extract/screenshot/wait/wait_text/assert_text/js). Koi aur kind mat likho.")
-            appendLine("4. Order dependency ka dhyaan rakho: BUILD pehle, phir GITHUB_PUSH, phir SUPABASE_TABLES, phir VERCEL_DEPLOY. Vercel deploy ke liye GitHub push DONE hona zaroori hai — uske bina Vercel step mat rakho.")
-            appendLine("5. detail me har step ke liye zaroori naam likho, is format me: BUILD -> \"project=<project-name>; <site kaisa ho, ek line>\"; GITHUB_PUSH -> \"repo=<repo-name>\" (user ne naam diya ho to wahi, nahi diya to \"repo=?\"); SUPABASE_TABLES -> \"project=<project-name>\"; VERCEL_DEPLOY -> \"project=<project-name>; repo=<owner>/<repo>\" (repo pata ho to); HTTP_CHECK -> \"url=<full-url> marker=<expected text>\"; BROWSER_JOB -> \"steps=<JSON array>\" — array ke har item me action + zaroori fields: goto {url}, click_text {text}, type {selector, text}, extract {selector, key}, screenshot {}, wait {ms}, wait_text {text}, assert_text {text}, js {code}. Login wali site ho to aage likho: login_url=<url> (user ko pehle Browser tab me login karna hoga).")
+            appendLine("2. Kaam 1 se 8 ke beech — zyada kaam ho to plan ko chhota rakho, silently truncate mat karo.")
+            appendLine("3. Kaam kinds sirf ye 6 allowed hain: BUILD (website banao — existing builder checklist ke saath), GITHUB_PUSH (code GitHub repo me push karo), SUPABASE_TABLES (built backend/schema.sql se tables banao), VERCEL_DEPLOY (GitHub repo se Vercel deploy karo), HTTP_CHECK (ek URL check karo), BROWSER_JOB (headless WebView se kisi website par kaam karo — kholo, click karo, type karo, text nikalo, screenshot lo; actions: goto/click_text/type/extract/screenshot/wait/wait_text/assert_text/js). Koi aur kind mat likho.")
+            appendLine("4. Order dependency ka dhyaan rakho: BUILD pehle, phir GITHUB_PUSH, phir SUPABASE_TABLES, phir VERCEL_DEPLOY. Vercel deploy ke liye GitHub push DONE hona zaroori hai — uske bina Vercel kaam mat rakho.")
+            appendLine("5. detail me har kaam ke liye zaroori naam likho, is format me: BUILD -> \"project=<project-name>; <site kaisa ho, ek line>\"; GITHUB_PUSH -> \"repo=<repo-name>\" (user ne naam diya ho to wahi, nahi diya to \"repo=?\"); SUPABASE_TABLES -> \"project=<project-name>\"; VERCEL_DEPLOY -> \"project=<project-name>; repo=<owner>/<repo>\" (repo pata ho to); HTTP_CHECK -> \"url=<full-url> marker=<expected text>\"; BROWSER_JOB -> \"steps=<JSON array>\" — array ke har item me action + zaroori fields: goto {url}, click_text {text}, type {selector, text}, extract {selector, key}, screenshot {}, wait {ms}, wait_text {text}, assert_text {text}, js {code}. Login wali site ho to aage likho: login_url=<url> (user ko pehle Browser tab me login karna hoga).")
             appendLine("6. Naam KABHI invent mat karo: repo naam, project naam, table naam user ne diya ho ya conversation me ho to wahi use karo — nahi ho to \"repo=?\" / project poochne ke liye detail me likho, khud ka naam mat gadh lo.")
-            appendLine("7. needsGate=true set karo jab step paise kharch kare, kuch delete kare, login/2FA maange, ya kisi existing non-empty project ko overwrite kare — us step se pehle user se poocha jayega.")
+            appendLine("7. needsGate=true set karo jab kaam paise kharch kare, kuch delete kare, login/2FA maange, ya kisi existing non-empty project ko overwrite kare — us kaam se pehle user se poocha jayega.")
             appendLine("8. Phone par koi backend server nahi chalta — backend files (backend/server.js, backend/schema.sql) deploy ke liye generate hoti hain, phone par run hone ka daava mat karo.")
-            appendLine("9. Goal me sirf website banani ho (koi GitHub/Supabase/Vercel/deploy shabd na ho) to BUILD step hi rakho — deploy steps mat jodo.")
+            appendLine("9. Goal me sirf website banani ho (koi GitHub/Supabase/Vercel/deploy shabd na ho) to BUILD hi rakho — deploy kaam mat jodo.")
         }
     }
 
@@ -1304,21 +1308,21 @@ class LlmClient(private val context: Context, private val prefs: JarvisPreferenc
         }
         val planTitle = obj.optString("planTitle", "").trim()
         val stepsArr = obj.optJSONArray("steps")
-            ?: throw PlanParseException("Plan me 'steps' array nahi mila")
-        if (stepsArr.length() == 0) throw PlanParseException("Plan me koi step nahi hai")
-        if (stepsArr.length() > 8) throw PlanParseException("Plan me 8 se zyada steps hain (${stepsArr.length()}) — chhota plan banao")
+            ?: throw PlanParseException("Plan me kaam ki list nahi mili")
+        if (stepsArr.length() == 0) throw PlanParseException("Plan me koi kaam nahi hai")
+        if (stepsArr.length() > 8) throw PlanParseException("Plan me 8 se zyada kaam hain (${stepsArr.length()}) — chhota plan banao")
         val allowedKinds = setOf(
             "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY", "HTTP_CHECK", "BROWSER_JOB"
         )
         val steps = mutableListOf<PlanStepDraft>()
         for (i in 0 until stepsArr.length()) {
             val stepObj = stepsArr.optJSONObject(i)
-                ?: throw PlanParseException("Step ${i + 1} JSON object nahi hai")
+                ?: throw PlanParseException("Kaam ${i + 1} JSON object nahi hai")
             val kind = stepObj.optString("kind", "").trim().uppercase()
-            if (kind.isBlank()) throw PlanParseException("Step ${i + 1} me 'kind' missing hai")
-            if (kind !in allowedKinds) throw PlanParseException("Step ${i + 1} ka kind unknown hai: $kind")
+            if (kind.isBlank()) throw PlanParseException("Kaam ${i + 1} me 'kind' missing hai")
+            if (kind !in allowedKinds) throw PlanParseException("Kaam ${i + 1} ka kind unknown hai: $kind")
             val title = stepObj.optString("title", "").trim()
-            if (title.isBlank()) throw PlanParseException("Step ${i + 1} me 'title' missing hai")
+            if (title.isBlank()) throw PlanParseException("Kaam ${i + 1} me 'title' missing hai")
             steps.add(
                 PlanStepDraft(
                     kind = kind,

@@ -57,14 +57,14 @@ object TalkerReplyPolicy {
      * passed in by the caller — no LLM, no Executor query.
      *
      * @param command the running command (null when nothing runs).
-     * @param stepDescription the Executor's current step line (may be
-     *   blank — the answer degrades to elapsed time only, never invents
-     *   a step).
+     * @param currentActivity the Executor's current activity line
+     *   (may be blank — the answer degrades to elapsed time only,
+     *   never invents an activity).
      * @param elapsedMs time since the command was issued.
      */
     fun statusLine(
         command: ExecutorCommand?,
-        stepDescription: String?,
+        currentActivity: String?,
         elapsedMs: Long
     ): String {
         if (command == null) return "Abhi koi kaam chal nahi raha — kuch karwana ho to bolo."
@@ -74,12 +74,12 @@ object TalkerReplyPolicy {
             minutes == 1L -> "1 minute se chal raha hai"
             else -> "$minutes minute se chal raha hai"
         }
-        val step = stepDescription?.trim()?.take(100).orEmpty()
+        val activity = currentActivity?.trim()?.take(100).orEmpty()
         val goal = command.goal.trim().take(80).ifBlank { "kaam" }
-        return if (step.isBlank()) {
+        return if (activity.isBlank()) {
             "Abhi ban raha hai — $goal, $elapsed."
         } else {
-            "Abhi chal raha hai — $goal, $elapsed. $step"
+            "Abhi chal raha hai — $goal, $elapsed. $activity"
         }
     }
 
@@ -110,30 +110,26 @@ object TalkerReplyPolicy {
         if (progress == null || TalkerProgressPolicy.isStale(progress, nowMs)) {
             return "Abhi ban raha hai — $goal, $elapsed.$stalledSuffix"
         }
+        // R1 (no-step): plain-words status only — the label is the
+        // current activity, never a "Step N/M" count.
         val label = progress.stepLabel.trim().take(80)
         val eta = TalkerProgressPolicy.etaClause(progress.etaSeconds)
-        return if (progress.stepTotal > 0) {
-            "Abhi chal raha hai — $goal, $elapsed. Step ${progress.stepIndex}/${progress.stepTotal}: $label.$eta$stalledSuffix"
-        } else {
-            "Abhi chal raha hai — $goal, $elapsed. Abhi $label chal raha hai.$stalledSuffix"
-        }
+        return "Abhi chal raha hai — $goal, $elapsed. Abhi $label chal raha hai.$eta$stalledSuffix"
     }
 
     /**
      * 1.9.0 (v2): one progress line, spoken and chat share the same
      * text (the chat rendering adds only the `⏳` marker — see
-     * [progressChatLine]). Plans name the next step; loops never
-     * invent one (DESIGN §3.3). `phase` START = "shuru hua",
-     * DONE = "ho gaya" for that step (a step "ho gaya" is fine —
-     * only a terminal DONE may claim the whole task is done).
+     * [progressChatLine]). R1 (no-step): the line names the current
+     * activity in plain words ("X chal raha hai / ho gaya") and, for
+     * plans, the next activity — never a count, never the word
+     * "step". Loops never invent a next activity (DESIGN §3.3).
+     * `phase` START = "shuru hua", DONE = "ho gaya" for that
+     * activity (an activity "ho gaya" is fine — only a terminal
+     * DONE may claim the whole task is done).
      */
     fun progressLine(progress: ExecutorProgress, nextLabel: String?): String {
         val label = progress.stepLabel.trim().take(80)
-        val stepPart = if (progress.stepTotal > 0) {
-            "Step ${progress.stepIndex}/${progress.stepTotal}: $label"
-        } else {
-            label
-        }
         val verb = when (progress.phase) {
             "DONE" -> "ho gaya"
             "START" -> "shuru hua"
@@ -142,12 +138,12 @@ object TalkerReplyPolicy {
         val next = if (progress.stepTotal > 0 && !nextLabel.isNullOrBlank()) {
             " — aage: ${nextLabel.trim().take(80)}"
         } else if (progress.stepTotal > 0 && progress.stepIndex >= progress.stepTotal) {
-            // Last plan step: no next step to name.
+            // Last plan unit: no next activity to name.
             " — bas, khatm hone wala hai"
         } else {
             ""
         }
-        return "$stepPart $verb$next"
+        return "$label $verb$next"
     }
 
     /** Chat rendering of a progress line: same text, `⏳` marker only. */

@@ -152,8 +152,10 @@ object SelfExtensionDetector {
         ) return Detection.NotACapabilityBlock("X-USER-CONTENT")
 
         // ---- Triggers (all must hold: trigger AND no exclusion) ----
-        // T-UNKNOWN-STEP: AgentPlanExecutor else-branch.
-        if (reasonLower.contains("unknown step kind")) {
+        // T-UNKNOWN-STEP: AgentPlanExecutor else-branch. R1:
+        // the wording is "Unknown kaam kind:" — keep in sync with
+        // AgentPlanExecutor.executeStep else-branch.
+        if (reasonLower.contains("unknown kaam kind")) {
             val kind = stepKindUpper.ifBlank { actionUpper }
             val capability = capabilityFor(kind, actionUpper)
             return Detection.MissingCapability(capability, signature(capability, failure), "T-UNKNOWN-STEP")

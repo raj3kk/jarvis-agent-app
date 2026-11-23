@@ -1,5 +1,7 @@
 package com.jarvis.autonomous.data
 
+import android.app.ActivityManager
+import android.content.Context
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -192,6 +194,49 @@ object JarvisDiagnosticsFile {
     /** Newest crash line, if any. */
     fun readLastCrash(): String? {
         return readLast(200).lastOrNull { it.contains("\"area\":\"crash\"") }
+    }
+
+    /**
+     * U7 (R1 audit follow-up, A7): one cheap RAM sample as a
+     * diagnostics entry (total / avail / app heap used+max /
+     * low-memory flag) — numbers only, never secrets, never user
+     * content. ON DEMAND only (the Diagnostics card's "RAM check"
+     * button): no hot loop, no periodic sampling, no battery cost.
+     * Goes through [JarvisStateRepository.addDiagnostic] so the
+     * sample lands in the same diagnostics.jsonl file (same
+     * FileLock/fsync discipline) AND shows in the card's mirror
+     * list. [formatMemorySample] is the pure, JVM-testable seam.
+     */
+    fun recordMemorySample(context: Context) {
+        runCatching {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE)
+                as? ActivityManager ?: return
+            val info = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(info)
+            val rt = Runtime.getRuntime()
+            val msg = formatMemorySample(
+                totalMemBytes = info.totalMem,
+                availMemBytes = info.availMem,
+                heapUsedBytes = rt.totalMemory() - rt.freeMemory(),
+                heapMaxBytes = rt.maxMemory(),
+                lowMemory = info.lowMemory
+            )
+            JarvisStateRepository.addDiagnostic("diagnostics", "RAM_SAMPLE", msg)
+        }
+    }
+
+    /** Pure formatting for [recordMemorySample] (no Android calls). */
+    fun formatMemorySample(
+        totalMemBytes: Long,
+        availMemBytes: Long,
+        heapUsedBytes: Long,
+        heapMaxBytes: Long,
+        lowMemory: Boolean
+    ): String {
+        val mb = 1024L * 1024L
+        return "total=${totalMemBytes / mb}MB avail=${availMemBytes / mb}MB " +
+            "heap_used=${heapUsedBytes / mb}MB heap_max=${heapMaxBytes / mb}MB " +
+            "low_memory=$lowMemory"
     }
 
     fun clear() {

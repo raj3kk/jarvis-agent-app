@@ -10,7 +10,7 @@ package com.jarvis.autonomous.agent
  *
  * The numbers are the annoyance bound: a milestone may arrive every
  * few seconds from a fast plan, but the user hears at most one
- * spoken progress line per 30 s, and the same step label is never
+ * spoken progress line per 30 s, and the same activity label is never
  * spoken twice within 60 s. Progress is a liveness signal for the
  * user, never a lease renewal for the job: it never resets the
  * 15-min watchdog and never satisfies the safety net.
@@ -23,7 +23,7 @@ object TalkerProgressPolicy {
     /** Minimum gap between two progress *chat* lines, same command. */
     const val MIN_CHAT_PROGRESS_INTERVAL_MS = 5_000L
 
-    /** Same stepLabel within this window is never spoken twice. */
+    /** Same activity label within this window is never spoken twice. */
     const val PROGRESS_DEDUPE_WINDOW_MS = 60_000L
 
     /** A progress line delivered later than this is chat-only, never spoken. */
@@ -99,7 +99,7 @@ object TalkerProgressPolicy {
      *  The Talker does NOT cancel and does NOT speak unprompted — this
      *  line is only appended to a status answer the user asked for. */
     fun stalledLine(): String =
-        "Pichle 5 minute se koi naya step nahi dikh raha — kaam chal raha hai, par slow lag raha hai."
+        "Pichle 5 minute se koi nayi halchal nahi dikh rahi — kaam chal raha hai, par slow lag raha hai."
 
     /** ETA clause for a spoken/status line. Loops never carry an ETA. */
     fun etaClause(etaSeconds: Long): String {
