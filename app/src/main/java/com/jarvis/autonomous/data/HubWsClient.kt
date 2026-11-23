@@ -364,6 +364,23 @@ class HubWsClient(
                     postCaptchaNotification(site, taskName)
                 }
             }
+            "MEMORY_PUSH" -> {
+                // R2.4: notice-only event from the hub — ids/counts,
+                // never content (same shape as CAPTCHA_ASSIST). The
+                // phone pulls the rows from /api/memory/list; the
+                // Trained tab observes memoryPushVersion and does the
+                // pull + on-device cache. Nothing here executes
+                // anything and no signature check is needed (a notice,
+                // not a command — a forged notice only triggers a
+                // pull, and the pull itself is device-signed).
+                val memoryCount = json.optInt("memory_count", -1)
+                val patternCount = json.optInt("pattern_count", -1)
+                JarvisStateRepository.bumpMemoryPushVersion()
+                diag(
+                    "WS_MEMORY_PUSH",
+                    "Memory push aaya (memories=$memoryCount, patterns=$patternCount) — pull hoga"
+                )
+            }
             "PING" -> {
                 runCatching { webSocket?.send("{\"type\":\"PONG\"}") }
             }

@@ -117,6 +117,38 @@ data class PlanView(
     val completed: Boolean
 )
 
+/** R2.7 (ToolRegistry): one trajectory line — tool name + outcome +
+ *  verdict, NO args, NO content (mini-swe shape). Arg values can be
+ *  PII (an email body, a URL with a token) and never go in a
+ *  trajectory, a log, or a plan file. */
+data class PlanTrajectoryEntry(
+    val tool: String,
+    val outcome: String,
+    val verdict: String,
+    val tsMs: Long
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("tool", tool)
+        put("outcome", outcome)
+        put("verdict", verdict)
+        put("tsMs", tsMs)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject?): PlanTrajectoryEntry? {
+            if (obj == null) return null
+            return runCatching {
+                PlanTrajectoryEntry(
+                    tool = obj.optString("tool", ""),
+                    outcome = obj.optString("outcome", ""),
+                    verdict = obj.optString("verdict", ""),
+                    tsMs = obj.optLong("tsMs", 0L)
+                ).takeIf { it.tool.isNotBlank() }
+            }.getOrNull()
+        }
+    }
+}
+
 data class AgentPlan(
     val planId: String,
     val goal: String,
@@ -132,7 +164,11 @@ data class AgentPlan(
     /** R1 (N3, §9.3): persisted task-budget state (LLM calls used,
      *  work units done, fix attempts, started-at). Absent on old
      *  plans — fromJson treats that as a fresh budget. */
-    val budget: com.jarvis.autonomous.agent.TaskBudgetState? = null
+    val budget: com.jarvis.autonomous.agent.TaskBudgetState? = null,
+    /** R2.7 (ToolRegistry): persisted per-step trajectory — tool
+     *  name + outcome + verdict, NO args, NO content (mini-swe
+     *  shape). Absent on old plans — fromJson defaults to empty. */
+    val trajectory: List<PlanTrajectoryEntry> = emptyList()
 ) {
     fun toView(): PlanView = PlanView(
         planId = planId,
@@ -153,6 +189,9 @@ data class AgentPlan(
         put("steps", JSONArray(steps.map { it.toJson() }))
         put("completed", completed)
         if (budget != null) put("budget", budget.toJson())
+        if (trajectory.isNotEmpty()) {
+            put("trajectory", JSONArray(trajectory.map { it.toJson() }))
+        }
     }
 
     companion object {
@@ -176,6 +215,14 @@ data class AgentPlan(
                     steps.add(PlanStep.fromJson(stepObj) ?: return null)
                 }
                 if (steps.isEmpty()) return null
+                val trajectory = mutableListOf<PlanTrajectoryEntry>()
+                val trajArr = obj.optJSONArray("trajectory")
+                if (trajArr != null) {
+                    for (i in 0 until trajArr.length()) {
+                        PlanTrajectoryEntry.fromJson(trajArr.optJSONObject(i) ?: continue)
+                            ?.let { trajectory.add(it) }
+                    }
+                }
                 AgentPlan(
                     planId = planId,
                     goal = goal,
@@ -185,7 +232,8 @@ data class AgentPlan(
                     answeredClarifications = clarifications,
                     steps = steps,
                     completed = obj.optBoolean("completed", false),
-                    budget = com.jarvis.autonomous.agent.TaskBudgetState.fromJson(obj.optJSONObject("budget"))
+                    budget = com.jarvis.autonomous.agent.TaskBudgetState.fromJson(obj.optJSONObject("budget")),
+                    trajectory = trajectory
                 )
             } catch (e: Exception) {
                 null
@@ -205,8 +253,14 @@ object AgentPlanStore {
     @Volatile
     private var lastCorruptSignature: String? = null
 
-    /** Atomic write: tmp file + rename. Every write goes through here. */
+    /** Atomic write: tmp file + rename. Every write goes through here.
+     *  R2.6: once migrated, the plan lives in the Jarvis Store
+     *  (SEC_AGENT_PLAN) instead of agent_plan.json. */
     fun save(context: Context, plan: AgentPlan) {
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_AGENT_PLAN, plan.toJson())
+            return
+        }
         runCatching {
             val dir = context.filesDir
             val tmp = File(dir, TMP_NAME)
@@ -230,6 +284,11 @@ object AgentPlanStore {
     /** Null = no plan, completed plan, or corrupt file (corrupt is
      *  logged once as a diagnostic, never resumed, never a crash). */
     fun load(context: Context): AgentPlan? {
+        if (JarvisStore.isMigrated()) {
+            val obj = JarvisStore.getSection(JarvisStore.SEC_AGENT_PLAN) as? JSONObject
+                ?: return null
+            return AgentPlan.fromJson(obj.toString())
+        }
         val file = File(context.filesDir, FILE_NAME)
         if (!file.exists()) return null
         val raw = runCatching { file.readText() }.getOrNull() ?: return null
@@ -250,6 +309,9 @@ object AgentPlanStore {
     }
 
     fun clear(context: Context) {
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_AGENT_PLAN, null)
+        }
         runCatching {
             File(context.filesDir, FILE_NAME).delete()
             File(context.filesDir, TMP_NAME).delete()

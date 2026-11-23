@@ -104,61 +104,21 @@ object WhiteboardStore {
     }
 
     private fun load() {
+        // R2.6 (1.17.0-PRO): once migrated, the board state lives in
+        // the Jarvis Store (SEC_WHITEBOARD); the file is only the
+        // pre-migration source. The image FILE itself always stays in
+        // filesDir — only its path is stored here.
+        if (JarvisStore.isMigrated()) {
+            val root = JarvisStore.getSection(JarvisStore.SEC_WHITEBOARD) as? JSONObject
+            if (root != null) {
+                parseState(root)
+                return
+            }
+        }
         val file = stateFile() ?: return
         if (!file.exists()) return
         try {
-            val root = JSONObject(file.readText())
-            val strokes = mutableListOf<WhiteboardStroke>()
-            val strokeArray = root.optJSONArray("strokes") ?: JSONArray()
-            for (i in 0 until strokeArray.length()) {
-                val strokeObj = strokeArray.optJSONObject(i) ?: continue
-                val pointArray = strokeObj.optJSONArray("points") ?: JSONArray()
-                val points = mutableListOf<WhiteboardPoint>()
-                for (j in 0 until pointArray.length()) {
-                    val pointObj = pointArray.optJSONObject(j) ?: continue
-                    points.add(
-                        WhiteboardPoint(
-                            x = pointObj.optDouble("x", 0.0).toFloat(),
-                            y = pointObj.optDouble("y", 0.0).toFloat()
-                        )
-                    )
-                }
-                if (points.isNotEmpty()) {
-                    strokes.add(
-                        WhiteboardStroke(
-                            points = points,
-                            color = strokeObj.optInt("color", -0x1000000),
-                            width = strokeObj.optDouble("width", 8.0).toFloat()
-                        )
-                    )
-                }
-            }
-            val messages = mutableListOf<WhiteboardMessage>()
-            val messageArray = root.optJSONArray("messages") ?: JSONArray()
-            for (i in 0 until messageArray.length()) {
-                val messageObj = messageArray.optJSONObject(i) ?: continue
-                val text = messageObj.optString("text", "")
-                if (text.isNotBlank()) {
-                    messages.add(
-                        WhiteboardMessage(
-                            text = text,
-                            timestampMillis = messageObj.optLong(
-                                "timestampMillis",
-                                System.currentTimeMillis()
-                            )
-                        )
-                    )
-                }
-            }
-            val imagePath = root.optString("imagePath", "").ifBlank { null }
-            val userCaption = root.optString("userCaption", "").ifBlank { null }
-            _state.value = WhiteboardState(
-                strokes = strokes,
-                imagePath = imagePath?.takeIf { File(it).exists() },
-                userCaption = userCaption,
-                messages = messages
-            )
-            _loadError.value = null
+            parseState(JSONObject(file.readText()))
         } catch (e: Exception) {
             // B-C5: corrupt JSON surfaces an error instead of a silent
             // empty board. The unreadable bytes are kept aside first,
@@ -171,6 +131,61 @@ object WhiteboardStore {
                 "Whiteboard ka purana data kharab (corrupt) mila, isliye khaali board dikh raha hai. " +
                     "Purana data whiteboard.json.corrupt me surakshit hai."
         }
+    }
+
+    /** Parse one state JSON object (Store section or file) into _state. */
+    private fun parseState(root: JSONObject) {
+        val strokes = mutableListOf<WhiteboardStroke>()
+        val strokeArray = root.optJSONArray("strokes") ?: JSONArray()
+        for (i in 0 until strokeArray.length()) {
+            val strokeObj = strokeArray.optJSONObject(i) ?: continue
+            val pointArray = strokeObj.optJSONArray("points") ?: JSONArray()
+            val points = mutableListOf<WhiteboardPoint>()
+            for (j in 0 until pointArray.length()) {
+                val pointObj = pointArray.optJSONObject(j) ?: continue
+                points.add(
+                    WhiteboardPoint(
+                        x = pointObj.optDouble("x", 0.0).toFloat(),
+                        y = pointObj.optDouble("y", 0.0).toFloat()
+                    )
+                )
+            }
+            if (points.isNotEmpty()) {
+                strokes.add(
+                    WhiteboardStroke(
+                        points = points,
+                        color = strokeObj.optInt("color", -0x1000000),
+                        width = strokeObj.optDouble("width", 8.0).toFloat()
+                    )
+                )
+            }
+        }
+        val messages = mutableListOf<WhiteboardMessage>()
+        val messageArray = root.optJSONArray("messages") ?: JSONArray()
+        for (i in 0 until messageArray.length()) {
+            val messageObj = messageArray.optJSONObject(i) ?: continue
+            val text = messageObj.optString("text", "")
+            if (text.isNotBlank()) {
+                messages.add(
+                    WhiteboardMessage(
+                        text = text,
+                        timestampMillis = messageObj.optLong(
+                            "timestampMillis",
+                            System.currentTimeMillis()
+                        )
+                    )
+                )
+            }
+        }
+        val imagePath = root.optString("imagePath", "").ifBlank { null }
+        val userCaption = root.optString("userCaption", "").ifBlank { null }
+        _state.value = WhiteboardState(
+            strokes = strokes,
+            imagePath = imagePath?.takeIf { File(it).exists() },
+            userCaption = userCaption,
+            messages = messages
+        )
+        _loadError.value = null
     }
 
     /** Serialises one snapshot. Built on the calling thread, so the
@@ -246,8 +261,22 @@ object WhiteboardStore {
     }
 
     private fun save() {
-        val file = stateFile() ?: return
         val json = stateToJson(_state.value)
+        // R2.6: once migrated, the board state goes to the Store
+        // section (the image file itself stays in filesDir).
+        if (JarvisStore.isMigrated()) {
+            val version = saveVersion.incrementAndGet()
+            ioScope.launch {
+                if (version != saveVersion.get()) return@launch
+                runCatching {
+                    JarvisStore.setSection(
+                        JarvisStore.SEC_WHITEBOARD, JSONObject(json)
+                    )
+                }
+            }
+            return
+        }
+        val file = stateFile() ?: return
         val version = saveVersion.incrementAndGet()
         ioScope.launch {
             // Skip when a newer snapshot (or a synchronous flush)
@@ -264,9 +293,16 @@ object WhiteboardStore {
      * cancel. Returns false when the write did not land.
      */
     fun flushSync(): Boolean {
-        val file = stateFile() ?: return false
         val json = stateToJson(_state.value)
         saveVersion.incrementAndGet()
+        if (JarvisStore.isMigrated()) {
+            return runCatching {
+                JarvisStore.setSection(
+                    JarvisStore.SEC_WHITEBOARD, JSONObject(json)
+                )
+            }.getOrDefault(false)
+        }
+        val file = stateFile() ?: return false
         return atomicWriteText(file, json)
     }
 

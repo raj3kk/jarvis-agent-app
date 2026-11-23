@@ -9,10 +9,12 @@ import com.jarvis.autonomous.data.HubGithubClient
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.GoogleClient
+import com.jarvis.autonomous.data.JarvisEventLog
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.LearnedStep
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanStep
+import com.jarvis.autonomous.data.PlanTrajectoryEntry
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
 import kotlinx.coroutines.CancellationException
@@ -309,6 +311,10 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private suspend fun runPlan(plan: AgentPlan) {
         var current = plan
+        // R2.7: a fresh run starts with a clean trajectory — entries
+        // from an earlier run (e.g. a step whose outcome led straight
+        // to finishPlan without an updateStep) never leak into this plan.
+        runTrajectory.clear()
         // R1 (N3): budget for this run — restored on resume, fresh
         // on a new plan. The loop runs until DONE (verified) or
         // budget exhausted or watchdog — never after N steps.
@@ -934,10 +940,26 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
         return GateResult.Allow
     }
 
-    // ---- Step dispatch ----
+    // ---- Step dispatch (R2.7: ToolRegistry resolve + trajectory) ----
+
+    // R2.7: per-run trajectory, appended by executeStep and merged
+    // into the persisted plan by updateStep (the post-execution
+    // choke point). Cleared at every runPlan start so entries never
+    // leak across plans. Tool name + outcome + verdict only — no
+    // args, no content (mini-swe shape).
+    private val runTrajectory = ArrayList<PlanTrajectoryEntry>()
 
     private suspend fun executeStep(step: PlanStep, plan: AgentPlan): StepOutcome {
-        return when (step.kind) {
+        // R2.7: resolve through the registry first. An unknown kind
+        // fails with the T-NO-HANDLER marker (the self-extension
+        // detector keys on it) instead of silently doing nothing.
+        val tool = ToolRegistry.resolve(step.kind)
+        if (tool == null) {
+            val outcome = StepOutcome.Failed("Unknown kaam kind: ${step.kind} (T-NO-HANDLER)")
+            recordStepOutcome(step, outcome)
+            return outcome
+        }
+        val outcome = when (step.kind) {
             "BUILD" -> executeBuild(step, plan)
             "GITHUB_PUSH" -> executeGithubPush(step, plan)
             "SUPABASE_TABLES" -> executeSupabaseTables(step, plan)
@@ -953,13 +975,44 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             // extract/screenshot). Session/captcha/foreground failures
             // park as BLOCKED (user help needed), everything else Failed.
             "BROWSER_JOB" -> executeBrowserJob(step)
-            // 1.11.0-PRO (self-extension): the T-NO-HANDLER marker
-            // names the trigger for the detector (§2.2). R1: the
-            // wording is now "Unknown kaam kind:" — the detector
-            // matches on that exact phrase (SelfExtensionDetector
-            // T-UNKNOWN-STEP); keep the two in sync.
+            // Unreachable after the registry resolve above (kept as a
+            // safety net — see the T-NO-HANDLER comment there).
             else -> StepOutcome.Failed("Unknown kaam kind: ${step.kind} (T-NO-HANDLER)")
         }
+        recordStepOutcome(step, outcome)
+        return outcome
+    }
+
+    /**
+     * R2.2 + R2.7: one executed step -> one trajectory line (tool +
+     * outcome + verdict, no args/content) and one event-log line
+     * (kind + result + verdict + short screen meaning, sanitised).
+     * The trajectory is merged into the persisted plan by updateStep;
+     * the event log is on-device only.
+     */
+    private fun recordStepOutcome(step: PlanStep, outcome: StepOutcome) {
+        val (result, detail) = when (outcome) {
+            is StepOutcome.Done -> "DONE" to outcome.evidence
+            is StepOutcome.Failed -> "FAILED" to outcome.reason
+            is StepOutcome.Blocked -> "BLOCKED" to outcome.reason
+        }
+        runTrajectory.add(
+            PlanTrajectoryEntry(
+                tool = step.kind,
+                outcome = result,
+                verdict = detail.take(120),
+                tsMs = System.currentTimeMillis()
+            )
+        )
+        val screenMeaning = when (outcome) {
+            is StepOutcome.Done -> "${step.kind} ho gaya — ${detail.take(200)}"
+            is StepOutcome.Failed -> "${step.kind} fail hua — ${detail.take(200)}"
+            is StepOutcome.Blocked -> "${step.kind} ruka — ${detail.take(200)}"
+        }
+        JarvisEventLog.log(
+            engine.planCurrentTurnId().ifBlank { "resume" },
+            step.kind, result, detail.take(120), screenMeaning
+        )
     }
 
     // ---- BUILD (existing builder loop, reused) ----
@@ -2265,9 +2318,20 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
 
     private fun updateStep(plan: AgentPlan, stepId: String, transform: (PlanStep) -> PlanStep): AgentPlan {
         val now = System.currentTimeMillis()
+        // R2.7: merge any pending trajectory lines into the plan copy
+        // (deduped) so the persisted plan carries the mini-swe
+        // trajectory. This is the post-execution choke point — every
+        // executed step flows through here before its save.
+        val mergedTrajectory = if (runTrajectory.isEmpty()) {
+            plan.trajectory
+        } else {
+            (plan.trajectory + runTrajectory).distinct()
+        }
+        runTrajectory.clear()
         return plan.copy(
             steps = plan.steps.map { if (it.id == stepId) transform(it).copy(updatedAtMs = now) else it },
-            updatedAtMs = now
+            updatedAtMs = now,
+            trajectory = mergedTrajectory
         )
     }
 

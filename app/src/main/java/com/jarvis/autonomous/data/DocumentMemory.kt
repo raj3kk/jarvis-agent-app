@@ -691,7 +691,16 @@ class DocumentMemoryStore(private val storage: DocumentStorage) {
         val orderArr = JSONArray()
         for (id in index.order) orderArr.put(id)
         obj.put("order", orderArr)
-        return storage.writeIndex(obj.toString())
+        val ok = storage.writeIndex(obj.toString())
+        // R2.6: mirror the docs INDEX into the Jarvis Store (bodies
+        // stay in device-memory/docs/; the live index stays index.json
+        // — the Store copy is the restore source). Best-effort.
+        if (ok && JarvisStore.isMigrated()) {
+            runCatching {
+                JarvisStore.setSection(JarvisStore.SEC_DOCS_INDEX, obj)
+            }
+        }
+        return ok
     }
 
     private fun evictLocked(index: IndexData, id: String) {

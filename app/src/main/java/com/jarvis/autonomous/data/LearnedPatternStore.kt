@@ -680,3 +680,101 @@ class FilePatternStorage(context: Context) : PatternStorage {
     private fun isSafeId(id: String): Boolean =
         id.matches(Regex("(pat|ins)-[0-9]+-[0-9a-f]+"))
 }
+
+/**
+ * R2.6 (1.17.0-PRO) — Store-backed [PatternStorage]: learned patterns
+ * + instructions live in the Jarvis Store (sections
+ * SEC_LEARNED_PATTERNS / SEC_INSTRUCTIONS) once migrated, instead of
+ * device-memory/patterns/*.json + instructions/*.json. Same seam, so
+ * LearnedPatternStore (and its unit test) work unchanged. The file
+ * implementation stays as the legacy reader for the one-time
+ * migration and for pre-migration launches.
+ */
+class JarvisStorePatternStorage : PatternStorage {
+
+    private fun patternsSection(): JSONObject =
+        (JarvisStore.getSection(JarvisStore.SEC_LEARNED_PATTERNS) as? JSONObject) ?: JSONObject()
+
+    private fun instructionsSection(): JSONObject =
+        (JarvisStore.getSection(JarvisStore.SEC_INSTRUCTIONS) as? JSONObject) ?: JSONObject()
+
+    private fun savePatternsSection(obj: JSONObject): Boolean =
+        JarvisStore.setSection(JarvisStore.SEC_LEARNED_PATTERNS, obj)
+
+    private fun saveInstructionsSection(obj: JSONObject): Boolean =
+        JarvisStore.setSection(JarvisStore.SEC_INSTRUCTIONS, obj)
+
+    private fun mapOf(section: JSONObject, key: String): JSONObject =
+        section.optJSONObject(key) ?: JSONObject().also { section.put(key, it) }
+
+    override fun listPatternIds(): List<String> =
+        mapOf(patternsSection(), "patterns").keys().asSequence().toList().sorted()
+
+    override fun listInstructionIds(): List<String> =
+        mapOf(instructionsSection(), "instructions").keys().asSequence().toList().sorted()
+
+    override fun readPattern(id: String): String? =
+        mapOf(patternsSection(), "patterns").optJSONObject(id)?.toString()
+
+    override fun readInstruction(id: String): String? =
+        mapOf(instructionsSection(), "instructions").optJSONObject(id)?.toString()
+
+    override fun writePattern(id: String, json: String): Boolean {
+        val section = patternsSection()
+        return runCatching {
+            mapOf(section, "patterns").put(id, JSONObject(json))
+            savePatternsSection(section)
+        }.getOrDefault(false)
+    }
+
+    override fun writeInstruction(id: String, json: String): Boolean {
+        val section = instructionsSection()
+        return runCatching {
+            mapOf(section, "instructions").put(id, JSONObject(json))
+            saveInstructionsSection(section)
+        }.getOrDefault(false)
+    }
+
+    override fun deletePattern(id: String): Boolean {
+        val section = patternsSection()
+        val map = mapOf(section, "patterns")
+        if (map.opt(id) == null) return false
+        map.remove(id)
+        return savePatternsSection(section)
+    }
+
+    override fun deleteInstruction(id: String): Boolean {
+        val section = instructionsSection()
+        val map = mapOf(section, "instructions")
+        if (map.opt(id) == null) return false
+        map.remove(id)
+        return saveInstructionsSection(section)
+    }
+
+    override fun readPatternIndex(): String? =
+        patternsSection().optJSONObject("pattern_index")?.toString()
+
+    override fun readInstructionIndex(): String? =
+        instructionsSection().optJSONObject("instruction_index")?.toString()
+
+    override fun writePatternIndex(json: String): Boolean {
+        val section = patternsSection()
+        return runCatching {
+            section.put("pattern_index", JSONObject(json))
+            savePatternsSection(section)
+        }.getOrDefault(false)
+    }
+
+    override fun writeInstructionIndex(json: String): Boolean {
+        val section = instructionsSection()
+        return runCatching {
+            section.put("instruction_index", JSONObject(json))
+            saveInstructionsSection(section)
+        }.getOrDefault(false)
+    }
+
+    override fun deleteAll() {
+        JarvisStore.setSection(JarvisStore.SEC_LEARNED_PATTERNS, null)
+        JarvisStore.setSection(JarvisStore.SEC_INSTRUCTIONS, null)
+    }
+}

@@ -28,8 +28,10 @@ import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.JarvisAgentEngine
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.HubWsClient
+import com.jarvis.autonomous.data.JarvisEventLog
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.JarvisStore
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.TestVoiceStageTracker
 import com.jarvis.autonomous.data.LaunchSession
@@ -407,6 +409,12 @@ class JarvisForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // R2.6 (1.17.0-PRO): load (or one-time migrate) the Jarvis
+        // Store BEFORE the F1 chat restore below and BEFORE the engine
+        // is built (the engine picks its pattern storage from
+        // isMigrated()). Idempotent; MainActivity does the same.
+        JarvisStore.load(this)
+        JarvisEventLog.init(this)
         // 1.15.0 memory-loss fix (F1): the service can run without the
         // Activity (mic loop, boot) — restore the saved chat history
         // once at service start too, on a background thread, so a

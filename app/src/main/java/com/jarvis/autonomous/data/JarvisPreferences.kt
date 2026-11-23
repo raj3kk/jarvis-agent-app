@@ -348,7 +348,25 @@ class JarvisPreferences(context: Context) {
     // write must be on disk before the next line is spoken, even on
     // force-stop right after a reply. Other prefs keep apply().
     // ChatEntry lives in this same package, so no import is needed.
+    // R2.6 (1.17.0-PRO): chat / friend memories / voice routines
+    // live in the Jarvis Store once migrated (single on-device
+    // file). Same public API, same caps, same F3 commit() guarantee
+    // (the Store write is atomic tmp + rename + fsync). Pre-migration
+    // launches keep the prefs path untouched.
     fun getSavedChatHistory(): List<ChatEntry> {
+        if (JarvisStore.isMigrated()) {
+            val arr = JarvisStore.getSection(JarvisStore.SEC_CHAT) as? JSONArray
+                ?: return emptyList()
+            return runCatching {
+                (0 until arr.length()).map { i ->
+                    val obj = arr.getJSONObject(i)
+                    ChatEntry(
+                        sender = obj.optString("sender", "Jarvis"),
+                        message = obj.optString("message", "")
+                    )
+                }.filter { it.message.isNotBlank() }
+            }.getOrDefault(emptyList())
+        }
         val raw = prefs.getString("chat_history_json", "[]") ?: "[]"
         return runCatching {
             val arr = JSONArray(raw)
@@ -370,11 +388,27 @@ class JarvisPreferences(context: Context) {
                 put("message", e.message)
             })
         }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_CHAT, arr)
+            return
+        }
         prefs.edit().putString("chat_history_json", arr.toString()).commit()
     }
 
     // Long-term Friend Memory Notes
     fun getMemories(): List<String> {
+        if (JarvisStore.isMigrated()) {
+            val arr = JarvisStore.getSection(JarvisStore.SEC_FRIEND_MEMORIES) as? JSONArray
+            if (arr == null) {
+                return listOf(
+                    "User prefers friendly Hinglish conversation",
+                    "Ask before clicking Pay Now or sending money"
+                )
+            }
+            return runCatching {
+                (0 until arr.length()).map { arr.getString(it) }
+            }.getOrDefault(emptyList())
+        }
         val raw = prefs.getString(
             "friend_memories",
             """["User prefers friendly Hinglish conversation", "Ask before clicking Pay Now or sending money"]"""
@@ -390,6 +424,10 @@ class JarvisPreferences(context: Context) {
         val updated = (getMemories() + note.trim()).distinct()
         val arr = JSONArray()
         updated.forEach { arr.put(it) }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_FRIEND_MEMORIES, arr)
+            return
+        }
         prefs.edit().putString("friend_memories", arr.toString()).apply()
     }
 
@@ -397,6 +435,10 @@ class JarvisPreferences(context: Context) {
         val updated = getMemories().filterNot { it == note }
         val arr = JSONArray()
         updated.forEach { arr.put(it) }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_FRIEND_MEMORIES, arr)
+            return
+        }
         prefs.edit().putString("friend_memories", arr.toString()).apply()
     }
 
@@ -409,7 +451,12 @@ class JarvisPreferences(context: Context) {
               {"id":"3","trigger":"focus mode","prompt":"Phone ka volume kam karo aur YouTube khol kar Lo-Fi study music search karke play karo"}
             ]
         """.trimIndent()
-        val raw = prefs.getString("voice_routines", defaultJson) ?: defaultJson
+        val raw = if (JarvisStore.isMigrated()) {
+            (JarvisStore.getSection(JarvisStore.SEC_VOICE_ROUTINES) as? JSONArray)?.toString()
+                ?: defaultJson
+        } else {
+            prefs.getString("voice_routines", defaultJson) ?: defaultJson
+        }
         return runCatching {
             val arr = JSONArray(raw)
             (0 until arr.length()).map { i ->
@@ -450,6 +497,10 @@ class JarvisPreferences(context: Context) {
                     put("prompt", r.actionPrompt)
                 }
             )
+        }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(JarvisStore.SEC_VOICE_ROUTINES, arr)
+            return
         }
         prefs.edit().putString("voice_routines", arr.toString()).apply()
     }

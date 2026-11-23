@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -128,6 +129,8 @@ import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.FileDocumentStorage
 import com.jarvis.autonomous.data.HubWsClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
+import com.jarvis.autonomous.data.JarvisEventLog
+import com.jarvis.autonomous.data.JarvisStore
 import com.jarvis.autonomous.data.LicenceKeyStore
 import com.jarvis.autonomous.data.PlanState
 import com.jarvis.autonomous.data.PlanView
@@ -180,6 +183,13 @@ class MainActivity : ComponentActivity() {
         // 1.4.4 per-launch guard window: reset HOME/BACK blocking
         // for THIS launch (see LaunchSession.onActivityLaunch).
         LaunchSession.onActivityLaunch()
+        // R2.6 (1.17.0-PRO): the Jarvis Store is the single on-device
+        // file — load (or one-time migrate) it BEFORE the F1 chat
+        // restore below reads the chat history (JarvisPreferences
+        // delegates to the Store once migrated). Idempotent; the FGS
+        // does the same in its onCreate.
+        JarvisStore.load(this)
+        JarvisEventLog.init(this)
         // 1.4.5 (item 6): seed the Swara ON/OFF flow's single source
         // (repository flow) from prefs at launch, and load the
         // PERSISTED diagnostics into the in-memory mirror on a
@@ -449,7 +459,10 @@ fun JarvisMainApp(
                     // R1 (TERMINAL_SUBAGENT_BROWSER_PARITY §4 #2):
                     // in-app terminal — xterm.js UI + ProcessBuilder
                     // "sh" backend (TerminalScreen.kt).
-                    Triple(8, Icons.Default.Terminal, "Terminal")
+                    Triple(8, Icons.Default.Terminal, "Terminal"),
+                    // R2.1 (1.17.0-PRO): Trained Jarvis — document /
+                    // PDF / photo / link / voice ingestion + memory.
+                    Triple(9, Icons.Default.School, "Trained")
                 )
                 val tabListState = rememberLazyListState()
                 LaunchedEffect(selectedTab) {
@@ -554,6 +567,8 @@ fun JarvisMainApp(
                 7 -> WhiteboardScreen()
 
                 8 -> TerminalScreen()
+
+                9 -> TrainedJarvisScreen()
             }
         }
         }

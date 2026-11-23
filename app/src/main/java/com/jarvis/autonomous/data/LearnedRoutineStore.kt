@@ -317,7 +317,12 @@ class LearnedRoutineStore(context: Context) {
      * Public — the Skills UI reads through this.
      */
     fun loadSkillManifests(): List<LocalSkillManifest> {
-        val raw = prefs.getString(KEY_SKILLS_JSON, "[]") ?: "[]"
+        val raw = if (JarvisStore.isMigrated()) {
+            (JarvisStore.getSection(JarvisStore.SEC_SKILL_MANIFESTS) as? JSONObject)
+                ?.optJSONArray("manifests")?.toString() ?: "[]"
+        } else {
+            prefs.getString(KEY_SKILLS_JSON, "[]") ?: "[]"
+        }
         return runCatching {
             val arr = JSONArray(raw)
             val out = ArrayList<LocalSkillManifest>()
@@ -335,6 +340,13 @@ class LearnedRoutineStore(context: Context) {
         val arr = JSONArray()
         for (manifest in manifests) {
             arr.put(manifestToJson(manifest))
+        }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(
+                JarvisStore.SEC_SKILL_MANIFESTS,
+                JSONObject().put("manifests", arr)
+            )
+            return
         }
         prefs.edit().putString(KEY_SKILLS_JSON, arr.toString()).apply()
     }
@@ -623,7 +635,12 @@ class LearnedRoutineStore(context: Context) {
     // ------------------------------------------------------------------
 
     private fun loadRoutines(): List<LearnedRoutine> {
-        val raw = prefs.getString(KEY_JSON, "[]") ?: "[]"
+        val raw = if (JarvisStore.isMigrated()) {
+            (JarvisStore.getSection(JarvisStore.SEC_LEARNED_ROUTINES) as? JSONObject)
+                ?.optJSONArray("routines")?.toString() ?: "[]"
+        } else {
+            prefs.getString(KEY_JSON, "[]") ?: "[]"
+        }
         return runCatching {
             val arr = JSONArray(raw)
             val out = ArrayList<LearnedRoutine>()
@@ -641,6 +658,13 @@ class LearnedRoutineStore(context: Context) {
         val arr = JSONArray()
         for (routine in routines) {
             arr.put(routineToJson(routine))
+        }
+        if (JarvisStore.isMigrated()) {
+            JarvisStore.setSection(
+                JarvisStore.SEC_LEARNED_ROUTINES,
+                JSONObject().put("routines", arr)
+            )
+            return
         }
         prefs.edit().putString(KEY_JSON, arr.toString()).apply()
     }

@@ -7,6 +7,7 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONObject
 
 /**
  * 1.4.2 bug catcher — persisted diagnostics file.
@@ -43,6 +44,31 @@ object JarvisDiagnosticsFile {
 
     @Volatile
     private var dir: File? = null
+
+    // R2.6: the Jarvis Store holds only the diagnostics CURSOR
+    // (line count + last write ts); the log lines stay in
+    // diagnostics.jsonl. The cursor is an index, not the log — it is
+    // mirrored at most once a minute (a full Store rewrite per
+    // diagnostic line would be pure disk churn) and on every rotation.
+    @Volatile
+    private var lineCount = -1
+
+    @Volatile
+    private var lastCursorMirrorMs = 0L
+
+    private fun mirrorCursorLocked(f: File, force: Boolean) {
+        if (!JarvisStore.isMigrated()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastCursorMirrorMs < 60_000L) return
+        runCatching {
+            if (lineCount < 0) lineCount = f.readLines().size
+            JarvisStore.setSection(JarvisStore.SEC_DIAGNOSTICS_CURSOR, JSONObject().apply {
+                put("lines", lineCount)
+                put("lastTsMs", now)
+            })
+            lastCursorMirrorMs = now
+        }
+    }
 
     fun init(filesDir: File) {
         dir = filesDir
@@ -95,7 +121,9 @@ object JarvisDiagnosticsFile {
             out.flush()
             if (sync) out.fd.sync()
         }
+        if (lineCount >= 0) lineCount++
         rotateLocked(f)
+        mirrorCursorLocked(f, force = false)
     }
 
     /**
@@ -121,6 +149,9 @@ object JarvisDiagnosticsFile {
                 f.writeText(kept.joinToString("\n") + if (kept.isEmpty()) "" else "\n")
                 runCatching { tmp.delete() }
             }
+            // Rotation dropped lines — the cursor restarts here.
+            lineCount = kept.size
+            mirrorCursorLocked(f, force = true)
         }
     }
 

@@ -245,7 +245,38 @@ class MemoryIndex(context: Context) {
     // JSON persistence helpers (dedicated file, local only)
     // ------------------------------------------------------------------
 
+    // R2.6 (1.17.0-PRO): once migrated, the three maps live in the
+    // Jarvis Store section SEC_MEMORY_INDEX ({summaries, turnKeywords,
+    // index}) instead of jarvis_memory_index prefs. The prefs key
+    // maps to its section field name.
+    private fun sectionFieldFor(key: String): String? = when (key) {
+        KEY_SUMMARIES -> "summaries"
+        KEY_TURN_KEYWORDS -> "turnKeywords"
+        KEY_INDEX -> "index"
+        else -> null
+    }
+
+    private fun loadSectionObject(): JSONObject? =
+        JarvisStore.getSection(JarvisStore.SEC_MEMORY_INDEX) as? JSONObject
+
+    private fun saveSectionObject(obj: JSONObject) {
+        JarvisStore.setSection(JarvisStore.SEC_MEMORY_INDEX, obj)
+    }
+
     private fun loadStringMap(key: String): MutableMap<String, String> {
+        if (JarvisStore.isMigrated()) {
+            val field = sectionFieldFor(key) ?: return HashMap()
+            val out = HashMap<String, String>()
+            runCatching {
+                val obj = loadSectionObject()?.optJSONObject(field) ?: return@runCatching
+                val names = obj.names() ?: return@runCatching
+                for (i in 0 until names.length()) {
+                    val name = names.getString(i)
+                    out[name] = obj.optString(name, "")
+                }
+            }
+            return out
+        }
         val raw = prefs.getString(key, "{}") ?: "{}"
         val out = HashMap<String, String>()
         runCatching {
@@ -260,6 +291,17 @@ class MemoryIndex(context: Context) {
     }
 
     private fun saveStringMap(key: String, map: Map<String, String>) {
+        if (JarvisStore.isMigrated()) {
+            val field = sectionFieldFor(key) ?: return
+            val section = loadSectionObject() ?: JSONObject()
+            val obj = JSONObject()
+            for (entry in map.entries) {
+                obj.put(entry.key, entry.value)
+            }
+            section.put(field, obj)
+            saveSectionObject(section)
+            return
+        }
         val obj = JSONObject()
         for (entry in map.entries) {
             obj.put(entry.key, entry.value)
@@ -268,6 +310,29 @@ class MemoryIndex(context: Context) {
     }
 
     private fun loadStringListMap(key: String): MutableMap<String, List<String>> {
+        if (JarvisStore.isMigrated()) {
+            val field = sectionFieldFor(key) ?: return HashMap()
+            val out = HashMap<String, List<String>>()
+            runCatching {
+                val obj = loadSectionObject()?.optJSONObject(field) ?: return@runCatching
+                val names = obj.names() ?: return@runCatching
+                for (i in 0 until names.length()) {
+                    val name = names.getString(i)
+                    val arr = obj.optJSONArray(name)
+                    val list = ArrayList<String>()
+                    if (arr != null) {
+                        for (j in 0 until arr.length()) {
+                            val value = arr.optString(j, "")
+                            if (value.isNotBlank()) {
+                                list.add(value)
+                            }
+                        }
+                    }
+                    out[name] = list
+                }
+            }
+            return out
+        }
         val raw = prefs.getString(key, "{}") ?: "{}"
         val out = HashMap<String, List<String>>()
         runCatching {
@@ -292,6 +357,21 @@ class MemoryIndex(context: Context) {
     }
 
     private fun saveStringListMap(key: String, map: Map<String, List<String>>) {
+        if (JarvisStore.isMigrated()) {
+            val field = sectionFieldFor(key) ?: return
+            val section = loadSectionObject() ?: JSONObject()
+            val obj = JSONObject()
+            for (entry in map.entries) {
+                val arr = JSONArray()
+                for (value in entry.value) {
+                    arr.put(value)
+                }
+                obj.put(entry.key, arr)
+            }
+            section.put(field, obj)
+            saveSectionObject(section)
+            return
+        }
         val obj = JSONObject()
         for (entry in map.entries) {
             val arr = JSONArray()

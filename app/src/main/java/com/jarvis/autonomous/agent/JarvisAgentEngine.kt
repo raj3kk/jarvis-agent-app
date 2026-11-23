@@ -9,8 +9,11 @@ import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AiProvider
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.FilePatternStorage
+import com.jarvis.autonomous.data.JarvisEventLog
 import com.jarvis.autonomous.data.JarvisPreferences
 import com.jarvis.autonomous.data.JarvisStateRepository
+import com.jarvis.autonomous.data.JarvisStore
+import com.jarvis.autonomous.data.JarvisStorePatternStorage
 import com.jarvis.autonomous.data.LicenceKeyStore
 import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.DocumentMemoryStore
@@ -97,6 +100,13 @@ class JarvisAgentEngine(
     // executor receives a fully-constructed engine.
     private val planExecutor: AgentPlanExecutor by lazy { AgentPlanExecutor(this) }
     private var activeTaskJob: Job? = null
+    // R2.2: the current turn's id for the on-device event log.
+    private var currentTurnId: String = ""
+
+    /** R2.2: the executor logs its steps under the current turn id
+     *  ("" when the plan resumed without a user command — the log
+     *  then uses "resume"). */
+    internal fun planCurrentTurnId(): String = currentTurnId
     // 1.8.0 Talker/Executor (DESIGN.md: expansion/talker-executor):
     // the bus is the ONLY handoff between the Talker (fast replies)
     // and the Executor (loop + plans). activeExecutorCommand is the
@@ -125,7 +135,14 @@ class JarvisAgentEngine(
     // store (DESIGN §5.1): same I1 filesDir/device-memory/ root, new
     // record kind. It is NEVER read by maybeUploadLearnedPattern
     // (CI grep enforces the boundary — see §5.7).
-    private val learnedPatternStore = LearnedPatternStore(FilePatternStorage(context))
+    // R2.6 (1.17.0-PRO): patterns + instructions live in the Jarvis
+    // Store once migrated (JarvisStorePatternStorage); the file
+    // implementation stays for pre-migration launches. The engine is
+    // built after JarvisStore.load() (MainActivity/FGS onCreate), so
+    // isMigrated() is final here.
+    private val learnedPatternStore = LearnedPatternStore(
+        if (JarvisStore.isMigrated()) JarvisStorePatternStorage() else FilePatternStorage(context)
+    )
     // Progress speak/chat throttle state (single job at a time, so
     // one set of counters suffices — DESIGN §3.3).
     private var lastSpokenProgressAtMs: Long = 0L
@@ -1554,6 +1571,14 @@ class JarvisAgentEngine(
         if (!chatResult) unannouncedResultIds.add(cmd.id)
         else if (!speakResult) speechSuppressedResultIds.add(cmd.id)
         val now = System.currentTimeMillis()
+        // R2.2: terminal outcome to the on-device event log — result
+        // code + verdict code only. The summary can carry user data
+        // (names, places), so it is NEVER the screen-meaning here.
+        JarvisEventLog.log(
+            currentTurnId.ifBlank { "resume" },
+            "TURN", status.name, evidence.take(120),
+            "Task ${status.name.lowercase()} hua"
+        )
         talkerBus.complete(
             ExecutorResult(
                 commandId = cmd.id,
@@ -1870,6 +1895,10 @@ class JarvisAgentEngine(
         isYesReply(reply) || isAffirmativeReply(reply.lowercase())
     internal fun planMemoryIndex(): MemoryIndex = memoryIndex
     internal fun planDocumentMemory(): DocumentMemoryStore = documentMemory
+
+    /** R2.4: the Trained tab caches hub pulls into the same pattern
+     *  store the engine reads (never a second instance). */
+    internal fun planLearnedPatternStore(): LearnedPatternStore = learnedPatternStore
 
     /**
      * I1 (1.7.1): save a shown document into on-device memory.
@@ -2594,6 +2623,11 @@ class JarvisAgentEngine(
     fun handleUserCommand(rawCommand: String) {
         val trimmed = rawCommand.trim()
         if (trimmed.isEmpty()) return
+        // R2.2 (1.17.0-PRO): every turn gets an id for the on-device
+        // event log. The COMMAND TEXT is never logged — only the turn
+        // start, the action kinds, the results and the verdicts.
+        currentTurnId = "turn-${System.currentTimeMillis()}-${(0..9999).random()}"
+        JarvisEventLog.log(currentTurnId, "TURN", "STARTED", "", "User command aaya")
         // 1.15.0 memory-loss fix (F2): restore before ANY chat line is
         // added or persisted — this is the single choke point for all
         // user commands, so no first-turn path can overwrite history.

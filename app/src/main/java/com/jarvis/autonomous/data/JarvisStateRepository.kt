@@ -487,6 +487,18 @@ object JarvisStateRepository {
         _docConfirm.value = state
     }
 
+    // ---- R2.4 (1.17.0-PRO) memory push ----
+    // The hub sends a MEMORY_PUSH notice (ids/counts only, never
+    // content) when shared memory changes. The Trained tab observes
+    // this version and pulls the new rows via MemoryClient. A bump
+    // is a notice, not data — no content ever flows through here.
+    private val _memoryPushVersion = MutableStateFlow(0)
+    val memoryPushVersion: StateFlow<Int> = _memoryPushVersion.asStateFlow()
+
+    fun bumpMemoryPushVersion() {
+        _memoryPushVersion.value = _memoryPushVersion.value + 1
+    }
+
     private val _recentNotifications = MutableStateFlow<List<NotificationItem>>(emptyList())
     val recentNotifications: StateFlow<List<NotificationItem>> = _recentNotifications.asStateFlow()
 

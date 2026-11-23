@@ -49,8 +49,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 52
-        versionName = "1.16.0-PRO"
+        versionCode = 53
+        versionName = "1.17.0-PRO"
 
         // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
         // download uses ONLY the token the phone's owner types in AI
@@ -153,6 +153,19 @@ dependencies {
     // the build FAILS loudly; there is deliberately NO fallback
     // to plain SharedPreferences for these tokens.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // 1.17.0 (R2 Trained Jarvis): ML Kit on-device text recognition
+    // for photo ingestion (Latin + Devanagari). BUNDLED 16.0.1 both
+    // scripts — the model ships inside the APK, so OCR works offline
+    // at first use with no Play Services model download (the
+    // unbundled Play-Services form is 19.0.2/19.0.1 and downloads on
+    // first use, which can fail offline). Cost ~4 MB per script per
+    // arch (~8 MB total on arm64-v8a); APK ~25 MB -> ~33 MB, well
+    // under the 100 MB cap. Apache-2.0 (Google ML Kit, proprietary
+    // models but free, no card). Task.await() comes from the
+    // kotlinx-coroutines-play-services dep already in the tree.
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
 
     // 1.15.0 (R0 Whop browser): androidx.webkit for
     // WebSettingsCompat.setUserAgentMetadata — desktop Client Hints
