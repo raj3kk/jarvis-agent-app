@@ -70,7 +70,6 @@ class TerminalSession(private val workingDir: File) {
 
     /** In-memory command history (session only, never persisted). */
     val history = ArrayList<String>()
-        private set
 
     var onOutput: ((String) -> Unit)? = null
 
