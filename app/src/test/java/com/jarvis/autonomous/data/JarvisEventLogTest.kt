@@ -52,22 +52,33 @@ class JarvisEventLogTest {
     fun sensitiveContentIsRedactedNotDropped() {
         JarvisEventLog.log("turn-2", "TURN", "DONE", "", "mera otp 123456 hai")
         JarvisEventLog.log("turn-2", "GMAIL_SEND", "DONE", "", "bank account number bhej diya")
+        // A token inside a URL is sensitive too — the whole line is
+        // redacted (the query-strip rule never gets a chance to leak it).
+        JarvisEventLog.log(
+            "turn-2", "HTTP_CHECK", "DONE", "ok",
+            "https://example.com/page?token=secret123 khola"
+        )
         val recent = JarvisEventLog.recent(10)
-        assertEquals(2, recent.size)
+        assertEquals(3, recent.size)
         assertTrue(recent.all { it.screenMeaning.contains("redacted") })
         // The event itself (kind + result) is still recorded.
-        assertEquals("GMAIL_SEND", recent[0].action)
+        assertEquals("HTTP_CHECK", recent[0].action)
+        assertEquals("GMAIL_SEND", recent[1].action)
     }
 
     @Test
     fun urlQueryStringsAreStripped() {
+        // Non-sensitive query params: the query is stripped, the
+        // path stays. (A token-bearing URL is a different rule — the
+        // sensitive-word redaction below redacts the whole line.)
         JarvisEventLog.log(
             "turn-3", "HTTP_CHECK", "DONE", "ok",
-            "https://example.com/page?token=secret123 khola"
+            "https://example.com/page?ref=home&page=2 khola"
         )
         val recent = JarvisEventLog.recent(10)
         assertEquals(1, recent.size)
-        assertTrue(!recent[0].screenMeaning.contains("token=secret123"))
+        assertTrue(!recent[0].screenMeaning.contains("ref=home"))
+        assertTrue(!recent[0].screenMeaning.contains("page=2"))
         assertTrue(recent[0].screenMeaning.contains("https://example.com/page"))
     }
 

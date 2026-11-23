@@ -140,15 +140,22 @@ class JarvisStoreTest {
     @Test
     fun corruptMainFileIsRescuedFromBak() {
         assertTrue(JarvisStore.load(context))
+        // Two writes: the .bak rotation keeps the PREVIOUS good copy,
+        // so after the second write the .bak holds "first" and the
+        // main file holds "second".
         JarvisStore.setSection(JarvisStore.SEC_CHAT, JSONArray().apply {
-            put(JSONObject().put("sender", "User").put("message", "keep me"))
+            put(JSONObject().put("sender", "User").put("message", "first"))
+        })
+        JarvisStore.setSection(JarvisStore.SEC_CHAT, JSONArray().apply {
+            put(JSONObject().put("sender", "User").put("message", "second"))
         })
         // Corrupt ONLY the main file; the .bak from the last save is good.
         File(context.filesDir, "jarvis-store.json").writeText("{corrupt!!!")
         JarvisStore.resetForTests()
         assertTrue(JarvisStore.load(context))
+        // Rescued from the .bak — the previous good state, not the latest.
         val back = JarvisStore.getSection(JarvisStore.SEC_CHAT) as? JSONArray
-        assertEquals("keep me", back?.getJSONObject(0)?.optString("message", ""))
+        assertEquals("first", back?.getJSONObject(0)?.optString("message", ""))
     }
 
     @Test
