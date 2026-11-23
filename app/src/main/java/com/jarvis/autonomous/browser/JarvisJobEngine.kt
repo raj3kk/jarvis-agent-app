@@ -534,7 +534,15 @@ class JarvisJobEngine(private val ctx: Context) {
                             lastFinalUrl = url
                             if (ownsWebView) {
                                 val latch = CountDownLatch(1)
-                                @Volatile var loadError: String? = null
+                                // Plain var, deliberately NOT @Volatile
+                                // (@Volatile is field-only — it does not
+                                // compile on a local). The latch supplies
+                                // the visibility: the callback writes
+                                // loadError BEFORE countDown(), and the
+                                // reader reads it AFTER await() returns —
+                                // that is a happens-before edge (JMM), so
+                                // no volatile is needed.
+                                var loadError: String? = null
                                 // Navigation wipes the page JS context — the
                                 // injected dsbridge.js is gone with it; the
                                 // next evalJs re-injects (self-healing flag).
