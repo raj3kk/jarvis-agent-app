@@ -64,6 +64,7 @@ import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import com.jarvis.autonomous.browser.JarvisBrowserFileHost
+import com.jarvis.autonomous.browser.JarvisUploadBridge
 import com.jarvis.autonomous.browser.JarvisBrowserSetup
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AutoSolveStatus
@@ -1541,8 +1542,9 @@ object JarvisBackgroundBrowser {
             }
             // No foreground host (background/headless): fall back to
             // a file the user pre-supplied via the bridge (Trained
-            // tab / JobEngine upload step); otherwise cancel and the
-            // user picks the file in the app instead.
+            // tab / JobEngine upload step arms it; the user picks the
+            // file in the app); otherwise cancel and the user picks
+            // the file in the app instead.
             val pending = JarvisUploadBridge.takePendingUri()
             if (pending != null) {
                 filePathCallback?.onReceiveValue(arrayOf(pending))

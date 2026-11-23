@@ -155,7 +155,7 @@ class JarvisAgentEngine(
         acc: JarvisAccessibilityService?,
         label: String,
         expectedText: String?,
-        run: () -> Boolean
+        run: suspend () -> Boolean
     ): ActionResult {
         if (acc == null) {
             return ActionResult(false, "$label -> Accessibility service band hai — Settings me Jarvis Accessibility ON karo")

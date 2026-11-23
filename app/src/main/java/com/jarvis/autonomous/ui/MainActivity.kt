@@ -944,16 +944,16 @@ fun CommandCenterScreen(
             TalkerCardView(
                 card = talkerCard!!,
                 onApprove = {
-                    context.startService(
-                        Intent(context, JarvisForegroundService::class.java).apply {
+                    whiteboardContext.startService(
+                        Intent(whiteboardContext, JarvisForegroundService::class.java).apply {
                             action = JarvisForegroundService.ACTION_ANSWER_BROWSER_APPROVAL
                             putExtra(JarvisForegroundService.EXTRA_APPROVAL_GRANTED, true)
                         }
                     )
                 },
                 onReject = {
-                    context.startService(
-                        Intent(context, JarvisForegroundService::class.java).apply {
+                    whiteboardContext.startService(
+                        Intent(whiteboardContext, JarvisForegroundService::class.java).apply {
                             action = JarvisForegroundService.ACTION_ANSWER_BROWSER_APPROVAL
                             putExtra(JarvisForegroundService.EXTRA_APPROVAL_GRANTED, false)
                         }
