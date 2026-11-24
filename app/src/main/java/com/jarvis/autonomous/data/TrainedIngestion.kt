@@ -120,7 +120,7 @@ class TrainedIngestion(
         val html = withContext(Dispatchers.IO) {
             runCatching {
                 val request = Request.Builder().url(cleanUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) Jarvis/1.19.0")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) Jarvis/1.20.0")
                     .build()
                 httpClient.newCall(request).execute().use { resp ->
                     if (!resp.isSuccessful) return@runCatching null

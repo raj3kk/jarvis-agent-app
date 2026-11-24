@@ -132,12 +132,13 @@ class TalkerReplyPolicyTest {
 
     @Test
     fun latencyBudgetsAreOrdered() {
-        // Acks/status are templated (fast); the local reply may take
-        // longer but is hard-bounded; the bound exceeds the target.
-        assertTrue(TalkerReplyPolicy.TALKER_ACK_TARGET_MS <= TalkerReplyPolicy.TALKER_REPLY_TARGET_MS)
-        assertTrue(TalkerReplyPolicy.TALKER_REPLY_TARGET_MS < TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS)
+        // Acks/status are templated (fast) and share one budget.
+        // 1.20.0: the local-Gemma reply budget + hard bound
+        // (TALKER_REPLY_TARGET_MS / TALKER_LOCAL_REPLY_TIMEOUT_MS)
+        // were deleted with the model — a TALK turn goes straight
+        // to the cloud loop, so no reply budget remains to order.
         assertEquals(300L, TalkerReplyPolicy.TALKER_ACK_TARGET_MS)
-        assertEquals(5_000L, TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS)
+        assertEquals(300L, TalkerReplyPolicy.TALKER_STATUS_TARGET_MS)
     }
 
     // ---- 1.9.0 (v2) — status from structured progress ----

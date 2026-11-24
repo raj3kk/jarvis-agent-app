@@ -49,8 +49,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 55
-        versionName = "1.19.0-PRO"
+        versionCode = 56
+        versionName = "1.20.0-PRO"
 
         // 1.19.0 (R4.4 AppAuth plumbing): AppAuth's
         // RedirectUriReceiverActivity needs a redirect scheme at
@@ -61,21 +61,19 @@ android {
         // can start from it today.
         manifestPlaceholders["appAuthRedirectScheme"] = "com.jarvis.autonomous.oauth"
 
-        // 2b-3 (B1 fix): NO embedded HF token any more. The gated Gemma
-        // download uses ONLY the token the phone's owner types in AI
-        // Brain (JarvisPreferences.hfToken) — the old BuildConfig
-        // .HF_TOKEN field (CI secret HF_TOKEN) was deleted here and in
-        // the workflow because the literal is extractable from DEX
-        // strings. No token + no downloaded model = an honest message.
+        // 1.20.0 (Gemma REMOVED, user order 2026-11-23): the on-device
+        // Gemma model is gone entirely — no LiteRT-LM dep, no model
+        // download, no HF token anywhere in the app or the workflow.
+        // All chat runs on the cloud LLM only (Gemini BYOK).
 
         vectorDrawables {
             useSupportLibrary = true
         }
 
         // 1.4.12: ship native libs for arm64-v8a only.
-        // Only LiteRT-LM Android ships native code now (the
-        // VAD engine AAR was removed in 1.4.23-PRO step 2c),
-        // and the user's phone is arm64, so this does not
+        // ML Kit OCR still ships native code (the VAD engine AAR was
+        // removed in 1.4.23-PRO step 2c; LiteRT-LM was removed in
+        // 1.20.0), and the user's phone is arm64, so this does not
         // break it on the target device. It drops the x86_64
         // slice (emulator-only) and saves a few MB. CI GATE: if
         // the build fails with a missing-native-lib error, revert
@@ -122,12 +120,8 @@ android {
         }
     }
 
-    // Token policy change (user order 2026-11-02 21:28 IST): the
-    // owner's read-only Gemma-download HF token IS embedded via
-    // BuildConfig (see defaultConfig above) so the end user does
-    // NOT have to enter any HF token. It can be extracted from the
-    // APK by a determined user and is revocable/rotatable from HF
-    // settings — never claim otherwise.
+    // 1.20.0: the Gemma/HF token note that lived here is deleted
+    // with the on-device model — see defaultConfig above.
     buildFeatures {
         buildConfig = true
         compose = true
@@ -229,11 +223,12 @@ dependencies {
     // may still defer the worker — see BUILD_NOTES phone preconditions.
     implementation("androidx.work:work-runtime-ktx:2.9.0")
 
-    // Free on-device LLM (LiteRT-LM 0.18.0, Google Maven). No account/card.
+    // 1.20.0: the on-device LLM dep (LiteRT-LM 0.18.0) was REMOVED
+    // here with the Gemma model (user order 2026-11-23) — no
+    // on-device engine remains. All chat is cloud-only (Gemini BYOK).
     // Localhost preview uses plain java.net ServerSocket (no dependency):
     // org.nanohttpd:nanohttpd:2.3.2 does not exist on Maven Central and
     // broke CI dependency resolution on 2026-11-02, so it is NOT used.
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
 
     // 1.19.0 (R4.4 AppAuth plumbing): AppAuth-Android, the reference
     // OAuth 2.0 / OIDC client for native apps (RFC 8252). Pinned

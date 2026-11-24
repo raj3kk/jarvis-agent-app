@@ -159,9 +159,9 @@ is the recommended route for the reason stated.
 Earlier wording ("Jarvis sees the drawing/image") was imprecise and is
 **corrected here and in code comments**:
 
-- **On-device Gemma cannot see images. There is no vision model in the
-  app.** A user drawing or upload becomes Jarvis-understood on-device
-  only via the **user's spoken description** — typed into the
+- **Jarvis has no on-device vision model (Gemma was removed in
+  1.20.0).** A user drawing or upload becomes Jarvis-understood
+  on-device only via the **user's spoken description** — typed into the
   "Describe this board for Jarvis" field (or spoken and then typed by
   the user) and stored as `WhiteboardStore.state.userCaption`, which
   `describeForEngine()` includes as text context for the reply.

@@ -230,9 +230,11 @@ jobs:
         run: ./gradlew testDebugUnitTest --stacktrace
 
       - name: Build Debug & Release APK
-        # 2b-3 (B1 fix): no HF_TOKEN env any more — the gated Gemma
-        # download uses only the user-entered token (AI Brain). The
-        # old BuildConfig.HF_TOKEN secret is deleted from code + here.
+        # 1.20.0 (Gemma REMOVED, user order 2026-11-23): no HF_TOKEN
+        # env ever existed here after 2b-3, and there is no token at
+        # all any more — the model download + token field are deleted
+        # from the app. The GitHub secret HF_TOKEN itself is NOT
+        # deleted by this change (Settings action, out of scope).
         run: ./gradlew assembleDebug assembleRelease --stacktrace
 
       - name: Verify APKs (exist + badging + signature)
@@ -270,9 +272,14 @@ jobs:
           # 1.4.12 NEGATIVE gate: the release APK must NOT
           # carry any bundled voice-model assets (Swara is
           # cloud-only — no assets/kokoro/ any more).
+          # 1.20.0 NEGATIVE gate: the release APK must NOT carry
+          # any LiteRT library (Gemma removed — no liblitertlm
+          # .so, no litertlm classes in the DEX).
           for APK in app/build/outputs/apk/release/*.apk; do
             echo "Checking no bundled voice assets in $APK"
             if unzip -l "$APK" | grep -qE "assets/kokoro/"; then echo "FAIL: bundled voice assets present in $APK"; exit 1; fi
+            echo "Checking no LiteRT lib in $APK"
+            if unzip -l "$APK" | grep -qiE "litertlm"; then echo "FAIL: LiteRT present in $APK"; exit 1; fi
           done
 
       - name: Rename release APK to Jarvis2026.apk

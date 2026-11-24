@@ -16,7 +16,6 @@ import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.data.JarvisStore
 import com.jarvis.autonomous.data.JarvisStorePatternStorage
 import com.jarvis.autonomous.data.LicenceKeyStore
-import com.jarvis.autonomous.data.DocContextPrompt
 import com.jarvis.autonomous.data.DocumentMemoryStore
 import com.jarvis.autonomous.data.DocumentSearch
 import com.jarvis.autonomous.data.DocumentText
@@ -91,7 +90,7 @@ class JarvisAgentEngine(
     private val onStopSpeaking: (() -> Unit)? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private val llmClient = LlmClient(context, prefs)
+    private val llmClient = LlmClient(prefs)
     private val learnedRoutineStore = LearnedRoutineStore(context)
     private val memoryIndex = MemoryIndex(context)
     // I1 (1.7.1): on-device document memory — file-backed, offline,
@@ -1952,44 +1951,11 @@ class JarvisAgentEngine(
         }
     }
 
-    /**
-     * Talker fast reply for a pure-chat turn: on-device Gemma first,
-     * bounded by [TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS].
-     * Returns true when a reply was posted + spoken. False when the
-     * model is not downloaded, the attempt timed out / errored, or the
-     * reply came back blank — the caller falls through to today's
-     * cloud loop (or the busy line while an Executor runs).
-     * M-I-2 (1.14.0): [docContext] is the I1 recall output
-     * ([DocumentText.buildDocContext] — max 3 docs, snippets ≤400
-     * chars, labelled). It joins the system prompt as context only,
-     * via [DocContextPrompt.talkerSystemPrompt]; blank means no
-     * recall and the prompt is the persona prompt untouched.
-     */
-    private suspend fun tryTalkerLocalReply(text: String, docContext: String = ""): Boolean {
-        if (!LocalLlmManager.isDownloaded(context)) return false
-        val recent = JarvisStateRepository.chatHistory.value.takeLast(6).mapNotNull { entry ->
-            val sender = entry.sender
-            val message = entry.message
-            if (message.isBlank()) null
-            else if (sender == "You") "You" to message else "Jarvis" to message
-        }
-        val reply = withTimeoutOrNull(TalkerReplyPolicy.TALKER_LOCAL_REPLY_TIMEOUT_MS) {
-            runCatching {
-                LocalLlmManager.chat(
-                    context = context,
-                    systemPrompt = DocContextPrompt.talkerSystemPrompt(prefs.personaPrompt, docContext),
-                    userText = text,
-                    recentChat = recent
-                )
-            }.getOrNull()
-        }?.trim().orEmpty()
-        if (reply.isBlank()) return false
-        JarvisStateRepository.addChatMessage("You", text)
-        JarvisStateRepository.addChatMessage("Jarvis", reply)
-        persistChat()
-        speak(reply, alreadyPostedToChat = true)
-        return true
-    }
+    // 1.20.0: the Talker's on-device fast reply (tryTalkerLocalReply,
+    // Gemma via LocalLlmManager) is deleted with the model — a TALK
+    // turn now goes straight to the cloud loop below (or the busy
+    // line while an Executor runs). M-I-2 doc context still rides
+    // the cloud loop via launchLoopTurn, unchanged.
 
     // ---- 1.4.21 Agent Mode (planner trigger, resume, executor access) ----
 
@@ -3214,25 +3180,20 @@ class JarvisAgentEngine(
             }
             TalkerDispatcher.TalkerDecision.TALK -> {
                 scope.launch {
-                    // M-I-2 (1.14.0): the Talker's on-device local
-                    // reply now sees recalled doc context too (the
-                    // cloud-loop fallback already had it via
-                    // launchLoopTurn). Blank = no recall, prompt
-                    // unchanged.
-                    val answered = tryTalkerLocalReply(effectiveGoal, docContext)
-                    if (!answered) {
-                        val running = talkerBus.pendingCommands().firstOrNull()
-                        if (running != null) {
-                            // Executor busy: NEVER launch the cloud
-                            // loop here — it would cancel the work.
-                            // The Talker says so plainly instead.
-                            val busy = TalkerReplyPolicy.busyLine(running.goal)
-                            JarvisStateRepository.addChatMessage("Jarvis", busy)
-                            persistChat()
-                            speak(busy, alreadyPostedToChat = true)
-                        } else {
-                            launchLoopTurn(effectiveGoal, docContext, recallHits.size)
-                        }
+                    // 1.20.0: no on-device fast reply any more — a
+                    // TALK turn goes straight to the cloud loop (the
+                    // M-I-2 doc context rides it via launchLoopTurn).
+                    // Executor busy: NEVER launch the cloud loop
+                    // here — it would cancel the work. The Talker
+                    // says so plainly instead.
+                    val running = talkerBus.pendingCommands().firstOrNull()
+                    if (running != null) {
+                        val busy = TalkerReplyPolicy.busyLine(running.goal)
+                        JarvisStateRepository.addChatMessage("Jarvis", busy)
+                        persistChat()
+                        speak(busy, alreadyPostedToChat = true)
+                    } else {
+                        launchLoopTurn(effectiveGoal, docContext, recallHits.size)
                     }
                 }
                 return
@@ -3951,11 +3912,12 @@ class JarvisAgentEngine(
         loopLastActionKind = ""
         loopVerifiedSteps = 0
         // Offline gate (1.4.0): cloud planning needs network.
-        // Local (on-device) chat still works offline; no-AI local
-        // routines already returned before this loop. Speak a
-        // clear warning and do local work only — never fake a
-        // cloud answer while offline.
-        if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
+        // 1.20.0: no on-device chat remains (Gemma removed), so
+        // offline blocks the loop outright; no-AI local routines
+        // already returned before this loop. Speak a clear warning
+        // and do local work only — never fake a cloud answer while
+        // offline.
+        if (!isOnline()) {
             postYouLineOnce(currentGoal)
             speak("Internet nahi hai — online kaam (AI planning, browsing, cloud actions) abhi nahi ho payega. Sirf phone ke andar wale kaam kar sakta hoon, jaise torch, volume, ya pehle se downloaded cheezein.")
             // 1.8.0: BLOCKED, chat-only — the warning above was spoken.
@@ -4026,7 +3988,8 @@ class JarvisAgentEngine(
                 // A-M7: per-step connectivity re-check — offline
                 // mid-task = pause (warn, do not complete, do not
                 // persist a routine), not a faked continuation.
-                if (!isOnline() && prefs.provider != AiProvider.LOCAL) {
+                // (1.20.0: no LOCAL-provider carve-out any more.)
+                if (!isOnline()) {
                     speak("Internet chala gaya hai — kaam yahin rok raha hoon, complete nahi bol raha. Net aane par dobara bolo.")
                     // 1.8.0: BLOCKED, chat-only — the warning above was spoken.
                     reportExecutorOutcome(

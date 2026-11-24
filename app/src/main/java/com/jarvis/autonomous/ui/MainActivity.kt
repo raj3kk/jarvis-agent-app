@@ -119,7 +119,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.jarvis.autonomous.BuildConfig
 import com.jarvis.autonomous.R
 import com.jarvis.autonomous.agent.LlmClient
-import com.jarvis.autonomous.agent.LocalLlmManager
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
@@ -2097,7 +2096,6 @@ fun AiBrainSettingsScreen(
     var apiKey by remember { mutableStateOf(prefs.apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
     var modelName by remember { mutableStateOf(prefs.modelName) }
-    var hfToken by remember { mutableStateOf(prefs.hfToken) }
     var languageMode by remember { mutableStateOf(prefs.languageMode) }
     var personaPrompt by remember { mutableStateOf(prefs.personaPrompt) }
 
@@ -2243,107 +2241,12 @@ fun AiBrainSettingsScreen(
             }
         }
 
-        // FREE on-device model (no key, no card, no server)
-        run {
-            val localContext = LocalContext.current
-            val localScope = rememberCoroutineScope()
-            var localDownloaded by remember {
-                mutableStateOf(LocalLlmManager.isDownloaded(localContext))
-            }
-            var localProgress by remember { mutableStateOf("") }
-            var localDownloading by remember { mutableStateOf(false) }
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1DC))
-            ) {
-                Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "Free Local Model — Gemma 3 270M (Offline Chat, HF Token Needed)",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
-                    )
-                    Text(
-                        text = "Ye model phone ke andar hi chalta hai (LiteRT-LM, Gemma 3 270M Q8, ~304 MB, ek baar download). " +
-                            "Casual baat-cheet isse tez aur bina internet ke hogi. " +
-                            "Ye gated model hai — download ke liye owner ka token app me hi hota hai, tumhe koi token daalne ki zaroorat nahi hai. Agar tum apna token daalna chaho to neeche wala field optional hai (tumhara token owner wale se pehle use hoga). Phone ke kaam (WhatsApp/YouTube/action JSON) AI cloud Lite model (Gemini/Groq) se karega, kyunki 270M model multi-part JSON reliably nahi de sakta.",
-                        fontSize = 12.sp
-                    )
-                    Text(
-                        text = if (!LocalLlmManager.isDeviceSupported()) {
-                            "Is phone ka processor local model ko support nahi karta (sirf arm64/x86_64)."
-                        } else if (localDownloaded) {
-                            "Status: Downloaded ✅ (${LocalLlmManager.downloadedBytes(localContext) / 1_000_000L} MB) — provider me Local chuno aur baat karo."
-                        } else {
-                            "Status: Not downloaded — Wi-Fi par download karo, ek baar me ~304 MB lagega."
-                        },
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    // 1.5.4-PRO: honest storage-footprint disclosure
-                    // (Pehle-Jaanch §3.6). APK size runtime PackageManager
-                    // se (hardcode nahi); model size downloaded bytes se
-                    // (na ho to ~304 MB estimate); total = APK + model.
-                    // Model pehli baar download hota hai, APK me nahi hai.
-                    Text(
-                        text = run {
-                            val apkBytes = try {
-                                val pkgInfo = localContext.packageManager.getPackageInfo(localContext.packageName, 0)
-                                java.io.File(pkgInfo.applicationInfo?.sourceDir ?: "").length()
-                            } catch (e: Exception) { 0L }
-                            val modelBytes = LocalLlmManager.downloadedBytes(localContext)
-                            val apkLabel = if (apkBytes > 0) "${apkBytes / 1_000_000L} MB" else "?"
-                            val modelLabel = if (modelBytes > 0) "${modelBytes / 1_000_000L} MB" else "~304 MB (download hone par)"
-                            val totalLabel = if (apkBytes > 0 && modelBytes > 0) "${(apkBytes + modelBytes) / 1_000_000L} MB" else "APK + model ≈ 600 MB+"
-                            "Storage footprint — APK: $apkLabel · Model: $modelLabel · Total: $totalLabel. Model pehli baar download hota hai, APK me nahi hai."
-                        },
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    if (localProgress.isNotBlank()) {
-                        Text(localProgress, fontSize = 12.sp)
-                    }
-                    OutlinedTextField(
-                        value = hfToken,
-                        onValueChange = { hfToken = it },
-                        label = { Text("Hugging Face Token (apna free token — Gemma download ke liye zaroori)", fontSize = 12.sp) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-                    Button(
-                        enabled = LocalLlmManager.isDeviceSupported() && !localDownloading,
-                        onClick = {
-                            if (localDownloaded) {
-                                selectedProvider = AiProvider.LOCAL
-                                modelName = AiProvider.LOCAL.defaultModel
-                            } else {
-                                localDownloading = true
-                                localProgress = "Downloading… 0 / ~304 MB"
-                                localScope.launch {
-                                    val result = LocalLlmManager.download(localContext, hfToken) { mb, total ->
-                                        localScope.launch { localProgress = "Downloading… $mb / $total MB" }
-                                    }
-                                    localDownloading = false
-                                    if (result.isSuccess) {
-                                        localDownloaded = true
-                                        localProgress = "Download complete ✅ — ab provider me Local chuno."
-                                        selectedProvider = AiProvider.LOCAL
-                                        modelName = AiProvider.LOCAL.defaultModel
-                                    } else {
-                                        localProgress = "Download fail: ${result.exceptionOrNull()?.message}"
-                                    }
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (localDownloaded) "Use Local Model" else "Download Free Local Model (~304 MB)")
-                    }
-                }
-            }
-        }
+        // 1.20.0: the Free Local Model card (Gemma 3 270M download
+        // + HF token field + Use Local Model button) is deleted with
+        // the on-device model (user order 2026-11-23). All chat is
+        // cloud-only now (Gemini BYOK) — no download, no token, no
+        // offline chat. A model downloaded by an older build stays
+        // as a dead file in filesDir/models/ (never read again).
 
         // Swara cloud voice (1.4.12, primary): Microsoft Edge
         // Read-Aloud hi-IN-SwaraNeural — free, no key, internet
@@ -2682,7 +2585,6 @@ fun AiBrainSettingsScreen(
         Button(
             onClick = {
                 prefs.provider = selectedProvider
-                prefs.hfToken = hfToken
                 prefs.apiKey = apiKey
                 prefs.modelName = modelName
                 prefs.languageMode = languageMode
@@ -2740,14 +2642,14 @@ fun AiBrainSettingsScreen(
         }
 
         // 1.4.2: "Gemini lagane ke baad bhi kaam nahi karta" had
-        // three indistinguishable causes — Save never pressed
-        // (fields are remember state until Save), provider still
-        // LOCAL Gemma, or a restricted/disabled key (400/403).
+        // two indistinguishable causes — Save never pressed
+        // (fields are remember state until Save), or a
+        // restricted/disabled key (400/403). (1.20.0: the old
+        // "provider still LOCAL Gemma" cause is gone with Gemma.)
         // This card names the SAVED state (not the edited fields)
         // and tests the saved key with one cheap call, showing the
         // HTTP result VERBATIM. The key itself is never shown.
         run {
-            val testContext = LocalContext.current
             val testScope = rememberCoroutineScope()
             var testResult by remember { mutableStateOf("") }
             var testBusy by remember { mutableStateOf(false) }
@@ -2782,7 +2684,7 @@ fun AiBrainSettingsScreen(
                             testBusy = true
                             testResult = "Testing…"
                             testScope.launch(Dispatchers.IO) {
-                                val result = LlmClient(testContext, prefs).testApiKey()
+                                val result = LlmClient(prefs).testApiKey()
                                 testResult = result
                                 testBusy = false
                             }
