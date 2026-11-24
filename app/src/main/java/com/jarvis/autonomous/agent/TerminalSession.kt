@@ -34,7 +34,7 @@ class TerminalSession(private val workingDir: File) {
     /** Pure denylist check (JVM unit test seam — no process). */
     companion object {
         private val BLOCKED = listOf(
-            Regex("""(?i)\brm\s+.*-rf\s+/(\s|$)"""),          // rm -rf /
+            Regex("""(?i)\brm\s+.*-rf\s+/"""),                 // rm -rf on any absolute path
             Regex("""(?i)\brm\s+.*--no-preserve-root\b"""),
             Regex("""(?i)(^|[;&|]\s*)su\b"""),                // su
             Regex("""(?i)(^|[;&|]\s*)sudo\b"""),
@@ -42,7 +42,7 @@ class TerminalSession(private val workingDir: File) {
             Regex("""(?i)\bshutdown\b"""),
             Regex("""(?i)\bmkfs\b"""),
             Regex("""(?i)\bdd\s+.*of=/dev/"""),               // raw disk write
-            Regex("""(?i)\bchmod\s+.*\s+/(\s|$)"""),          // chmod on /
+            Regex("""(?i)\bchmod\s+.*\s+/"""),               // chmod on any absolute path
             Regex("""(?i)\bcd\s+/"""),                        // cd to an absolute path
             Regex("""(?i)\bcd\s+\.\.""")                      // cd out of app storage
         )
