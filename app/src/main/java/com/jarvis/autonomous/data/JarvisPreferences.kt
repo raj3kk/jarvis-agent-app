@@ -147,6 +147,17 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getLong("pairing_paired_at_ms", 0L)
         set(value) = prefs.edit().putLong("pairing_paired_at_ms", value).apply()
 
+    // 1.21.0-PRO: the tenant the hub resolved at pairing (needed by
+    // the Skills install route, which requires tenant_id in the body
+    // — the catalog GET resolves it server-side from the device, so
+    // only install needs it). Not a secret (it is the tenant id, not
+    // a key) — plain prefs like pairingDeviceId. Set by LicenceScreen
+    // on auto-pairing Ok, and by SkillsClient when recovered via one
+    // idempotent /api/pairing/auto call on an already-paired device.
+    var pairingTenantId: String
+        get() = prefs.getString("pairing_tenant_id", "") ?: ""
+        set(value) = prefs.edit().putString("pairing_tenant_id", value).apply()
+
     // 1.12.0 FCM: last FCM token registered with the hub (plain prefs —
     // the token is useless without the hub's server key, and Firebase
     // keeps its own copy in prefs anyway). Used only to skip

@@ -447,6 +447,13 @@ fun LicenceScreen() {
                                             jp.pairingPaired = true
                                             jp.pairingDeviceId = id
                                             jp.pairingPairedAtMs = System.currentTimeMillis()
+                                            // 1.21.0-PRO: remember the
+                                            // tenant the hub resolved —
+                                            // the Skills install route
+                                            // needs it in the body.
+                                            if (auto.tenantId.isNotBlank()) {
+                                                jp.pairingTenantId = auto.tenantId
+                                            }
                                             status = "Activated ✅ — licence is bound to this device. " +
                                                 "Paired bhi ho gaya ✅ — ab code type karne ki zaroorat nahi."
                                         }

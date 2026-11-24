@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Mic
@@ -584,7 +585,10 @@ fun JarvisMainApp(
                     Triple(8, Icons.Default.Terminal, "Terminal"),
                     // R2.1 (1.17.0-PRO): Trained Jarvis — document /
                     // PDF / photo / link / voice ingestion + memory.
-                    Triple(9, Icons.Default.School, "Trained")
+                    Triple(9, Icons.Default.School, "Trained"),
+                    // 1.21.0-PRO: Skills — browse + install the hub's
+                    // skills library (catalog + install routes).
+                    Triple(10, Icons.Default.Extension, "Skills")
                 )
                 val tabListState = rememberLazyListState()
                 LaunchedEffect(selectedTab) {
@@ -691,6 +695,8 @@ fun JarvisMainApp(
                 8 -> TerminalScreen()
 
                 9 -> TrainedJarvisScreen()
+
+                10 -> SkillsScreen()
             }
         }
         }
