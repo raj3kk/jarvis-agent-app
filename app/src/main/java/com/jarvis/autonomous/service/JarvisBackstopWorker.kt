@@ -1,17 +1,11 @@
 package com.jarvis.autonomous.service
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.os.Build
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.ForegroundInfo
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
@@ -46,8 +40,18 @@ import java.util.concurrent.TimeUnit
  *   Without the exemption the OS denies the start; the worker records
  *   a BACKSTOP_DENIED diagnostic and the next tick retries. The phone
  *   test precondition is: battery exemption allowed once.
- * - setForeground() is best-effort: if it throws, the worker still
- *   attempts the start and degrades to the diagnostic path.
+ * - 1.23.0: NO setForeground() here, ever. The worker is a PLAIN
+ *   periodic worker (NOT expedited), so foreground priority is not
+ *   required — and on WorkManager 2.9.0 it CRASHES the app on launch:
+ *   setForeground() starts WorkManager's SystemForegroundService,
+ *   which declares NO foregroundServiceType in the manifest, while
+ *   the ForegroundInfo carried SPECIAL_USE (0x40000000) — the system
+ *   rejects it (IllegalArgumentException, "not a subset", main
+ *   thread) and runCatching around the setForegroundAsync call
+ *   cannot catch it because the promotion happens asynchronously
+ *   inside the service. Removing the call fixes the launch-bounce
+ *   crash loop (1.21.0/1.22.0); the backstop check + FGS restart
+ *   below are unchanged.
  */
 class JarvisBackstopWorker(
     ctx: Context,
@@ -58,13 +62,13 @@ class JarvisBackstopWorker(
 
     companion object {
         const val UNIQUE_NAME = "jarvis-backstop"
-        const val NOTIF_ID = 1002
     }
 
     override suspend fun doWork(): Result {
         return try {
-            runCatching { setForeground(createForegroundInfo()) }
-                .onFailure { Log.w(TAG, "backstop setForeground failed: ${it.message}") }
+            // 1.23.0: NO setForeground() — see the class docstring.
+            // This is a plain periodic worker; it runs in the
+            // background without foreground priority.
             val pending = hasPendingPlan()
             if (!pending) return Result.success()
             Log.i(TAG, "pending plan found — re-starting foreground service")
@@ -102,34 +106,6 @@ class JarvisBackstopWorker(
         return plan.steps.any {
             it.state == PlanState.PENDING || it.state == PlanState.RUNNING ||
                 it.state == PlanState.BLOCKED || it.state == PlanState.AWAITING_USER
-        }
-    }
-
-    private fun createForegroundInfo(): ForegroundInfo {
-        val ctx = applicationContext
-        val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            mgr.createNotificationChannel(
-                NotificationChannel(
-                    JarvisForegroundService.CHANNEL_ID,
-                    "Jarvis background",
-                    NotificationManager.IMPORTANCE_LOW
-                )
-            )
-        }
-        val notif = NotificationCompat.Builder(ctx, JarvisForegroundService.CHANNEL_ID)
-            .setContentTitle("Jarvis background check")
-            .setContentText("Adhoora kaam check ho raha hai")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .build()
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ForegroundInfo(
-                NOTIF_ID, notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            ForegroundInfo(NOTIF_ID, notif)
         }
     }
 }
