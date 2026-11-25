@@ -113,7 +113,9 @@ class JarvisCallCompanionService : InCallService() {
             onMain {
                 runCatching {
                     call.answer(0)
-                    call.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+                    // setAudioRoute is an InCallService method, not a Call method
+                    // (Call has answer/disconnect/playDtmfTone only).
+                    setAudioRoute(CallAudioState.ROUTE_SPEAKER)
                 }
             }
             JarvisStateRepository.updateCallState {
@@ -131,8 +133,9 @@ class JarvisCallCompanionService : InCallService() {
 
         /** Mute / unmute the microphone on the current call. */
         fun setMutedCurrent(muted: Boolean): Boolean {
-            val call = currentCall ?: return false
-            onMain { runCatching { call.setMuted(muted) } }
+            currentCall ?: return false
+            // setMuted is an InCallService method, not a Call method.
+            onMain { runCatching { setMuted(muted) } }
             JarvisStateRepository.updateCallState { it.copy(muted = muted) }
             return true
         }
@@ -142,7 +145,8 @@ class JarvisCallCompanionService : InCallService() {
             val call = currentCall ?: return false
             onMain {
                 runCatching {
-                    call.setAudioRoute(
+                    // setAudioRoute is an InCallService method, not a Call method.
+                    setAudioRoute(
                         if (speaker) CallAudioState.ROUTE_SPEAKER
                         else CallAudioState.ROUTE_EARPIECE
                     )
