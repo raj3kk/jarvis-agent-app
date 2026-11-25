@@ -49,8 +49,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 60
-        versionName = "1.23.0-PRO"
+        versionCode = 61
+        versionName = "1.24.0-PRO"
 
         // 1.19.0 (R4.4 AppAuth plumbing): AppAuth's
         // RedirectUriReceiverActivity needs a redirect scheme at

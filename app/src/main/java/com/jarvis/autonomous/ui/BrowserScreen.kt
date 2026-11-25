@@ -1028,6 +1028,10 @@ object JarvisBackgroundBrowser {
             // browsing only. NO addJavascriptInterface is ever added,
             // so page JS cannot call into the app.
             settings.domStorageEnabled = true
+            // 1.24.0 (WhopClip parity): WhopClip sets
+            // mediaPlaybackRequiresUserGesture = false in
+            // setupBrowserTab, so pages behave like a real browser.
+            settings.mediaPlaybackRequiresUserGesture = false
             // Full-website rendering (preview quality bar, §14):
             // images, viewport handling, zoom, and default caching, so
             // a page renders exactly like a real website. Multi-page
@@ -1709,6 +1713,27 @@ fun JarvisWebView(
                 // 1.22.0: the factory may host a fallback View (see
                 // above) — only drive it when it really is a WebView.
                 val webView = view as? WebView ?: return@AndroidView
+                // 1.24.0 (WhopClip parity): RETRY the initial Google
+                // load while the tab is still fresh. WhopClip loads
+                // its home page UNCONDITIONALLY at the end of
+                // setupBrowserTab, so its load cannot silently never
+                // happen. Here the factory fires the load only once
+                // (targetUrl blank && shared.url blank), and the
+                // key(tabKey) re-key on first load ("" -> "tab-...")
+                // detaches the WebView mid-load — either way the load
+                // can be lost and never retried, leaving a blank tab.
+                // Retry while no target has finished (targetUrl blank)
+                // and nothing is loading (progress 0): once the page
+                // starts (progress > 0) or finishes (onUrlChanged
+                // sets the target), this stops firing, so a loading
+                // or loaded page is never re-issued. Only the initial
+                // Google load is retried — never a user-navigated page.
+                if (targetUrl.isBlank() &&
+                    (webView.url.isNullOrBlank() || webView.url == GOOGLE_HOME_URL) &&
+                    webView.progress == 0
+                ) {
+                    webView.loadUrl(GOOGLE_HOME_URL)
+                }
                 holder[0] = webView
                 onWebViewReady(webView)
                 // B-M3: load only when the target really differs, ignoring
