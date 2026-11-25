@@ -219,7 +219,10 @@ class FilePowerTest {
 
     @Test
     fun parentPathAndHumanSize() {
-        assertEquals("/sdcard", FilePower.parentPath("/sdcard/Android/data"))
+        // The true parent: "/sdcard/Android/data" goes up ONE level
+        // to "/sdcard/Android" (the Files tab "up" button uses this —
+        // skipping a level would be a navigation bug).
+        assertEquals("/sdcard/Android", FilePower.parentPath("/sdcard/Android/data"))
         assertEquals("/sdcard", FilePower.parentPath("/sdcard/file.txt"))
         assertEquals("/", FilePower.parentPath("/sdcard"))
         assertEquals("/", FilePower.parentPath("/"))

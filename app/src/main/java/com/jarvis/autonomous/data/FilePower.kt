@@ -147,10 +147,17 @@ object FilePower {
     fun apkBackupCommand(apkPath: String, destPath: String): String =
         "cp ${quotePath(apkPath)} ${quotePath(destPath)} && ls -l ${quotePath(destPath)}"
 
-    /** Keep only safe search characters (no shell metacharacters). */
+    /**
+     * Sanitise a search query. Truncates at the first shell
+     * metacharacter — anything after it (e.g. "; rm -rf /") is
+     * dropped ENTIRELY, so no command word can survive the
+     * sanitizer. Filtering alone was not enough: it kept the
+     * words ("rm", "rf") while only stripping the punctuation.
+     * The kept prefix is letters/digits and "._- " only.
+     */
     fun sanitizeSearchQuery(query: String): String {
-        val cleaned = query.filter { it.isLetterOrDigit() || it in "._- " }.trim()
-        return cleaned.split(Regex("\\s+")).joinToString(" ").take(64)
+        val prefix = query.takeWhile { it.isLetterOrDigit() || it in "._- " }
+        return prefix.trim().split(Regex("\\s+")).joinToString(" ").take(64)
     }
 
     fun findCommand(dir: String, query: String): String {
@@ -235,7 +242,10 @@ object FilePower {
     fun parsePmList(out: String): List<String> =
         out.lines()
             .map { it.trim().removePrefix("package:").trim() }
-            .filter { it.isNotBlank() && it.contains(".") }
+            // No dot requirement: real packages such as "android"
+            // (the system package) have no dot — filtering on "."
+            // silently dropped them from the APK-backup list.
+            .filter { it.isNotBlank() }
             .distinct()
             .sorted()
 
