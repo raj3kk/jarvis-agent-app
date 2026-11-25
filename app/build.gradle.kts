@@ -49,8 +49,8 @@ android {
         applicationId = "com.jarvis.autonomous"
         minSdk = 26
         targetSdk = 34
-        versionCode = 61
-        versionName = "1.24.0-PRO"
+        versionCode = 62
+        versionName = "1.25.0-PRO"
 
         // 1.19.0 (R4.4 AppAuth plumbing): AppAuth's
         // RedirectUriReceiverActivity needs a redirect scheme at
@@ -125,6 +125,12 @@ android {
     buildFeatures {
         buildConfig = true
         compose = true
+        // 1.25.0 (Shizuku): AIDL is REQUIRED for the Shizuku
+        // UserService interface (IShizukuShellService.aidl). AGP 8.0+
+        // ships with android.defaults.buildfeatures.aidl=false, so
+        // without this line the aidl source set is silently ignored
+        // and the generated IShizukuShellService.Stub does not exist.
+        aidl = true
     }
 
     packaging {
@@ -222,6 +228,23 @@ dependencies {
     // the battery exemption once (already prompted, A-M8) or the OS
     // may still defer the worker — see BUILD_NOTES phone preconditions.
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // 1.25.0 (Shizuku): lets Jarvis bind to the Shizuku app (already
+    // installed on the user's phone) and run shell commands as the
+    // ADB shell identity (UID 2000) — used to enable Jarvis's own
+    // Accessibility service + Doze whitelist + standby bucket +
+    // appops + pm grants with ONE tap, instead of the user tapping
+    // through Settings. Shizuku is NOT bundled inside Jarvis: it is
+    // a separate app with its own privileged server process, and it
+    // cannot be embedded in another APK. Pinned 13.1.5 — the newest
+    // artifact on Maven Central (verified 2026-11-25; server
+    // v13.6.0). minSdk is 26, so the 13.1.0 desugaring requirement
+    // (minSdk 23 only) does NOT apply. The provider AAR merges
+    // moe.shizuku.manager.permission.API_V23 into the manifest
+    // automatically — no manual <uses-permission> is needed.
+    // See ShizukuManager.kt + SHIZUKU_SPEC.md (work/1.25.0/).
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     // 1.20.0: the on-device LLM dep (LiteRT-LM 0.18.0) was REMOVED
     // here with the Gemma model (user order 2026-11-23) — no

@@ -60,6 +60,27 @@
              entries lived here; deleted with Gemma (no native
              engine remains that needs them). -->
 
+        <!-- 1.25.0 (Shizuku): the provider is how the Shizuku server
+             pushes its Binder into this app when the process starts.
+             REQUIRED attributes (enforced at runtime by
+             ShizukuProvider.attachInfo): multiprocess=false,
+             exported=true, permission=INTERACT_ACROSS_USERS_FULL (a
+             permission only shell/root hold, so only the Shizuku
+             server can call this provider — the app itself does NOT
+             hold it and does NOT need to). NO <service> entry for
+             the UserService (ShizukuShellService): the server loads
+             that class directly from this APK via classLoader, never
+             through the manifest. NO extra <uses-permission>: the
+             provider AAR merges moe.shizuku.manager.permission.API_V23
+             automatically. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
         <!-- Main Command Center UI -->
         <activity
             android:name=".ui.MainActivity"

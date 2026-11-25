@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import com.jarvis.autonomous.data.JarvisPreferences
+import com.jarvis.autonomous.shizuku.ShizukuManager
 
 class BootCompletedReceiver : BroadcastReceiver() {
     /**
@@ -38,6 +39,14 @@ class BootCompletedReceiver : BroadcastReceiver() {
             // no-op unless a plan is unfinished, so this does not
             // start anything the user did not ask for.
             JarvisBackstop.enqueue(context)
+            // 1.25.0 (Shizuku): silent re-apply of the shell-level
+            // protections (accessibility + Doze whitelist + standby
+            // bucket + appops). ONLY when the Shizuku server is
+            // running AND Jarvis is authorized; otherwise do nothing
+            // (the settings persist across reboots anyway). No UI, no
+            // notification, never blocks boot — goAsync() is finished
+            // by the manager within 25 s at most.
+            ShizukuManager.reapplyOnBootAsync(context, goAsync())
         }
     }
 }
