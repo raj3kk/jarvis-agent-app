@@ -3,6 +3,7 @@ package com.jarvis.autonomous.data
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -631,5 +632,25 @@ object JarvisStateRepository {
 
     fun addNotification(item: NotificationItem) {
         _recentNotifications.value = (_recentNotifications.value + item).takeLast(25)
+    }
+
+    // ---- 1.26.0: call state + M0 probe results --------------------
+
+    private val _callState = MutableStateFlow(CallPower.JarvisCallState())
+    val callState: StateFlow<CallPower.JarvisCallState> = _callState.asStateFlow()
+
+    fun setCallState(state: CallPower.JarvisCallState) {
+        _callState.value = state
+    }
+
+    fun updateCallState(transform: (CallPower.JarvisCallState) -> CallPower.JarvisCallState) {
+        _callState.update(transform)
+    }
+
+    private val _probeResults = MutableStateFlow<List<CallPower.ProbeResult>>(emptyList())
+    val probeResults: StateFlow<List<CallPower.ProbeResult>> = _probeResults.asStateFlow()
+
+    fun setProbeResults(results: List<CallPower.ProbeResult>) {
+        _probeResults.value = results
     }
 }

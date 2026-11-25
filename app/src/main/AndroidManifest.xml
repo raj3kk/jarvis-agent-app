@@ -39,6 +39,16 @@
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.FLASHLIGHT" />
 
+    <!-- 1.26.0 (power features): CALL_COMPANION_APP is the manifest
+         permission that lets Telecom bind this app as a call
+         companion (InCallService) WITHOUT being the default phone
+         app. It is a signature|privileged permission — a normal
+         install does NOT get it; the Shizuku one-tap grants it via
+         the Telecom override instead. The declaration is still
+         required for the InCallService to bind at all. No
+         READ_PHONE_STATE / READ_CALL_LOG (generic-only rule stays). -->
+    <uses-permission android:name="android.permission.CALL_COMPANION_APP" />
+
     <!-- 1.15.0 (R0): tools:replace="android:allowBackup" — the DSBridge
          AAR manifest declares allowBackup="true"; the app deliberately
          keeps false (no backup of on-device data). Without the replace
@@ -127,6 +137,29 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Autonomous voice assistant and multi-step agent (microphone FGS type only while listening)" />
+        </service>
+
+        <!-- 1.26.0 (power features): the Telecom call companion.
+             BIND_INCALL_SERVICE + the CALL_COMPANION_APP manifest
+             permission let Telecom bind this InCallService WITHOUT
+             Jarvis being the default phone app — but only after the
+             Shizuku one-tap applies the Telecom override
+             (add-or-remove-call-companion-app), because
+             CALL_COMPANION_APP is signature|privileged and a normal
+             install does not hold it. No foregroundServiceType here:
+             this service never runs startForeground (the 1.23.0
+             WorkManager crash was exactly that mistake). -->
+        <service
+            android:name=".service.JarvisCallCompanionService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_INCALL_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_UI"
+                android:value="true" />
         </service>
 
         <!-- 1.4.12: the isolated :tts speech process is GONE.

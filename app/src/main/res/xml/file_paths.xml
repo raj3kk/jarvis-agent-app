@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 1.4.4: only the bounce-report dir is shareable, nothing else. -->
+<!-- 1.4.4: only the bounce-report dir is shareable, nothing else.
+     1.26.0: the Files tab shares a file the user picked (Share
+     button) — FileProvider exposes /sdcard (external-path ".")
+     for that one share Intent. The share is user-initiated per
+     file; nothing is auto-shared, and Jarvis's private filesDir
+     stays unshared (0700, not reachable by other apps anyway). -->
 <paths>
     <external-files-path name="bounce_reports" path="JarvisDiagnostics/" />
+    <external-path name="sdcard" path="." />
 </paths>

@@ -18,7 +18,9 @@ class ToolRegistryTest {
     fun allExecutorKindsResolve() {
         val kinds = listOf(
             "BUILD", "GITHUB_PUSH", "SUPABASE_TABLES", "VERCEL_DEPLOY",
-            "HTTP_CHECK", "GMAIL_SEND", "GMAIL_READ", "DRIVE_READ", "BROWSER_JOB"
+            "HTTP_CHECK", "GMAIL_SEND", "GMAIL_READ", "DRIVE_READ", "BROWSER_JOB",
+            // 1.26.0 (power features): the five shell automation kinds.
+            "SHELL_TAP", "SHELL_TYPE", "SHELL_SCREENSHOT", "SHELL_APP", "SHELL_SETTING"
         )
         for (kind in kinds) {
             val entry = ToolRegistry.resolve(kind)
@@ -27,7 +29,7 @@ class ToolRegistryTest {
             assertTrue(entry.description.isNotBlank())
             assertTrue(entry.args.isNotEmpty())
         }
-        assertEquals(9, ToolRegistry.all().size)
+        assertEquals(14, ToolRegistry.all().size)
     }
 
     @Test
@@ -67,15 +69,19 @@ class ToolRegistryTest {
     // REFUSED from live mode; the local device tools (torch /
     // volume / media) are not registry tools — the engine allowlists
     // them by name.
+    //
+    // 1.26.0: the SAFE shell kinds (TAP/TYPE/SCREENSHOT) join the
+    // live-mode set (6 SAFE tools now); SHELL_APP/SHELL_SETTING are
+    // CONFIRM and stay refused from live mode.
     @Test
     fun liveModeRegistryToolsAreSafeOnly() {
-        for (kind in listOf("HTTP_CHECK", "GMAIL_READ", "DRIVE_READ")) {
+        for (kind in listOf("HTTP_CHECK", "GMAIL_READ", "DRIVE_READ", "SHELL_TAP", "SHELL_TYPE", "SHELL_SCREENSHOT")) {
             assertEquals(
                 ToolRegistry.GateLevel.SAFE,
                 ToolRegistry.resolve(kind)!!.gate
             )
         }
-        for (kind in listOf("BUILD", "GITHUB_PUSH", "VERCEL_DEPLOY", "BROWSER_JOB")) {
+        for (kind in listOf("BUILD", "GITHUB_PUSH", "VERCEL_DEPLOY", "BROWSER_JOB", "SHELL_APP", "SHELL_SETTING")) {
             assertEquals(
                 ToolRegistry.GateLevel.CONFIRM,
                 ToolRegistry.resolve(kind)!!.gate
@@ -87,5 +93,21 @@ class ToolRegistryTest {
                 ToolRegistry.resolve(kind)!!.gate
             )
         }
+    }
+
+    // 1.26.0: destructive app actions sit behind CONFIRM — the
+    // executor hard-gates them again when needsGate is false.
+    @Test
+    fun shellAppAndSettingAreConfirmGated() {
+        assertEquals(
+            ToolRegistry.GateLevel.CONFIRM,
+            ToolRegistry.resolve("SHELL_APP")!!.gate
+        )
+        assertEquals(
+            ToolRegistry.GateLevel.CONFIRM,
+            ToolRegistry.resolve("SHELL_SETTING")!!.gate
+        )
+        assertTrue(ToolRegistry.resolve("SHELL_APP")!!.args.contains("action"))
+        assertTrue(ToolRegistry.resolve("SHELL_SETTING")!!.args.contains("setting"))
     }
 }

@@ -94,6 +94,43 @@ object ToolRegistry {
             description = "WebView browser job: page kholo, tap/type karo, data nikalo (R0 JobEngine).",
             args = listOf("url", "steps"),
             gate = GateLevel.CONFIRM
+        ),
+        // 1.26.0 (power features — spec §5.3): shell-first phone
+        // automation. SHELL_TAP/SHELL_TYPE/SHELL_SCREENSHOT are
+        // reversible gestures (SAFE, with the live-mode restriction
+        // below); SHELL_APP/SHELL_SETTING change system state, so
+        // they sit behind CONFIRM — and destructive SHELL_APP
+        // actions (uninstall/clear/disable) are hard-gated in the
+        // executor even when the step says needsGate=false.
+        ToolEntry(
+            name = "SHELL_TAP",
+            description = "Screen par (x,y) tap karo (shell `input tap`; Accessibility fallback).",
+            args = listOf("x", "y"),
+            gate = GateLevel.SAFE
+        ),
+        ToolEntry(
+            name = "SHELL_TYPE",
+            description = "Text type karo (shell `input text`; Accessibility fallback).",
+            args = listOf("text"),
+            gate = GateLevel.SAFE
+        ),
+        ToolEntry(
+            name = "SHELL_SCREENSHOT",
+            description = "Screen ka screenshot lo (shell `screencap`; read-only).",
+            args = listOf("path"),
+            gate = GateLevel.SAFE
+        ),
+        ToolEntry(
+            name = "SHELL_APP",
+            description = "App manage karo: launch/install/enable/disable/uninstall/clear/force-stop.",
+            args = listOf("action", "package", "apk_path"),
+            gate = GateLevel.CONFIRM
+        ),
+        ToolEntry(
+            name = "SHELL_SETTING",
+            description = "Setting/toggle badlo: brightness, volume, night mode, power saver, DND, wifi, data, bluetooth, airplane.",
+            args = listOf("setting", "value"),
+            gate = GateLevel.CONFIRM
         )
     )
 

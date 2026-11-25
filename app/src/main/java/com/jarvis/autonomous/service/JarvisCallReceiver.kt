@@ -26,6 +26,16 @@ import com.jarvis.autonomous.data.JarvisStateRepository
  * normal app cannot inject its voice into a phone call's audio.
  * Answering is still done by the user tapping Accept (or by the
  * existing CALL action for outgoing calls).
+ *
+ * 1.26.0 update: talking to the caller IS possible in principle
+ * through the Shizuku path (hidden call-audio APIs — see the M0
+ * probe in CallPower / the Phone Health card, tab 3), but it is
+ * UNPROVEN on this phone: the audio engine (1.27.0) is built ONLY
+ * if the probe passes (P2 + P3 + P10). Until then, this receiver's
+ * behaviour is UNCHANGED — generic announce only, no answer, no
+ * voice into the call. The companion service
+ * (JarvisCallCompanionService) is what answers/dials in 1.26.0,
+ * and only with the user's tap.
  */
 class JarvisCallReceiver : BroadcastReceiver() {
 
