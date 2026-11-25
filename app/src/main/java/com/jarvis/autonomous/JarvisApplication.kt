@@ -1,6 +1,7 @@
 package com.jarvis.autonomous
 
 import android.app.Application
+import com.jarvis.autonomous.data.CallPower
 import com.jarvis.autonomous.data.FcmTokenClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.JarvisStateRepository
@@ -111,6 +112,14 @@ class JarvisApplication : Application() {
             // never runs this (its Application is a bare
             // android.app.Application, not JarvisApplication).
             ShizukuManager.install(applicationContext)
+            // 1.26.0 (power features): re-apply the Telecom call
+            // companion override (lost on reboot / Telecom restart).
+            // Best-effort and silent — waits up to 10 s for Shizuku
+            // Ready, then re-applies only if the override is gone.
+            // Never blocks app start.
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching { CallPower.reapplyCompanionOnStart() }
+            }
         }
     }
 }

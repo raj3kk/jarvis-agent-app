@@ -6,6 +6,7 @@ import com.jarvis.autonomous.data.AgentPlan
 import com.jarvis.autonomous.data.AgentPlanStore
 import com.jarvis.autonomous.data.AgentRunState
 import com.jarvis.autonomous.data.AgentSecrets
+import com.jarvis.autonomous.data.FilePower
 import com.jarvis.autonomous.data.HubGithubClient
 import com.jarvis.autonomous.data.ChatSummary
 import com.jarvis.autonomous.data.DocContextPrompt
@@ -18,6 +19,9 @@ import com.jarvis.autonomous.data.PlanStep
 import com.jarvis.autonomous.data.PlanTrajectoryEntry
 import com.jarvis.autonomous.data.ProjectPreviewServer
 import com.jarvis.autonomous.data.ProjectStore
+import com.jarvis.autonomous.data.ShellAutomation
+import com.jarvis.autonomous.service.JarvisAccessibilityService
+import com.jarvis.autonomous.shizuku.ShizukuManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -976,6 +980,13 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             // extract/screenshot). Session/captcha/foreground failures
             // park as BLOCKED (user help needed), everything else Failed.
             "BROWSER_JOB" -> executeBrowserJob(step)
+            // 1.26.0 (power features — spec §5.3): shell-first phone
+            // automation (AccessibilityService is the fallback).
+            "SHELL_TAP" -> executeShellTap(step)
+            "SHELL_TYPE" -> executeShellType(step)
+            "SHELL_SCREENSHOT" -> executeShellScreenshot(step)
+            "SHELL_APP" -> executeShellApp(step)
+            "SHELL_SETTING" -> executeShellSetting(step)
             // Unreachable after the registry resolve above (kept as a
             // safety net — see the T-NO-HANDLER comment there).
             else -> StepOutcome.Failed("Unknown kaam kind: ${step.kind} (T-NO-HANDLER)")
@@ -1009,6 +1020,11 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             "HTTP_CHECK" -> executeHttpCheck(step)
             "GMAIL_READ" -> executeGmailRead(step)
             "DRIVE_READ" -> executeDriveRead(step)
+            // 1.26.0: the SAFE shell kinds run from live mode too
+            // (SHELL_APP/SHELL_SETTING are CONFIRM — refused above).
+            "SHELL_TAP" -> executeShellTap(step)
+            "SHELL_TYPE" -> executeShellType(step)
+            "SHELL_SCREENSHOT" -> executeShellScreenshot(step)
             else -> StepOutcome.Failed("Unknown kaam kind: $kind (T-NO-HANDLER)")
         }) {
             is StepOutcome.Done -> outcome.evidence
@@ -1692,6 +1708,167 @@ class AgentPlanExecutor(private val engine: JarvisAgentEngine) {
             ?: return StepOutcome.Failed("HTTP_CHECK me url nahi diya gaya.")
         val marker = parseDetailRest(step.detail, "marker")
         return httpCheck(url, marker)
+    }
+
+    // ---- SHELL_* (1.26.0 power features — spec §5.3) ----
+    //
+    // Shell first, AccessibilityService as fallback — shell is
+    // faster and works even when Accessibility is off, and the
+    // fallback keeps a tap/type working when Shizuku dies mid-run.
+    // Shizuku not Ready is BLOCKED (the plan parks so the user can
+    // start the server), never a terminal Failed — except when the
+    // Accessibility fallback already did the work.
+
+    private suspend fun executeShellTap(step: PlanStep): StepOutcome {
+        val x = parseDetailValue(step.detail, "x")?.toIntOrNull()
+        val y = parseDetailValue(step.detail, "y")?.toIntOrNull()
+        if (x == null || y == null) {
+            return StepOutcome.Failed("SHELL_TAP me x aur y chahiye (x=123 y=456).")
+        }
+        if (ShizukuManager.state.value is ShizukuManager.ShizukuState.Ready) {
+            val r = ShizukuManager.exec(ShellAutomation.tapCommand(x, y))
+            if (r.isSuccess) return StepOutcome.Done("tap ($x,$y)")
+        }
+        val acc = JarvisAccessibilityService.instance
+        if (acc != null && runCatching { acc.tapCoordinates(x, y) }.getOrDefault(false)) {
+            return StepOutcome.Done("tap ($x,$y) (Accessibility se)")
+        }
+        return StepOutcome.Blocked(
+            "Tap nahi hua — Shizuku ready nahi hai aur Accessibility bhi nahi chal raha. " +
+                "Shizuku server start karo ya Accessibility on karo, phir dobara try karo."
+        )
+    }
+
+    private suspend fun executeShellType(step: PlanStep): StepOutcome {
+        val text = parseDetailRest(step.detail, "text")
+            ?: return StepOutcome.Failed("SHELL_TYPE me text chahiye (text=...).")
+        if (ShizukuManager.state.value is ShizukuManager.ShizukuState.Ready) {
+            val r = ShizukuManager.exec(ShellAutomation.typeCommand(text))
+            if (r.isSuccess) return StepOutcome.Done("typed ${text.length} chars")
+        }
+        val acc = JarvisAccessibilityService.instance
+        if (acc != null && runCatching { acc.typeText(null, text, pressEnter = false) }.getOrDefault(false)) {
+            return StepOutcome.Done("typed ${text.length} chars (Accessibility se)")
+        }
+        return StepOutcome.Blocked(
+            "Type nahi hua — Shizuku ready nahi hai aur Accessibility bhi nahi chal raha. " +
+                "Shizuku server start karo ya Accessibility on karo, phir dobara try karo."
+        )
+    }
+
+    private suspend fun executeShellScreenshot(step: PlanStep): StepOutcome {
+        val path = parseDetailValue(step.detail, "path")
+            ?: "/sdcard/Jarvis/screenshots/jarvis-${System.currentTimeMillis()}.png"
+        if (!FilePower.isWritablePath(path)) {
+            return StepOutcome.Failed("SHELL_SCREENSHOT path likhne layak nahi hai: $path")
+        }
+        if (ShizukuManager.state.value !is ShizukuManager.ShizukuState.Ready) {
+            return StepOutcome.Blocked(
+                "Screenshot ke liye Shizuku chahiye — Shizuku server start karo, phir dobara try karo."
+            )
+        }
+        val r = ShizukuManager.exec(ShellAutomation.screenshotCommand(path), 30_000)
+        return r.fold(
+            onSuccess = { StepOutcome.Done("screenshot: $path") },
+            onFailure = { e -> StepOutcome.Failed("Screenshot nahi hua: ${e.message?.take(150)}") }
+        )
+    }
+
+    private suspend fun executeShellApp(step: PlanStep): StepOutcome {
+        val action = parseDetailValue(step.detail, "action")?.lowercase()
+            ?: return StepOutcome.Failed("SHELL_APP me action chahiye (launch/install/enable/disable/uninstall/clear/force-stop).")
+        val pkg = parseDetailValue(step.detail, "package")
+            ?: return StepOutcome.Failed("SHELL_APP me package chahiye (package=com.example.app).")
+        if (!ShellAutomation.isValidPackage(pkg)) {
+            return StepOutcome.Failed("SHELL_APP package galat hai: $pkg")
+        }
+        // §6 rule 6: destructive app actions are NEVER silent — if
+        // the step did not go through the gate (needsGate=false),
+        // park as Blocked instead of running them.
+        val destructive = action in setOf("uninstall", "clear", "disable")
+        if (destructive && !step.needsGate) {
+            return StepOutcome.Blocked(
+                "'$action $pkg' destructive hai — bina confirmation ke nahi karunga. " +
+                    "Confirm karo to phir se chalao."
+            )
+        }
+        if (ShizukuManager.state.value !is ShizukuManager.ShizukuState.Ready) {
+            // Launch has an Accessibility fallback (it just opens the
+            // app — no shell needed). Every other app action needs
+            // the shell, so those park as Blocked.
+            if (action == "launch") {
+                val acc = JarvisAccessibilityService.instance
+                if (acc != null && runCatching { acc.launchApp(pkg) }.getOrDefault(false)) {
+                    return StepOutcome.Done("launch $pkg (Accessibility se)")
+                }
+            }
+            return StepOutcome.Blocked(
+                "App action ke liye Shizuku chahiye — Shizuku server start karo, phir dobara try karo."
+            )
+        }
+        val cmd = when (action) {
+            "launch" -> ShellAutomation.launchAppCommand(pkg)
+            "install" -> {
+                val apk = parseDetailValue(step.detail, "apk_path")
+                    ?: return StepOutcome.Failed("SHELL_APP install me apk_path chahiye.")
+                // An APK can only come from shared storage or the
+                // staging dir — never from a blocked/private path.
+                if (FilePower.isBlockedPath(apk) ||
+                    !(apk.startsWith("/sdcard") || apk.startsWith("/data/local/tmp"))
+                ) {
+                    return StepOutcome.Failed("SHELL_APP apk_path allowed nahi hai: $apk")
+                }
+                ShellAutomation.installAppCommand(apk)
+            }
+            "enable" -> ShellAutomation.enableAppCommand(pkg)
+            "disable" -> ShellAutomation.disableAppCommand(pkg)
+            "uninstall" -> ShellAutomation.uninstallAppCommand(pkg)
+            "clear" -> ShellAutomation.clearAppCommand(pkg)
+            "force-stop" -> ShellAutomation.forceStopAppCommand(pkg)
+            else -> return StepOutcome.Failed("SHELL_APP action galat hai: $action")
+        }
+        val r = ShizukuManager.exec(cmd, 60_000)
+        return r.fold(
+            onSuccess = { StepOutcome.Done("$action $pkg") },
+            onFailure = { e -> StepOutcome.Failed("$action $pkg fail hua: ${e.message?.take(200)}") }
+        )
+    }
+
+    private suspend fun executeShellSetting(step: PlanStep): StepOutcome {
+        val setting = parseDetailValue(step.detail, "setting")?.lowercase()
+            ?: return StepOutcome.Failed("SHELL_SETTING me setting chahiye (brightness/volume/night/power_saver/dnd/wifi/data/bluetooth/airplane).")
+        val value = parseDetailValue(step.detail, "value")
+            ?: return StepOutcome.Failed("SHELL_SETTING me value chahiye.")
+        val cmd = when (setting) {
+            "brightness" -> {
+                val pct = value.toIntOrNull()
+                    ?: return StepOutcome.Failed("brightness value 0-100 hona chahiye: $value")
+                ShellAutomation.brightnessCommand(pct)
+            }
+            "volume" -> {
+                val level = value.toIntOrNull()
+                    ?: return StepOutcome.Failed("volume value 0-15 hona chahiye: $value")
+                ShellAutomation.volumeCommand(3, level)
+            }
+            "night" -> ShellAutomation.nightModeCommand(value.equals("on", ignoreCase = true))
+            "power_saver" -> ShellAutomation.powerSaverCommand(value.equals("on", ignoreCase = true))
+            "dnd" -> ShellAutomation.dndCommand(value.equals("on", ignoreCase = true))
+            "wifi" -> ShellAutomation.wifiCommand(value.equals("on", ignoreCase = true))
+            "data" -> ShellAutomation.mobileDataCommand(value.equals("on", ignoreCase = true))
+            "bluetooth" -> ShellAutomation.bluetoothCommand(value.equals("on", ignoreCase = true))
+            "airplane" -> ShellAutomation.airplaneModeCommand(value.equals("on", ignoreCase = true))
+            else -> return StepOutcome.Failed("SHELL_SETTING setting galat hai: $setting")
+        }
+        if (ShizukuManager.state.value !is ShizukuManager.ShizukuState.Ready) {
+            return StepOutcome.Blocked(
+                "Setting badalne ke liye Shizuku chahiye — Shizuku server start karo, phir dobara try karo."
+            )
+        }
+        val r = ShizukuManager.exec(cmd)
+        return r.fold(
+            onSuccess = { StepOutcome.Done("$setting=$value") },
+            onFailure = { e -> StepOutcome.Failed("$setting=$value fail hua: ${e.message?.take(200)}") }
+        )
     }
 
     // ---- BROWSER_JOB (1.15.0 R0 Whop browser) ----

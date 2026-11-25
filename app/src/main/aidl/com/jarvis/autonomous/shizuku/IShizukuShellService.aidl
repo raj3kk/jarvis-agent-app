@@ -26,4 +26,14 @@ interface IShizukuShellService {
     // timeoutMs elapses; the caller serialises calls with a Mutex
     // (the service is single-flight).
     Bundle exec(String command, int timeoutMs) = 2;
+
+    // 1.26.0 (M0 probe P3): asks the hidden
+    // AudioManager.isPstnCallAudioInterceptable() in THIS process
+    // (the shell UID holds the CALL_AUDIO_INTERCEPTION permission).
+    // Returns a Bundle with "supported" (boolean: the hidden API
+    // could be called at all), "interceptable" (boolean: the system
+    // says a call-audio tap is possible), "error" (String: why not,
+    // when supported is false). The probe treats supported=false as
+    // UNKNOWN — never as a pass, never as a fail.
+    Bundle isCallAudioInterceptable() = 3;
 }

@@ -292,6 +292,37 @@ class JarvisPreferences(context: Context) {
         get() = prefs.getBoolean("auto_start_on_boot", true)
         set(value) = prefs.edit().putBoolean("auto_start_on_boot", value).apply()
 
+    // 1.26.0 (power features — spec §5.2):
+    /** "Jarvis talks" — Jarvis answers a ringing call with his voice. */
+    var jarvisTalksEnabled: Boolean
+        get() = prefs.getBoolean("jarvis_talks_enabled", false)
+        set(value) = prefs.edit().putBoolean("jarvis_talks_enabled", value).apply()
+
+    /** Set to true the first time the M0 audio gate passes (P2+P3). */
+    var m0AudioGatePassed: Boolean
+        get() = prefs.getBoolean("m0_audio_gate_passed", false)
+        set(value) = prefs.edit().putBoolean("m0_audio_gate_passed", value).apply()
+
+    /** When the M0 probe last ran (ms since epoch, 0 = never). */
+    var m0ProbeRanAtMs: Long
+        get() = prefs.getLong("m0_probe_ran_at_ms", 0L)
+        set(value) = prefs.edit().putLong("m0_probe_ran_at_ms", value).apply()
+
+    /** Last M0 probe results as JSON (CallPower.probeResultsToJson). */
+    var m0ProbeResultsJson: String
+        get() = prefs.getString("m0_probe_results_json", "").orEmpty()
+        set(value) = prefs.edit().putString("m0_probe_results_json", value).apply()
+
+    /** Last folder opened in the Files tab ("" = /sdcard). */
+    var filesLastPath: String
+        get() = prefs.getString("files_last_path", "").orEmpty()
+        set(value) = prefs.edit().putString("files_last_path", value).apply()
+
+    /** Last number typed in the Calls tab dial pad. */
+    var callsLastNumber: String
+        get() = prefs.getString("calls_last_number", "").orEmpty()
+        set(value) = prefs.edit().putString("calls_last_number", value).apply()
+
     // R1 (1.16.0-PRO, N3 budgets — REDESIGN_PLAN.md §9.3):
     // the loop runs until DONE or budget/watchdog, NEVER after N
     // steps. ⚠️ NEEDS THE USER'S WORD — the numbers below are PLAN

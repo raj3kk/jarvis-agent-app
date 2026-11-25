@@ -50,11 +50,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Mic
@@ -588,7 +590,13 @@ fun JarvisMainApp(
                     Triple(9, Icons.Default.School, "Trained"),
                     // 1.21.0-PRO: Skills — browse + install the hub's
                     // skills library (catalog + install routes).
-                    Triple(10, Icons.Default.Extension, "Skills")
+                    Triple(10, Icons.Default.Extension, "Skills"),
+                    // 1.26.0-PRO: Files — browse /sdcard, Android/
+                    // data, obb via the Shizuku shell.
+                    Triple(11, Icons.Default.Folder, "Files"),
+                    // 1.26.0-PRO: Calls — dial pad + in-call controls
+                    // via the Telecom companion service.
+                    Triple(12, Icons.Default.Call, "Calls")
                 )
                 val tabListState = rememberLazyListState()
                 LaunchedEffect(selectedTab) {
@@ -697,6 +705,10 @@ fun JarvisMainApp(
                 9 -> TrainedJarvisScreen()
 
                 10 -> SkillsScreen()
+
+                11 -> FilesScreen()
+
+                12 -> CallsScreen()
             }
         }
         }
@@ -1576,6 +1588,31 @@ fun CommandCenterScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
+        // 1.26.0 (power features): Automation — what Jarvis can now
+        // do on the phone itself, from a plan or live mode. Shell
+        // first, Accessibility as fallback; destructive app actions
+        // (uninstall/clear/disable) always ask first. This card is
+        // informational — the steps run from a command, not from
+        // buttons here.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF))
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Automation (phone)", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFFB85C38))
+                Text(
+                    text = "Jarvis ab phone ko khud chala sakta hai — tap, type, screenshot, app kholo/band karo, " +
+                        "brightness/wifi/data/bluetooth badlo. Bolo: \"WhatsApp kholo\", \"brightness 50 karo\", " +
+                        "\"screenshot lo\". Destructive kaam (uninstall, clear, disable) hamesha pooch kar hota hai. " +
+                        "Shizuku server chahiye; nahi ho to Accessibility fallback chalta hai.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF8A7A70)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
         // Whiteboard entry point (1.4.0): overlay permission is
         // NEVER bypassed — without it the system permission screen
         // opens; with it the floating board service starts.
@@ -1980,6 +2017,13 @@ fun PermissionsChecklistScreen() {
         // permission states so the Accessibility card above flips to
         // GRANTED when the shell run enabled it.
         ShizukuCard(onApplied = { refreshTick++ })
+
+        // 1.26.0 (power features): the Telecom call companion —
+        // dial/answer/end/mute/DTMF/speaker without being the
+        // default phone app. Setup lives here (next to Shizuku,
+        // because it needs the same shell); the Calls tab (12) is
+        // where calls are actually made.
+        CallControlCard()
 
         PermissionItemCard(
             title = "2. Floating HUD Overlay (Draw Over Apps)",
@@ -3092,6 +3136,13 @@ fun MemoryRoutinesLogsScreen(
                 }
             }
         }
+
+        // 1.26.0 (power features): Phone Health — the M0 probe.
+        // Runs P1–P10 on this phone and shows every result, so the
+        // user can report back whether the 1.27.0 audio engine is
+        // possible (P2+P3 must both pass). Placed here, right after
+        // Diagnostics, because it IS a diagnostic.
+        PhoneHealthCard(prefs = prefs)
 
         // Section 1: Custom Voice Routines (Macros)
         Card(

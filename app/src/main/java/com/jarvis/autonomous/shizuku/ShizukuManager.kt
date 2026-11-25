@@ -105,6 +105,20 @@ object ShizukuManager {
     class ShellException(val exitCode: Int, val stdout: String, val stderr: String) :
         RuntimeException("exit $exitCode: ${stderr.ifBlank { stdout }.trim()}")
 
+    /**
+     * 1.26.0 (M0 probe P3): the answer from the shell-uid service
+     * about [android.media.AudioManager.isPstnCallAudioInterceptable].
+     * [supported] false means the hidden API could not be called at
+     * all on this build — the probe reports UNKNOWN, never a pass
+     * and never a fail. [interceptable] true is the M0 audio gate
+     * together with P2.
+     */
+    data class CallAudioInterceptableResult(
+        val supported: Boolean,
+        val interceptable: Boolean,
+        val error: String
+    )
+
     private val _state = MutableStateFlow<ShizukuState>(ShizukuState.ServerNotRunning)
     val state: StateFlow<ShizukuState> = _state.asStateFlow()
 
@@ -298,6 +312,28 @@ object ShizukuManager {
             val err = bundle.getString("err").orEmpty()
             if (code != 0) throw ShellException(code, out, err)
             out
+        }
+
+    /**
+     * 1.26.0 (M0 probe P3): asks the shell-uid service whether the
+     * system says a PSTN call-audio tap is possible. Runs over the
+     * same serialised exec path as [exec] (same bind, same mutex,
+     * same IO dispatcher) — safe to call from any suspend scope.
+     * The service answers from the Bundle: supported=false means
+     * the hidden API could not be called on this build (reported
+     * UNKNOWN by the caller — never a pass, never a fail).
+     */
+    suspend fun isCallAudioInterceptable(): Result<CallAudioInterceptableResult> =
+        runCatching {
+            val svc = bindService()
+            val bundle = execMutex.withLock {
+                withContext(Dispatchers.IO) { svc.isCallAudioInterceptable() }
+            }
+            CallAudioInterceptableResult(
+                supported = bundle.getBoolean("supported", false),
+                interceptable = bundle.getBoolean("interceptable", false),
+                error = bundle.getString("error").orEmpty()
+            )
         }
 
     /** Stops and kills the shell process (server sends transaction 16777115). */

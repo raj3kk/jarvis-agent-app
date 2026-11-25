@@ -28,16 +28,26 @@ import kotlin.system.exitProcess
 @Keep
 class ShizukuShellService : IShizukuShellService.Stub {
 
+    /**
+     * The Context the Shizuku server passes (a bare Application).
+     * Stored ONLY so [isCallAudioInterceptable] can reach the
+     * system AudioManager — nothing else in this class touches it,
+     * and no Jarvis singleton, repository, or preference is ever
+     * touched here (this process has no JarvisApplication).
+     */
+    private var serviceContext: Context? = null
+
     /** Required constructor. */
     constructor() : super()
 
     /**
      * Constructor with Context (Shizuku API v13 tries this first).
-     * The Context is a bare Application; it is deliberately ignored.
      */
     @Keep
     @Suppress("unused")
-    constructor(context: Context) : super()
+    constructor(context: Context) : super() {
+        serviceContext = context
+    }
 
     override fun exec(command: String, timeoutMs: Int): android.os.Bundle {
         val timeout = timeoutMs.coerceAtLeast(1).toLong()
@@ -87,6 +97,48 @@ class ShizukuShellService : IShizukuShellService.Stub {
 
     override fun exit() {
         destroy()
+    }
+
+    /**
+     * 1.26.0 (M0 probe P3): calls the hidden
+     * AudioManager.isPstnCallAudioInterceptable() in this process.
+     * The shell UID holds CALL_AUDIO_INTERCEPTION, but the hidden
+     * API itself may still refuse reflection on this build — that
+     * is a real probe outcome (supported=false), not a crash: the
+     * caller reports UNKNOWN and the audio engine is not built.
+     * Catches Throwable on purpose: hidden-API enforcement throws
+     * Errors (not Exceptions) on some builds.
+     */
+    override fun isCallAudioInterceptable(): android.os.Bundle {
+        val ctx = serviceContext
+        if (ctx == null) {
+            return android.os.Bundle().apply {
+                putBoolean("supported", false)
+                putBoolean("interceptable", false)
+                putString("error", "no Context in this process")
+            }
+        }
+        return try {
+            val am = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            val method = android.media.AudioManager::class.java.getMethod(
+                "isPstnCallAudioInterceptable"
+            )
+            val result = method.invoke(am) as? Boolean
+            android.os.Bundle().apply {
+                putBoolean("supported", result != null)
+                putBoolean("interceptable", result == true)
+                putString("error", if (result == null) "method returned null" else "")
+            }
+        } catch (t: Throwable) {
+            android.os.Bundle().apply {
+                putBoolean("supported", false)
+                putBoolean("interceptable", false)
+                putString(
+                    "error",
+                    (t.javaClass.simpleName + ": " + (t.message ?: "")).take(300)
+                )
+            }
+        }
     }
 
     /**
