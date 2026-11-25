@@ -1672,41 +1672,63 @@ fun JarvisWebView(
     key(tabKey) {
         AndroidView(
             factory = { ctx ->
-                val shared = JarvisBackgroundBrowser.obtainWebView(ctx)
-            (shared.parent as? ViewGroup)?.removeView(shared)
-            // 1.4.7 (C): a truly fresh tab (no target, WebView never
-            // loaded) opens on Google — the old blank tab loaded
-            // nothing at all. An already-loaded page (e.g. a
-            // Projects preview) is never clobbered: this fires only
-            // when the shared WebView has no URL yet.
-            if (targetUrl.isBlank() && shared.url.isNullOrBlank()) {
-                shared.loadUrl(GOOGLE_HOME_URL)
-            }
-            holder[0] = shared
-            onWebViewReady(shared)
-            shared
-        },
-        update = { webView ->
-            holder[0] = webView
-            onWebViewReady(webView)
-            // B-M3: load only when the target really differs, ignoring
-            // the preview ?v= nonce — a nonce bump alone must not
-            // reload the Browser tab's page.
-            if (targetUrl.isNotBlank() && !urlsEqualIgnoringPreviewNonce(webView.url, targetUrl)) {
-                webView.loadUrl(targetUrl)
-            }
-            // B-L11: when no target is set (fresh tab) but the shared
-            // WebView already shows a page (e.g. a preview loaded
-            // before this tab opened), report it so the URL bar is
-            // never empty while a page is on screen. Posted (not
-            // called inline) so no state is written during
-            // composition; the callback sets the tab's target, so this
-            // fires once and converges.
-            if (targetUrl.isBlank() && !webView.url.isNullOrBlank()) {
-                val shown = webView.url!!
-                webView.post { onUrlChanged(shown) }
-            }
-        },
+                // 1.22.0: WebView creation can throw (provider
+                // unavailable, or a crash-loop restart left it
+                // unusable). The old code let that throw out of the
+                // factory, which kills the whole composition — the
+                // tab goes blank (or the app crashes). Catch it:
+                // host a plain View and report the failure, so the
+                // tab shows an error text instead of blank. The
+                // next tab switch retries the real WebView.
+                val shared = runCatching {
+                    JarvisBackgroundBrowser.obtainWebView(ctx)
+                }.getOrNull()
+                if (shared == null) {
+                    val fallback = View(ctx)
+                    fallback.post {
+                        onError("Browser nahi khul paya — WebView load nahi hua. Dobara try karo.")
+                    }
+                    holder[0] = null
+                    fallback
+                } else {
+                    (shared.parent as? ViewGroup)?.removeView(shared)
+                    // 1.4.7 (C): a truly fresh tab (no target, WebView never
+                    // loaded) opens on Google — the old blank tab loaded
+                    // nothing at all. An already-loaded page (e.g. a
+                    // Projects preview) is never clobbered: this fires only
+                    // when the shared WebView has no URL yet.
+                    if (targetUrl.isBlank() && shared.url.isNullOrBlank()) {
+                        shared.loadUrl(GOOGLE_HOME_URL)
+                    }
+                    holder[0] = shared
+                    onWebViewReady(shared)
+                    shared
+                }
+            },
+            update = { view ->
+                // 1.22.0: the factory may host a fallback View (see
+                // above) — only drive it when it really is a WebView.
+                val webView = view as? WebView ?: return@AndroidView
+                holder[0] = webView
+                onWebViewReady(webView)
+                // B-M3: load only when the target really differs, ignoring
+                // the preview ?v= nonce — a nonce bump alone must not
+                // reload the Browser tab's page.
+                if (targetUrl.isNotBlank() && !urlsEqualIgnoringPreviewNonce(webView.url, targetUrl)) {
+                    webView.loadUrl(targetUrl)
+                }
+                // B-L11: when no target is set (fresh tab) but the shared
+                // WebView already shows a page (e.g. a preview loaded
+                // before this tab opened), report it so the URL bar is
+                // never empty while a page is on screen. Posted (not
+                // called inline) so no state is written during
+                // composition; the callback sets the tab's target, so this
+                // fires once and converges.
+                if (targetUrl.isBlank() && !webView.url.isNullOrBlank()) {
+                    val shown = webView.url!!
+                    webView.post { onUrlChanged(shown) }
+                }
+            },
         onRelease = {
             // Shared instance survives tab switches: no destroy,
             // no pause here (pause follows the activity lifecycle).

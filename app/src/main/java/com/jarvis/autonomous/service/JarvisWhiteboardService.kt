@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
@@ -128,7 +129,7 @@ class JarvisWhiteboardService : Service() {
         WhiteboardStore.init(applicationContext)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        startForegroundSafe()
         serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main).apply {
             launch {
                 WhiteboardStore.state.collect { state ->
@@ -138,6 +139,41 @@ class JarvisWhiteboardService : Service() {
             }
         }
         JarvisStateRepository.addLog("Jarvis Whiteboard service started.")
+    }
+
+    /**
+     * 1.22.0: the old raw 2-arg startForeground() here was the ONLY
+     * unwrapped foreground start in the app — on SDK 34+ it can throw
+     * IllegalArgumentException (foregroundServiceType not a subset of
+     * the manifest) and kill the whole process, because onCreate has
+     * no try/catch here. The 2026-11-25 launch-bounce report's
+     * requested type (0x40000000 = SPECIAL_USE) is exactly what this
+     * service's 2-arg call applies. Route through an explicit 3-arg
+     * call with SPECIAL_USE (this service's manifest type) inside a
+     * try/catch: on failure, log FGS_START_FAILED naming this
+     * service and continue WITHOUT foreground state (the overlay
+     * still works in-app; only the persistent notification is
+     * missing). A foreground promotion must never crash the app.
+     */
+    private fun startForegroundSafe() {
+        val notification = buildNotification()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            JarvisStateRepository.addDiagnostic(
+                "nav", "FGS_START_FAILED",
+                "JarvisWhiteboardService foreground start failed " +
+                    "(${e.javaClass.simpleName}: ${e.message ?: ""}) — " +
+                    "continuing without foreground state."
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
