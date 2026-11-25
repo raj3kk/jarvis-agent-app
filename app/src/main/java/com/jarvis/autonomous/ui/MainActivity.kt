@@ -1973,6 +1973,14 @@ fun PermissionsChecklistScreen() {
             }
         }
 
+        // 1.25.0 (Shizuku): one-tap Accessibility + battery whitelist
+        // via the Shizuku app (already on the user's phone). The
+        // manual cards above/below stay as the fallback — this card
+        // never replaces them. After a run, the screen re-reads the
+        // permission states so the Accessibility card above flips to
+        // GRANTED when the shell run enabled it.
+        ShizukuCard(onApplied = { refreshTick++ })
+
         PermissionItemCard(
             title = "2. Floating HUD Overlay (Draw Over Apps)",
             description = "Shows the draggable Jarvis Arc Reactor pill & Emergency Stop button on top of WhatsApp, Instagram, YouTube, etc.",

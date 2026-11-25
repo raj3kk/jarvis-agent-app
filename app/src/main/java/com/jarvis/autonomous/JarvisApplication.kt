@@ -5,6 +5,7 @@ import com.jarvis.autonomous.data.FcmTokenClient
 import com.jarvis.autonomous.data.JarvisDiagnosticsFile
 import com.jarvis.autonomous.data.JarvisStateRepository
 import com.jarvis.autonomous.service.JarvisBackstop
+import com.jarvis.autonomous.shizuku.ShizukuManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -102,6 +103,14 @@ class JarvisApplication : Application() {
             // cheap no-op. Main process only — the :tts process never
             // touches WorkManager.
             JarvisBackstop.enqueue(applicationContext)
+            // 1.25.0 (Shizuku): register the Shizuku binder +
+            // permission listeners once (main process only). The
+            // manager keeps a StateFlow the Permissions screen reads;
+            // install() is idempotent and does nothing if Shizuku is
+            // not installed/running. The Shizuku UserService process
+            // never runs this (its Application is a bare
+            // android.app.Application, not JarvisApplication).
+            ShizukuManager.install(applicationContext)
         }
     }
 }
