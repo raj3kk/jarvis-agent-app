@@ -59,6 +59,22 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+/**
+ * 1.22.0: classifies a foreground-service start failure — the
+ * decision point that breaks the launch-bounce loop. A
+ * foregroundServiceType IllegalArgumentException (the 2026-11-25
+ * report: "foregroundServiceType 0x40000000 is not a subset of
+ * foregroundServiceType attribute 0x00000000") must NOT rethrow out
+ * of onCreate: the service survives without foreground state and
+ * the mic restore retries on the next open. Any other exception
+ * keeps the 1.4.2 crash behaviour (record + rethrow). Pure function
+ * (JVM unit test seam — no Android runtime).
+ */
+internal fun isForegroundServiceTypeError(e: Exception): Boolean {
+    return e is IllegalArgumentException &&
+        (e.message?.contains("foregroundServiceType") == true)
+}
+
 class JarvisForegroundService : Service() {
 
     companion object {
@@ -837,14 +853,34 @@ class JarvisForegroundService : Service() {
         // (persisted — survives process death like all markers).
         JarvisStateRepository.addDiagnostic("nav", "SVC_CREATE", "Foreground service created.")
         } catch (e: Exception) {
-            runCatching {
-                com.jarvis.autonomous.data.JarvisDiagnosticsFile.appendCrash("main", e)
+            // 1.22.0: a foreground-service type error must NOT bounce
+            // the launch loop. The 2026-11-25 report shows the app
+            // crashing 4 times in 9 seconds because onCreate rethrew
+            // this exact error on every START_STICKY restart. Record
+            // it as FGS_START_FAILED (naming this service) and return
+            // normally — the service survives without foreground state
+            // and the mic restore retries on the next open. It is
+            // deliberately NOT written to the crash file: it is a
+            // survived failure, not a crash, so the next launch must
+            // not read it as a previous-session bounce. Every other
+            // exception keeps the 1.4.2 behaviour (record + rethrow).
+            if (isForegroundServiceTypeError(e)) {
+                JarvisStateRepository.addDiagnostic(
+                    "nav", "FGS_START_FAILED",
+                    "JarvisForegroundService onCreate: foreground start failed " +
+                        "(${e.javaClass.simpleName}: ${e.message ?: ""}) — " +
+                        "continuing without foreground state."
+                )
+            } else {
+                runCatching {
+                    com.jarvis.autonomous.data.JarvisDiagnosticsFile.appendCrash("main", e)
+                }
+                JarvisStateRepository.addDiagnostic(
+                    "nav", "STARTUP_CRASH",
+                    "Foreground service onCreate failed: ${e.javaClass.simpleName}: ${e.message ?: ""}"
+                )
+                throw e
             }
-            JarvisStateRepository.addDiagnostic(
-                "nav", "STARTUP_CRASH",
-                "Foreground service onCreate failed: ${e.javaClass.simpleName}: ${e.message ?: ""}"
-            )
-            throw e
         }
     }
 
@@ -1299,7 +1335,7 @@ class JarvisForegroundService : Service() {
             // promotion must never crash service creation.
             JarvisStateRepository.addDiagnostic(
                 "nav", "FGS_TYPE_FALLBACK",
-                "Foreground start with qualified types failed (${e.javaClass.simpleName}) — retrying specialUse-only."
+                "JarvisForegroundService foreground start with qualified types failed (${e.javaClass.simpleName}) — retrying specialUse-only."
             )
             val fallback = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             val ok = runCatching {
@@ -1313,7 +1349,7 @@ class JarvisForegroundService : Service() {
                 lastFgsTypes = fallback
                 JarvisStateRepository.addDiagnostic(
                     "nav", "FGS_TYPES_ACTUAL",
-                    "Foreground types ACTUAL: specialUse-only " +
+                    "JarvisForegroundService foreground types ACTUAL: specialUse-only " +
                         "(computed was " +
                         if (requested and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0) "microphone|specialUse" else "specialUse-only" +
                         " — fallback applied, computed record corrected)."
@@ -1323,7 +1359,7 @@ class JarvisForegroundService : Service() {
             ok.onFailure {
                 JarvisStateRepository.addDiagnostic(
                     "nav", "FGS_START_FAILED",
-                    "Foreground start failed even with specialUse-only (${it.javaClass.simpleName}) — service continues without foreground state."
+                    "JarvisForegroundService foreground start failed even with specialUse-only (${it.javaClass.simpleName}) — service continues without foreground state."
                 )
             }
             // 1.4.13 G8 note: total failure leaves NO foreground
