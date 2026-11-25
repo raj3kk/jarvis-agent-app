@@ -50,6 +50,17 @@ class JarvisCallCompanionService : InCallService() {
         @Volatile
         private var currentCall: Call? = null
 
+        /**
+         * The live service instance. setAudioRoute/setMuted are
+         * InCallService INSTANCE methods (not Call methods, and not
+         * companion methods) — the companion functions reach them
+         * through this reference. Set in onCallAdded (the service
+         * is alive whenever a call is tracked) and cleared in
+         * onDestroy.
+         */
+        @Volatile
+        private var serviceInstance: JarvisCallCompanionService? = null
+
         @Volatile
         private var talksEnabledCached: Boolean = false
 
@@ -113,9 +124,10 @@ class JarvisCallCompanionService : InCallService() {
             onMain {
                 runCatching {
                     call.answer(0)
-                    // setAudioRoute is an InCallService method, not a Call method
-                    // (Call has answer/disconnect/playDtmfTone only).
-                    setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+                    // setAudioRoute is an InCallService instance
+                    // method (Call has answer/disconnect/playDtmfTone
+                    // only) — reached via the stored service instance.
+                    serviceInstance?.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
                 }
             }
             JarvisStateRepository.updateCallState {
@@ -134,8 +146,9 @@ class JarvisCallCompanionService : InCallService() {
         /** Mute / unmute the microphone on the current call. */
         fun setMutedCurrent(muted: Boolean): Boolean {
             currentCall ?: return false
-            // setMuted is an InCallService method, not a Call method.
-            onMain { runCatching { setMuted(muted) } }
+            // setMuted is an InCallService instance method, not a
+            // Call method — reached via the stored service instance.
+            onMain { runCatching { serviceInstance?.setMuted(muted) } }
             JarvisStateRepository.updateCallState { it.copy(muted = muted) }
             return true
         }
@@ -145,8 +158,9 @@ class JarvisCallCompanionService : InCallService() {
             val call = currentCall ?: return false
             onMain {
                 runCatching {
-                    // setAudioRoute is an InCallService method, not a Call method.
-                    setAudioRoute(
+                    // setAudioRoute is an InCallService instance
+                    // method — reached via the stored service instance.
+                    serviceInstance?.setAudioRoute(
                         if (speaker) CallAudioState.ROUTE_SPEAKER
                         else CallAudioState.ROUTE_EARPIECE
                     )
@@ -201,6 +215,7 @@ class JarvisCallCompanionService : InCallService() {
 
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
+        serviceInstance = this
         // One Jarvis-handled call at a time — a second simultaneous
         // call stays with the system.
         if (currentCall != null) return
@@ -250,6 +265,11 @@ class JarvisCallCompanionService : InCallService() {
     override fun onCallRemoved(call: Call) {
         super.onCallRemoved(call)
         if (currentCall == call) finishCurrentCall(call)
+    }
+
+    override fun onDestroy() {
+        serviceInstance = null
+        super.onDestroy()
     }
 
     private fun finishCurrentCall(call: Call) {
